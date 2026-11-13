@@ -1,0 +1,622 @@
+package review
+
+import (
+	"strings"
+
+	"github.com/Dxlxz/orrery-sql/review"
+	"github.com/Dxlxz/orrery-sql/review/walk"
+	"github.com/Dxlxz/orrery-sql/tidb/ast"
+)
+
+// statement lowers one statement (spec §5), false when the walk does not
+// follow it, which ends the walk before it. TiDB has no triggers,
+// functions, or events (1064), and CREATE and DROP PROCEDURE fail (8108):
+// none of their statements is lowered, so each ends the walk. ALTER VIEW
+// (1064) never reaches the walk: the parser refuses it.
+func (b *builder) statement(n ast.Node) bool {
+	switch v := n.(type) {
+	case *ast.CreateDatabaseStmt:
+		return b.createDatabase(v)
+	case *ast.DropDatabaseStmt:
+		return b.dropDatabase(v)
+	case *ast.AlterDatabaseStmt:
+		return b.alterDatabase(v)
+	case *ast.UseStmt:
+		return b.use(v)
+	case *ast.CreateTableStmt:
+		return b.createTable(v)
+	case *ast.AlterTableStmt:
+		return b.alterTable(v)
+	case *ast.RenameTableStmt:
+		return b.renameTable(v)
+	case *ast.DropTableStmt:
+		return b.dropTable(v)
+	case *ast.TruncateStmt:
+		return b.truncate(v)
+	case *ast.CreateIndexStmt:
+		return b.createIndex(v)
+	case *ast.DropIndexStmt:
+		return b.dropIndex(v)
+	case *ast.CreateViewStmt:
+		return b.createView(v)
+	case *ast.DropViewStmt:
+		return b.dropView(v)
+	case *ast.CreateSequenceStmt:
+		return b.createSequence(v)
+	case *ast.DropSequenceStmt:
+		return b.dropSequence(v)
+	case *ast.InsertStmt:
+		return b.dml([]*ast.TableRef{v.Table})
+	case *ast.LoadDataStmt:
+		return b.dml([]*ast.TableRef{v.Table})
+	case *ast.ImportIntoStmt:
+		// IMPORT INTO writes rows into a table that has to be there
+		// already: v8.5.5 answers 1146 for a target that is not. It
+		// creates, drops and renames nothing, so it is lowered the way
+		// LOAD DATA is -- and lowered at all, because a node the walk does
+		// not know ends the walk and hides every finding below it.
+		return b.dml([]*ast.TableRef{v.Table})
+	case *ast.UpdateStmt:
+		return b.dml(singleTarget(v.Tables))
+	case *ast.DeleteStmt:
+		if v.Using != nil {
+			return b.dml(nil)
+		}
+		return b.dml(singleTarget(v.Tables))
+	case *ast.SetStmt:
+		return b.set(v)
+	case *ast.AdminStmt:
+		return b.admin(v)
+	case *ast.DropStatsStmt:
+		return b.dropStats(v)
+	case *ast.CreateStatisticsStmt:
+		return b.createStatistics(v)
+	case *ast.ExplainStmt, *ast.TraceStmt:
+		return b.wrapper(v)
+	case *ast.BRIEStmt:
+		// The log task and BR job statements name no table, and fail only on
+		// what the walk does not hold: a task, a job, a cluster without TiKV.
+		// Every other kind drops out below.
+		if v.Kind.IsLogTaskOrJob() {
+			return true
+		}
+	case *ast.PlanReplayerStmt:
+		if v.Load {
+			// PLAN REPLAYER LOAD puts back the schemas the dump carries,
+			// and the dump is a file the walk cannot read, so it drops out
+			// below with RESTORE and RECOVER rather than claim the schema
+			// is still what it was. Measured on pingcap/tidb:v8.5.5: with
+			// `t` dropped, LOAD of a dump taken over it recreates the
+			// table with its columns, and a second LOAD of the same dump
+			// answers 1050.
+			break
+		}
+		return b.wrapper(v)
+	case *ast.SelectStmt, *ast.DoStmt:
+		return true
+	case *ast.CreateBindingStmt, *ast.DropBindingStmt, *ast.SetBindingStmt:
+		// A SQL plan binding records a plan for later statements; it makes,
+		// drops, and renames nothing the walk keeps. The statements it
+		// carries are not run, so neither is lowered: `CREATE BINDING FOR
+		// DELETE FROM t USING DELETE FROM t` deletes no row.
+		return true
+	case *ast.BeginStmt, *ast.CommitStmt, *ast.SavepointStmt, *ast.SetTransactionStmt, *ast.UnlockTablesStmt,
+		*ast.ShowStmt, *ast.HelpStmt, *ast.AnalyzeTableStmt, *ast.OptimizeTableStmt, *ast.CheckTableStmt,
+		*ast.ChecksumTableStmt, *ast.RepairTableStmt, *ast.FlushStmt,
+		*ast.SplitRegionStmt, *ast.DistributeTableStmt,
+		*ast.LoadStatsStmt, *ast.DropStatisticsStmt,
+		*ast.GrantStmt, *ast.RevokeStmt, *ast.GrantRoleStmt, *ast.RevokeRoleStmt, *ast.SetRoleStmt, *ast.SetDefaultRoleStmt,
+		*ast.CreateUserStmt, *ast.AlterUserStmt, *ast.DropUserStmt, *ast.RenameUserStmt,
+		*ast.CreateRoleStmt, *ast.DropRoleStmt, *ast.SetPasswordStmt,
+		*ast.CreateResourceGroupStmt, *ast.AlterResourceGroupStmt, *ast.DropResourceGroupStmt,
+		*ast.SetResourceGroupStmt, *ast.CalibrateResourceStmt,
+		*ast.AddQueryWatchStmt, *ast.DropQueryWatchStmt,
+		*ast.RecommendIndexStmt, *ast.SetConfigStmt, *ast.AlterRangeStmt, *ast.CancelDistributionJobStmt,
+		*ast.CancelImportJobStmt, *ast.KillStmt:
+		// None changes a name the walk keeps. SAVEPOINT and RELEASE keep
+		// what the change did; a ROLLBACK, which undoes it, is not here.
+		// SPLIT ... TABLE and DISTRIBUTE TABLE are here for the same
+		// reason ANALYZE TABLE is: each needs its table, and the index
+		// form its index, but neither creates, drops, or renames one, so
+		// the walk follows both and records nothing.
+		// LOAD STATS names a file and DROP STATISTICS an extended
+		// statistic, and neither is a name the walk holds. v8.5.5 does
+		// not run DROP STATISTICS at all (8108, whatever the schema),
+		// which is an unsupported feature rather than a check the walk
+		// models, so it claims nothing either way.
+		// The resource control statements name resource groups and watch
+		// list entries, neither of which the walk holds; dropping out here
+		// instead would end the walk and lose every statement after one.
+		// RENAME USER and SET PASSWORD join the other user statements for
+		// that reason: both parsed already, and both reached the default
+		// arm, so either one in the middle of a change script ended the
+		// walk and hid every finding below it.
+		// KILL is here for the same reason. RECOMMEND INDEX, SET CONFIG, ALTER
+		// RANGE and CANCEL DISTRIBUTION JOB name an advisor option, a config
+		// item, a placement policy and a job. The walk holds none of those, so
+		// the answers each can get on v8.5.5 (unknown option, unknown policy,
+		// range name not supported, a job that is gone) are not its to claim.
+		// RECOMMEND INDEX RUN FOR 'sql' does read the tables its text names and
+		// answers 1146 for a missing one, but that text is a string the parser
+		// never opens, so the walk claims nothing about it either.
+
+		return true
+	}
+	// Everything else leaves the walk claiming nothing from here on, which is
+	// where LOCK TABLES has always been and where LOCK STATS and UNLOCK STATS
+	// join it. Neither changes a name the walk keeps, but both fail on a table
+	// that is not there (1146 on pingcap/tidb:v8.5.5, read on 2026-11-04), so
+	// listing them above as statements with no effect would drop a rejection
+	// the review ought to report rather than add one it should not.
+	//
+	// TiDB's backup, restore, recover and flashback statements are here for
+	// both halves of that reason. RESTORE, RECOVER TABLE and the bring-back
+	// FLASHBACK forms each put a relation or a schema back without saying
+	// what is in it, and FLASHBACK CLUSTER ... TO TIMESTAMP rolls the whole
+	// cluster back, so the walk cannot keep its names accurate past any of
+	// them; FLASHBACK TABLE t TO t1 is no help either, since it is not a
+	// rename -- t must be gone already and t1 is created. BACKUP changes
+	// nothing at all, but it does fail on a table that is not there (1146
+	// for BACKUP TABLE nosuch on v8.5.5, read on 2026-11-04), which is the
+	// LOCK STATS case exactly. PLAN REPLAYER LOAD is here for the first
+	// half of it: the dump it reads creates the relations it holds, and
+	// nothing in the statement says which.
+	return false
+}
+
+// admin lowers TiDB's ADMIN. Nothing in the family changes a name the walk
+// keeps, so no kind records anything, but a kind that names relations needs
+// each of them to exist: v8.5.5 answers 1146 for ADMIN CHECK TABLE nosuch,
+// ADMIN CHECKSUM TABLE nosuch, ADMIN SHOW nosuch NEXT_ROW_ID, ADMIN
+// CLEANUP TABLE LOCK nosuch, and ADMIN CHECK, RECOVER, and CLEANUP INDEX
+// nosuch idx. A view and a sequence are relations here, not a wrong kind:
+// ADMIN CHECK TABLE and ADMIN CHECKSUM TABLE both succeed on either.
+//
+// Everything else these statements fail on is a runtime check the walk does
+// not model and does not claim: a missing index (1105), a temporary table
+// (8006 for ADMIN CHECK TABLE, 1146 for ADMIN SHOW ... NEXT_ROW_ID, both
+// against a table the walk knows is there), a missing plugin (1105), a
+// disabled feature (1105 for EVOLVE BINDINGS and RELOAD STATISTICS), and
+// the server not running in repair mode (8215 for every ADMIN REPAIR
+// TABLE). ADMIN REPAIR TABLE's CREATE TABLE is a table's definition, but
+// the statement never creates a table: in repair mode it rewrites the
+// metadata of one that is already there, so the walk neither records the
+// table nor needs its name free.
+func (b *builder) admin(v *ast.AdminStmt) bool {
+	switch v.Kind {
+	case ast.AdminCheckTable, ast.AdminChecksumTable, ast.AdminShowNextRowID,
+		ast.AdminCleanupTableLock, ast.AdminCheckIndex, ast.AdminCheckIndexRange,
+		ast.AdminRecoverIndex, ast.AdminCleanupIndex:
+		return b.relationsExist(v.Tables)
+	}
+	return true
+}
+
+// dropStats lowers TiDB's DROP STATS. It discards statistics and changes no
+// name the walk keeps, but every table it names has to be there: v8.5.5
+// answers 1146 for DROP STATS nosuch (read on 2026-11-04). A view is a
+// relation here and not a wrong kind -- DROP STATS on a view succeeds -- so
+// the check is relationsExist, not tableNeeds.
+//
+// What it does not claim is the partition arm: DROP STATS t PARTITION p0
+// against a table with no partitions is 1505, a runtime check the walk does
+// not model.
+func (b *builder) dropStats(v *ast.DropStatsStmt) bool {
+	return b.relationsExist(v.Tables)
+}
+
+// createStatistics lowers TiDB's CREATE STATISTICS. An extended statistic is
+// not a name the walk holds, so nothing is recorded, but the table it reads
+// has to be there: v8.5.5 resolves the table first and answers 1146 for
+// CREATE STATISTICS s (CARDINALITY) ON nosuch(a).
+//
+// With the table in place the statement still fails -- 8108, "Unsupported
+// type", for every form, since v8.5.5's executor does not run this statement
+// at all -- and that is an unsupported feature rather than a check the walk
+// models, as a disabled feature is under ADMIN. So the missing table is
+// reported and nothing else is claimed.
+func (b *builder) createStatistics(v *ast.CreateStatisticsStmt) bool {
+	if v.Table == nil {
+		return true
+	}
+	return b.relationsExist([]*ast.TableRef{v.Table})
+}
+
+// wrapper lowers the three statements that carry another: EXPLAIN, TRACE and
+// PLAN REPLAYER DUMP. The form that runs nothing -- a plain EXPLAIN, a
+// TRACE PLAN, a plain DUMP -- is followed without recording anything, since
+// reporting a plan or writing a dump changes no name the walk keeps. The form
+// that runs the statement is lowered as the statement it performs, or the walk
+// would lose the change: EXPLAIN ANALYZE ALTER TABLE t ADD COLUMN c and
+// PLAN REPLAYER DUMP EXPLAIN ANALYZE ALTER TABLE t ADD COLUMN c each add the
+// column, and TRACE runs the DML and SET it carries. wrapped says which form
+// is which, and where each verdict was measured.
+func (b *builder) wrapper(v ast.Node) bool {
+	inner, runs, _ := wrapped(v)
+	if !runs || inner == nil {
+		return true
+	}
+	return b.statement(inner)
+}
+
+// tableNeeds adds the check that a statement's table exists as a base
+// table (1146 missing, 1347 a view).
+func (b *builder) tableNeeds(r tableRef) {
+	b.needKind(relKey(r.db, r.name), []string{relTable}, r.rng, notFound("table", r.written, ""), r.written, "table")
+}
+
+// databaseNeeds adds the check that a database exists (1049).
+func (b *builder) databaseNeeds(db, written string, rng review.Range) {
+	b.need(dbKey(db), walk.Present, nil, rng, notFound("database", ident(written), ""), "")
+}
+
+func (b *builder) createDatabase(v *ast.CreateDatabaseStmt) bool {
+	rng := b.anchor()
+	if b.tooLong(v.Name, rng) {
+		return true
+	}
+	d, ok := b.key(spaceDatabase, v.Name)
+	if !ok {
+		return false
+	}
+	k := dbKey(d)
+	prior, _ := b.l.Lookup(k)
+	if !v.IfNotExists {
+		b.need(k, walk.Absent, nil, rng, "", alreadyExists("database", ident(v.Name), "")) // 1007
+		prior = walk.Absent
+	}
+	switch prior {
+	case walk.Absent:
+		b.Set(k, walk.Present, "")
+		b.clearDatabase(d)
+	case walk.Unknown:
+		b.Set(k, walk.Present, "")
+	}
+	return true
+}
+
+func (b *builder) dropDatabase(v *ast.DropDatabaseStmt) bool {
+	d, ok := b.key(spaceDatabase, v.Name)
+	if !ok {
+		return false
+	}
+	k := dbKey(d)
+	if !v.IfExists {
+		b.need(k, walk.Present, nil, b.anchor(), notFound("database", ident(v.Name), ""), "") // 1008
+	}
+	b.Set(k, walk.Absent, "")
+	b.clearDatabase(d)
+	if !b.w.lost && d == b.w.current {
+		b.Session(func() { b.w.noDatabase = true })
+	}
+	return true
+}
+
+// clearDatabase records that a database holds nothing, temporary tables
+// aside: a session's temporary tables outlive DROP DATABASE of theirs
+// (verified).
+func (b *builder) clearDatabase(d string) {
+	for _, space := range []string{spaceRelation, spaceColumn, spaceIndex, spaceTableForeignKey} {
+		b.Clear(walk.Scope{Space: space, Parent: walk.Path(d), Deep: true})
+	}
+}
+
+// alterDatabase follows ALTER DATABASE, of the current database when it
+// names none, which fails once that is dropped (1046, verified).
+func (b *builder) alterDatabase(v *ast.AlterDatabaseStmt) bool {
+	if v.Name == "" {
+		if b.w.noDatabase && !b.w.lost {
+			b.fail(b.anchor(), []walk.Key{dbKey(b.w.current)}, review.NoCurrentSchema, noDatabase("ALTER DATABASE"))
+		}
+		return true
+	}
+	d, ok := b.key(spaceDatabase, v.Name)
+	if ok {
+		b.databaseNeeds(d, v.Name, b.anchor())
+	}
+	return true
+}
+
+func (b *builder) use(v *ast.UseStmt) bool {
+	d, ok := b.key(spaceDatabase, v.Database)
+	if !ok {
+		b.Session(func() { b.w.lost = true })
+		return true
+	}
+	b.databaseNeeds(d, v.Database, b.anchor())
+	b.Session(func() {
+		b.w.current, b.w.noDatabase, b.w.lost = d, false, false
+	})
+	return true
+}
+
+// createTable follows CREATE [TEMPORARY] TABLE [IF NOT EXISTS], with a
+// column list, LIKE, or AS SELECT.
+func (b *builder) createTable(v *ast.CreateTableStmt) bool {
+	if b.namesTooLong(v) {
+		return true
+	}
+	r, st := b.ref(v.Table)
+	switch st {
+	case refFailed:
+		return true
+	case refUnknown:
+		return false
+	}
+	// One object: every check holds against the state before the
+	// statement, and the creation is a part of its own, one IF NOT EXISTS
+	// may skip.
+	b.Order = walk.Lookups
+	if v.Table.Schema != "" {
+		b.databaseNeeds(r.db, v.Table.Schema, r.rng)
+	}
+	// Every base table keeps foreign keys, whatever its ENGINE; a
+	// temporary table takes none (1215, verified), and neither does a global
+	// temporary table, which is an ordinary schema object everywhere else
+	// (1215 on v8.5.5, verified).
+	b.fks = !v.Temporary && !v.Global
+	// The LIKE source is checked even when IF NOT EXISTS finds the table
+	// (verified).
+	if v.Like != nil {
+		src, st := b.ref(v.Like)
+		switch st {
+		case refFailed:
+			return true
+		case refOK:
+			if f, temp, _ := b.resolve(src); !temp && f != walk.Unknown {
+				b.tableNeeds(src)
+			}
+		}
+	}
+	if v.Temporary {
+		tk := tempKey(r.db, r.name)
+		prior, _ := b.l.Lookup(tk)
+		if !v.IfNotExists {
+			b.needFree(tk, r.rng, r.written, relTable) // 1050
+		}
+		if v.IfNotExists && prior != walk.Absent {
+			// A note when the table exists, its text unread (verified).
+			if prior == walk.Unknown {
+				b.Set(tk, walk.Present, relTable)
+			}
+			return true
+		}
+		if b.tableTextFails(v, r) {
+			return true
+		}
+		b.Set(tk, walk.Present, relTable)
+		return true
+	}
+	k := relKey(r.db, r.name)
+	prior, _ := b.l.Lookup(k)
+	if !v.IfNotExists {
+		b.needFree(k, r.rng, r.written, relTable) // 1050
+		prior = walk.Absent
+	}
+	if prior == walk.Present {
+		return true // a note: nothing is created
+	}
+	b.Next()
+	if prior == walk.Unknown {
+		// The table may exist, as a table or a view, and the statement be
+		// a note: what it would create may or may not be there.
+		b.Optional()
+	}
+	if b.tableTextFails(v, r) {
+		return true
+	}
+	if b.fks {
+		// A foreign key's name is the table's: one another table's foreign
+		// key has is free here (verified).
+		for _, c := range v.Constraints {
+			if c.Type == ast.ConstrForeignKey {
+				b.foreignKeyTarget(r, c)
+			}
+		}
+	}
+	b.created(v, r)
+	if prior == walk.Unknown {
+		b.Next()
+		b.Set(k, walk.Present, "")
+	}
+	return true
+}
+
+// namesTooLong fails a CREATE TABLE naming a table, column, index, or
+// foreign key longer than 64 characters. The name after FOREIGN KEY counts
+// only without a CONSTRAINT symbol, which names the foreign key in its
+// place, and so does the name after UNIQUE (verified). A CHECK
+// constraint's name does not count: with tidb_enable_check_constraint off,
+// TiDB's default, it takes a long one with a warning (verified on
+// v8.5.5), and the walk does not know the setting.
+func (b *builder) namesTooLong(v *ast.CreateTableStmt) bool {
+	if v.Table != nil && b.tooLong(v.Table.Name, rangeOf(v.Table.Loc)) {
+		return true
+	}
+	for _, c := range v.Columns {
+		if b.tooLong(c.Name, rangeOf(c.Loc)) {
+			return true
+		}
+	}
+	for _, c := range v.Constraints {
+		if c.Type != ast.ConstrCheck && b.tooLong(keyName(c), rangeOf(c.Loc)) {
+			return true
+		}
+	}
+	return false
+}
+
+// tableTextFails fails a CREATE TABLE its text alone refutes (verified):
+// a column named twice (1060), two indexes of one name (1061), two foreign
+// keys of one name (1826, or 1061 for the index each would add), two
+// primary keys (1068), or an index named PRIMARY (1280).
+func (b *builder) tableTextFails(v *ast.CreateTableStmt, r tableRef) bool {
+	columns := make(map[string]bool)
+	for _, c := range v.Columns {
+		k, ok := b.key(spaceColumn, c.Name)
+		if !ok {
+			continue
+		}
+		if columns[k] {
+			b.fail(rangeOf(c.Loc), nil, review.DuplicateName, statesTwice("declares", "column", ident(c.Name)))
+			return true
+		}
+		columns[k] = true
+	}
+	primaries := 0
+	indexes := make(map[string]bool)
+	foreignKeys := make(map[string]bool)
+	for _, c := range v.Columns {
+		for _, cc := range c.Constraints {
+			if cc.Type == ast.ColConstrPrimaryKey {
+				primaries++
+			}
+		}
+	}
+	for _, c := range v.Constraints {
+		switch c.Type {
+		case ast.ConstrPrimaryKey:
+			primaries++
+			continue
+		case ast.ConstrForeignKey:
+			if k, ok := b.key(spaceTableForeignKey, keyName(c)); ok && b.fks {
+				if foreignKeys[k] {
+					b.fail(rangeOf(c.Loc), nil, review.DuplicateName, statesTwice("declares", "foreign key", ident(keyName(c))))
+					return true
+				}
+				foreignKeys[k] = true
+			}
+			continue
+		case ast.ConstrCheck:
+			continue
+		}
+		k, ok := b.key(spaceIndex, c.Name)
+		switch {
+		case !ok:
+			continue
+		case k == primaryIndex:
+			b.fail(rangeOf(c.Loc), nil, review.ReservedName, reservedPrimary)
+			return true
+		case indexes[k]:
+			b.fail(rangeOf(c.Loc), nil, review.DuplicateName, statesTwice("declares", "index", ident(c.Name)))
+			return true
+		}
+		indexes[k] = true
+	}
+	if primaries > 1 {
+		b.fail(r.rng, nil, review.NameTaken, hasPrimaryKey(r.written))
+		return true
+	}
+	return false
+}
+
+// created records what a CREATE TABLE makes: the table, holding exactly
+// its column list's columns and named keys, with generated names as
+// May-effects. A table copied with LIKE or filled from a query holds what
+// the walk does not follow. Otherwise a table has no primary key it does
+// not declare: TiDB has no invisible one, and no generated index name is
+// PRIMARY (1280). Its hidden row id is Unknown.
+func (b *builder) created(v *ast.CreateTableStmt, r tableRef) {
+	path := tablePath(r.db, r.name)
+	b.Set(relKey(r.db, r.name), walk.Present, relTable)
+	b.Clear(walk.Scope{Parent: path, Deep: true})
+	if v.Like != nil || v.Select != nil {
+		b.Forget(walk.Scope{Parent: path, Deep: true})
+	}
+	primary := false
+	for _, c := range v.Columns {
+		if k, ok := b.key(spaceColumn, c.Name); ok {
+			b.Set(colKey(r.db, r.name, k), walk.Present, "")
+		}
+		primary = b.columnKeys(r, c) || primary
+	}
+	for _, c := range v.Constraints {
+		primary = b.constraint(r, c) || primary
+	}
+	if !primary && v.Like == nil && v.Select == nil {
+		b.Set(idxKey(r.db, r.name, primaryIndex), walk.Absent, "")
+	}
+	b.Set(colKey(r.db, r.name, rowIDColumn), walk.Unknown, "")
+}
+
+// columnKeys records the keys a column definition declares inline, and
+// reports whether one is the primary key. An inline REFERENCES makes no
+// foreign key (verified); its generated name is a May-effect all the
+// same.
+func (b *builder) columnKeys(r tableRef, c *ast.ColumnDef) bool {
+	primary := false
+	for _, cc := range c.Constraints {
+		switch cc.Type {
+		case ast.ColConstrPrimaryKey:
+			b.Set(idxKey(r.db, r.name, primaryIndex), walk.Present, "")
+			primary = true
+		case ast.ColConstrUnique:
+			b.MayAdd(walk.Scope{Space: spaceIndex, Parent: tablePath(r.db, r.name)})
+		case ast.ColConstrReferences:
+			b.mayAddForeignKeys(r)
+		}
+	}
+	return primary
+}
+
+// constraint records a table constraint a CREATE or ALTER TABLE adds, and
+// reports whether it is the primary key: named keys and foreign keys are
+// Present, unnamed ones generated names. A foreign key adds an index of
+// its own when none serves it, named after it (verified).
+func (b *builder) constraint(r tableRef, c *ast.Constraint) bool {
+	indexes := walk.Scope{Space: spaceIndex, Parent: tablePath(r.db, r.name)}
+	switch c.Type {
+	case ast.ConstrPrimaryKey:
+		b.Set(idxKey(r.db, r.name, primaryIndex), walk.Present, "")
+		return true
+	case ast.ConstrCheck:
+	case ast.ConstrForeignKey:
+		k, ok := b.key(spaceTableForeignKey, keyName(c))
+		switch {
+		case ok && b.fks:
+			b.Set(fkKey(r, k), walk.Present, "")
+		case ok:
+			b.Set(fkKey(r, k), walk.Unknown, "")
+		default:
+			b.mayAddForeignKeys(r)
+		}
+		b.MayAdd(indexes)
+	default:
+		if k, ok := b.key(spaceIndex, c.Name); ok {
+			b.Set(idxKey(r.db, r.name, k), walk.Present, "")
+		} else {
+			b.MayAdd(indexes)
+		}
+	}
+	return false
+}
+
+// mayAddForeignKeys records a foreign key of a generated name, fk_<n>.
+func (b *builder) mayAddForeignKeys(r tableRef) {
+	b.MayAdd(walk.Scope{Space: spaceTableForeignKey, Parent: tablePath(r.db, r.name), Prefix: generatedFKs})
+}
+
+// foreignKeyTarget checks a foreign key's referenced table while the
+// session checks foreign keys: it must be a base table (1824 for a missing
+// one or a temporary table, which shadows none here; 3734 for a sequence,
+// which has no columns; 3780 for a view; verified). A table that refers to
+// itself needs nothing.
+func (b *builder) foreignKeyTarget(r tableRef, c *ast.Constraint) {
+	if b.w.fkChecks != review.SwitchOn || c.RefTable == nil {
+		return
+	}
+	// An unqualified parent is in the child's database (verified).
+	ref := *c.RefTable
+	if ref.Schema == "" {
+		ref.Schema = r.db
+		if strings.HasPrefix(r.db, nonASCII) {
+			return
+		}
+	}
+	t, st := b.ref(&ref)
+	if st != refOK || t.db == r.db && t.name == r.name {
+		return
+	}
+	t.written = table(c.RefTable)
+	b.needKind(relKey(t.db, t.name), []string{relTable}, t.rng, notFound("referenced table", t.written, ""), t.written, "table a foreign key can reference")
+}

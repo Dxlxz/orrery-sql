@@ -1,0 +1,950 @@
+package parser
+
+import (
+	nodes "github.com/Dxlxz/orrery-sql/tidb/ast"
+)
+
+// parseBeginEndBlock parses a BEGIN...END compound statement block.
+//
+// Ref: https://dev.mysql.com/doc/refman/8.0/en/begin-end.html
+//
+//	[begin_label:] BEGIN
+//	    [statement_list]
+//	END [end_label]
+//
+// The label, if any, must already be consumed by the caller and passed as labelName.
+func (p *Parser) parseBeginEndBlock(labelName string, labelStart int) (*nodes.BeginEndBlock, error) {
+	start := labelStart
+	if labelName == "" {
+		start = p.pos()
+	}
+
+	p.advance() // consume BEGIN
+
+	stmt := &nodes.BeginEndBlock{
+		Loc:   nodes.Loc{Start: start},
+		Label: labelName,
+	}
+
+	// Parse statements until END
+	for p.cur.Type != kwEND && p.cur.Type != tokEOF {
+		s, err := p.parseCompoundStmtOrStmt()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Stmts = append(stmt.Stmts, s)
+
+		if err := p.expectStoredProgramStmtTerminator(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Consume END
+	if _, err := p.expect(kwEND); err != nil {
+		return nil, err
+	}
+
+	// Optional end_label — only a labeled block takes one. TiDB v8.5.5
+	// parser.y:16318 attaches ProcedurceLabelOpt to ProcedureLabeledBlock
+	// (identifier ':' ProcedureBlockContent ProcedurceLabelOpt); the unlabeled
+	// ProcedureBlockContent (:16162) ends at END, so a trailing token there
+	// (e.g. "BEGIN END zzz") is 1064.
+	if labelName != "" && p.isLabelIdentToken() && p.cur.Type != tokEOF {
+		stmt.EndLabel = p.cur.Str
+		p.advance()
+	}
+
+	stmt.Loc.End = p.prev.End
+	return stmt, nil
+}
+
+// parseCompoundStmtOrStmt tries to parse compound statements (DECLARE, labeled blocks,
+// flow control) and falls back to regular statement parsing.
+func (p *Parser) parseCompoundStmtOrStmt() (nodes.Node, error) {
+	if err := p.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer p.leaveNesting()
+	// DECLARE
+	if p.cur.Type == kwDECLARE {
+		return p.parseDeclareStmt()
+	}
+
+	// BEGIN ... END (without label)
+	if p.cur.Type == kwBEGIN {
+		return p.parseBeginEndBlock("", 0)
+	}
+
+	// IF statement
+	if p.cur.Type == kwIF {
+		return p.parseIfStmt()
+	}
+
+	// CASE statement
+	if p.cur.Type == kwCASE {
+		return p.parseCaseStmt()
+	}
+
+	// WHILE loop (without label)
+	if p.cur.Type == kwWHILE {
+		return p.parseWhileStmt("", 0)
+	}
+
+	// REPEAT loop (without label)
+	if p.cur.Type == kwREPEAT {
+		return p.parseRepeatStmt("", 0)
+	}
+
+	// LOOP — TiDB v8.5.0 has no LOOP ... END LOOP in stored programs.
+	if p.cur.Type == kwLOOP {
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	// LEAVE
+	if p.cur.Type == kwLEAVE {
+		return p.parseLeaveStmt()
+	}
+
+	// ITERATE
+	if p.cur.Type == kwITERATE {
+		return p.parseIterateStmt()
+	}
+
+	// RETURN
+	if p.cur.Type == kwRETURN {
+		return p.parseReturnStmt()
+	}
+
+	// OPEN cursor
+	if p.cur.Type == kwOPEN {
+		return p.parseOpenCursorStmt()
+	}
+
+	// FETCH cursor
+	if p.cur.Type == kwFETCH {
+		return p.parseFetchCursorStmt()
+	}
+
+	// CLOSE cursor
+	if p.cur.Type == kwCLOSE {
+		return p.parseCloseCursorStmt()
+	}
+
+	// Label: check for identifier followed by ':'
+	if p.isLabelIdentToken() && p.cur.Type != kwEND {
+		next := p.peekNext()
+		if next.Type == ':' {
+			name := p.cur.Str
+			nameStart := p.pos()
+			p.advance() // consume identifier
+			p.advance() // consume ':'
+			// Labeled BEGIN...END
+			if p.cur.Type == kwBEGIN {
+				return p.parseBeginEndBlock(name, nameStart)
+			}
+			// Labeled WHILE
+			if p.cur.Type == kwWHILE {
+				return p.parseWhileStmt(name, nameStart)
+			}
+			// Labeled REPEAT
+			if p.cur.Type == kwREPEAT {
+				return p.parseRepeatStmt(name, nameStart)
+			}
+			// Labeled LOOP — TiDB v8.5.0 has no LOOP.
+			if p.cur.Type == kwLOOP {
+				return nil, p.syntaxErrorAtCur()
+			}
+			return nil, &ParseError{
+				Message:  "expected BEGIN, WHILE, or REPEAT after label",
+				Position: p.cur.Loc,
+			}
+		}
+	}
+
+	// ADMIN does not reach a routine body. TiDB's procedure grammar takes a
+	// narrower statement list than its top level, and ADMIN is outside it:
+	// v8.5.5 answers 1064 for CREATE PROCEDURE p() ADMIN SHOW DDL and for
+	// the same statement inside BEGIN ... END, a WHILE body, and an IF
+	// branch, where CREATE PROCEDURE p() SELECT 1 reaches 8108 instead.
+	//
+	// SHOW, FLUSH, and BATCH are outside that list too and this parser still
+	// takes them here; narrowing the body to TiDB's list is its own change,
+	// and this guard only keeps ADMIN from joining them.
+	if p.cur.Type == kwADMIN {
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	// Regular statement
+	return p.parseStmt()
+}
+
+// parseDeclareStmt parses DECLARE statements inside compound blocks.
+// Dispatches to variable, condition, handler, or cursor declarations.
+//
+// DECLARE var [, var] ... type [DEFAULT value]
+// DECLARE condition_name CONDITION FOR condition_value
+// DECLARE handler_action HANDLER FOR condition_value [, ...] stmt
+// DECLARE cursor_name CURSOR FOR select_stmt
+func (p *Parser) parseDeclareStmt() (nodes.Node, error) {
+	start := p.pos()
+	p.advance() // consume DECLARE
+
+	// Check for handler: CONTINUE | EXIT | UNDO
+	if p.cur.Type == kwCONTINUE || p.cur.Type == kwEXIT || p.cur.Type == kwUNDO {
+		return p.parseDeclareHandlerStmt(start)
+	}
+
+	// We need to look ahead to determine if it's CONDITION, CURSOR, or variable.
+	// Parse the first identifier name.
+	name, _, err := p.parseIdentifier()
+	if err != nil {
+		return nil, err
+	}
+
+	// DECLARE name CONDITION FOR ... — TiDB v8.5.0 has no DECLARE ... CONDITION.
+	if p.cur.Type == kwCONDITION {
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	// DECLARE name CURSOR FOR ...
+	if p.cur.Type == kwCURSOR {
+		return p.parseDeclareCursorStmt(start, name)
+	}
+
+	// DECLARE var [, var] ... type [DEFAULT value]
+	return p.parseDeclareVarStmt(start, name)
+}
+
+// parseDeclareVarStmt parses a DECLARE variable statement.
+// The first variable name has already been consumed.
+//
+//	DECLARE var_name [, var_name] ... type [DEFAULT value]
+func (p *Parser) parseDeclareVarStmt(start int, firstName string) (*nodes.DeclareVarStmt, error) {
+	stmt := &nodes.DeclareVarStmt{
+		Loc:   nodes.Loc{Start: start},
+		Names: []string{firstName},
+	}
+
+	// Additional variable names separated by commas
+	for p.cur.Type == ',' {
+		p.advance()
+		name, _, err := p.parseIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Names = append(stmt.Names, name)
+	}
+
+	// Data type
+	dt, err := p.parseDataType()
+	if err != nil {
+		return nil, err
+	}
+	stmt.TypeName = dt
+
+	// Optional DEFAULT value
+	if p.cur.Type == kwDEFAULT {
+		p.advance()
+		val, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.collectMode() && val == nil {
+			return nil, p.syntaxErrorAtCur()
+		}
+		stmt.Default = val
+	}
+
+	stmt.Loc.End = p.prev.End
+	return stmt, nil
+}
+
+// parseDeclareConditionStmt parses DECLARE condition_name CONDITION FOR condition_value.
+// The condition name has already been consumed.
+//
+//	DECLARE condition_name CONDITION FOR condition_value
+//	condition_value: SQLSTATE [VALUE] sqlstate_value | mysql_error_code
+func (p *Parser) parseDeclareConditionStmt(start int, name string) (*nodes.DeclareConditionStmt, error) {
+	p.advance() // consume CONDITION
+
+	// FOR
+	if _, err := p.expect(kwFOR); err != nil {
+		return nil, err
+	}
+
+	stmt := &nodes.DeclareConditionStmt{
+		Loc:  nodes.Loc{Start: start},
+		Name: name,
+	}
+
+	// condition_value
+	condVal, err := p.parseHandlerConditionValue()
+	if err != nil {
+		return nil, err
+	}
+	stmt.ConditionValue = condVal
+
+	stmt.Loc.End = p.prev.End
+	return stmt, nil
+}
+
+// parseDeclareHandlerStmt parses DECLARE handler_action HANDLER FOR condition_value [, ...] stmt.
+//
+//	DECLARE {CONTINUE|EXIT|UNDO} HANDLER FOR condition_value [, condition_value] ... statement
+func (p *Parser) parseDeclareHandlerStmt(start int) (*nodes.DeclareHandlerStmt, error) {
+	stmt := &nodes.DeclareHandlerStmt{
+		Loc: nodes.Loc{Start: start},
+	}
+
+	// handler_action
+	switch p.cur.Type {
+	case kwCONTINUE:
+		stmt.Action = "CONTINUE"
+	case kwEXIT:
+		stmt.Action = "EXIT"
+	case kwUNDO:
+		stmt.Action = "UNDO"
+	}
+	p.advance()
+
+	// HANDLER
+	if _, err := p.expect(kwHANDLER); err != nil {
+		return nil, err
+	}
+
+	// FOR
+	if _, err := p.expect(kwFOR); err != nil {
+		return nil, err
+	}
+
+	// condition_value [, condition_value] ...
+	for {
+		condVal, err := p.parseHandlerConditionValue()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Conditions = append(stmt.Conditions, condVal)
+		if p.cur.Type != ',' {
+			break
+		}
+		p.advance()
+	}
+
+	// handler statement body
+	body, err := p.parseCompoundStmtOrStmt()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Stmt = body
+
+	stmt.Loc.End = p.prev.End
+	return stmt, nil
+}
+
+// parseDeclareCursorStmt parses DECLARE cursor_name CURSOR FOR select_statement.
+// The cursor name has already been consumed.
+//
+//	DECLARE cursor_name CURSOR FOR select_statement
+func (p *Parser) parseDeclareCursorStmt(start int, name string) (*nodes.DeclareCursorStmt, error) {
+	p.advance() // consume CURSOR
+
+	// FOR
+	if _, err := p.expect(kwFOR); err != nil {
+		return nil, err
+	}
+
+	// select_statement
+	sel, err := p.parseSelectStmt()
+	if err != nil {
+		return nil, err
+	}
+
+	return &nodes.DeclareCursorStmt{
+		Loc:    nodes.Loc{Start: start, End: p.prev.End},
+		Name:   name,
+		Select: sel,
+	}, nil
+}
+
+// parseHandlerConditionValue parses a handler condition value.
+//
+// TiDB v8.5.5 parser.y:16025 (ProcedureHcond) takes only these forms — there
+// is no condition_name alternative, because TiDB has no DECLARE ... CONDITION:
+//
+//	condition_value:
+//	    mysql_error_code                 (ProcedurceCond: NUM)
+//	  | SQLSTATE [VALUE] sqlstate_value  (ProcedurceCond)
+//	  | SQLWARNING
+//	  | NOT FOUND
+//	  | SQLEXCEPTION
+//
+// So a bare keyword or identifier (e.g. "FOUND" without NOT) is 1064.
+func (p *Parser) parseHandlerConditionValue() (string, error) {
+	// SQLSTATE [VALUE] 'sqlstate_value'
+	if p.cur.Type == kwSQLSTATE {
+		p.advance()
+		// Optional VALUE
+		if p.cur.Type == kwVALUE {
+			p.advance()
+		}
+		if p.cur.Type != tokSCONST {
+			return "", &ParseError{
+				Message:  "expected SQLSTATE value string",
+				Position: p.cur.Loc,
+			}
+		}
+		val := p.cur.Str
+		p.advance()
+		return val, nil
+	}
+
+	// SQLWARNING
+	if p.cur.Type == kwSQLWARNING {
+		p.advance()
+		return "SQLWARNING", nil
+	}
+
+	// SQLEXCEPTION
+	if p.cur.Type == kwSQLEXCEPTION {
+		p.advance()
+		return "SQLEXCEPTION", nil
+	}
+
+	// NOT FOUND
+	if p.cur.Type == kwNOT {
+		p.advance()
+		if _, err := p.expect(kwFOUND); err != nil {
+			return "", err
+		}
+		return "NOT FOUND", nil
+	}
+
+	// mysql_error_code (integer literal)
+	if p.cur.Type == tokICONST {
+		val := p.cur.Str
+		p.advance()
+		return val, nil
+	}
+
+	// No condition_name alternative in TiDB; anything else is a syntax error.
+	return "", p.syntaxErrorAtCur()
+}
+
+// isCompoundTerminator checks if the current token is a keyword that terminates
+// a statement list inside a compound block (END, ELSEIF, ELSE, UNTIL, WHEN).
+func (p *Parser) isCompoundTerminator() bool {
+	switch p.cur.Type {
+	case kwEND, kwELSEIF, kwELSE, kwUNTIL, kwWHEN, tokEOF:
+		return true
+	}
+	return false
+}
+
+// parseCompoundStmtList parses a list of statements inside a compound block,
+// stopping at any compound terminator keyword.
+func (p *Parser) parseCompoundStmtList() ([]nodes.Node, error) {
+	var stmts []nodes.Node
+	for !p.isCompoundTerminator() {
+		s, err := p.parseCompoundStmtOrStmt()
+		if err != nil {
+			return nil, err
+		}
+		stmts = append(stmts, s)
+		if err := p.expectStoredProgramStmtTerminator(); err != nil {
+			return nil, err
+		}
+	}
+	return stmts, nil
+}
+
+// expectStoredProgramStmtTerminator consumes the ';' that ends every
+// declaration and statement of a stored program body: ProcedureDecls and
+// ProcedureProcStmts in TiDB v8.5.5 parser.y:16126 and 16138 follow each one
+// with ';', so "BEGIN SELECT 1 SELECT 2; END" and "BEGIN BEGIN SELECT 1; END
+// END" are 1064 there.
+func (p *Parser) expectStoredProgramStmtTerminator() error {
+	if p.cur.Type == ';' {
+		p.advance()
+		return nil
+	}
+	return p.syntaxErrorAtCur()
+}
+
+// parseIfStmt parses an IF/ELSEIF/ELSE/END IF compound statement.
+//
+//	IF search_condition THEN statement_list
+//	  [ELSEIF search_condition THEN statement_list] ...
+//	  [ELSE statement_list]
+//	END IF
+func (p *Parser) parseIfStmt() (*nodes.IfStmt, error) {
+	start := p.pos()
+	p.advance() // consume IF
+
+	// Parse condition
+	cond, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if cond == nil {
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	// THEN
+	if _, err := p.expect(kwTHEN); err != nil {
+		return nil, err
+	}
+
+	// Parse THEN statement list
+	thenList, err := p.parseCompoundStmtList()
+	if err != nil {
+		return nil, err
+	}
+
+	stmt := &nodes.IfStmt{
+		Loc:      nodes.Loc{Start: start},
+		Cond:     cond,
+		ThenList: thenList,
+	}
+
+	// Parse ELSEIF clauses
+	for p.cur.Type == kwELSEIF {
+		eiStart := p.pos()
+		p.advance() // consume ELSEIF
+
+		eiCond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if eiCond == nil {
+			return nil, p.syntaxErrorAtCur()
+		}
+
+		if _, err := p.expect(kwTHEN); err != nil {
+			return nil, err
+		}
+
+		eiThenList, err := p.parseCompoundStmtList()
+		if err != nil {
+			return nil, err
+		}
+
+		stmt.ElseIfs = append(stmt.ElseIfs, &nodes.ElseIf{
+			Loc:      nodes.Loc{Start: eiStart, End: p.prev.End},
+			Cond:     eiCond,
+			ThenList: eiThenList,
+		})
+	}
+
+	// Parse optional ELSE clause
+	if p.cur.Type == kwELSE {
+		p.advance() // consume ELSE
+
+		elseList, err := p.parseCompoundStmtList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.ElseList = elseList
+	}
+
+	// END IF
+	if _, err := p.expect(kwEND); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(kwIF); err != nil {
+		return nil, err
+	}
+
+	stmt.Loc.End = p.prev.End
+	return stmt, nil
+}
+
+// parseCaseStmt parses a CASE statement (not expression) in stored programs.
+//
+//	CASE case_value
+//	  WHEN when_value THEN statement_list
+//	  [WHEN when_value THEN statement_list] ...
+//	  [ELSE statement_list]
+//	END CASE
+//
+//	CASE
+//	  WHEN search_condition THEN statement_list
+//	  [WHEN search_condition THEN statement_list] ...
+//	  [ELSE statement_list]
+//	END CASE
+func (p *Parser) parseCaseStmt() (*nodes.CaseStmtNode, error) {
+	start := p.pos()
+	p.advance() // consume CASE
+
+	stmt := &nodes.CaseStmtNode{
+		Loc: nodes.Loc{Start: start},
+	}
+
+	// Simple CASE: if next token is not WHEN, parse operand
+	if p.cur.Type != kwWHEN {
+		operand, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.collectMode() && operand == nil {
+			return nil, p.syntaxErrorAtCur()
+		}
+		stmt.Operand = operand
+	}
+
+	// Parse WHEN clauses
+	for p.cur.Type == kwWHEN {
+		whenStart := p.pos()
+		p.advance() // consume WHEN
+
+		whenCond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if whenCond == nil {
+			return nil, p.syntaxErrorAtCur()
+		}
+
+		if _, err := p.expect(kwTHEN); err != nil {
+			return nil, err
+		}
+
+		whenThenList, err := p.parseCompoundStmtList()
+		if err != nil {
+			return nil, err
+		}
+
+		stmt.Whens = append(stmt.Whens, &nodes.CaseStmtWhen{
+			Loc:      nodes.Loc{Start: whenStart, End: p.prev.End},
+			Cond:     whenCond,
+			ThenList: whenThenList,
+		})
+	}
+
+	// Optional ELSE clause
+	if p.cur.Type == kwELSE {
+		p.advance() // consume ELSE
+
+		elseList, err := p.parseCompoundStmtList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.ElseList = elseList
+	}
+
+	// END CASE
+	if _, err := p.expect(kwEND); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(kwCASE); err != nil {
+		return nil, err
+	}
+
+	stmt.Loc.End = p.prev.End
+	return stmt, nil
+}
+
+// parseWhileStmt parses a WHILE loop compound statement.
+//
+//	[begin_label:] WHILE search_condition DO
+//	  statement_list
+//	END WHILE [end_label]
+func (p *Parser) parseWhileStmt(labelName string, labelStart int) (*nodes.WhileStmt, error) {
+	start := labelStart
+	if labelName == "" {
+		start = p.pos()
+	}
+	p.advance() // consume WHILE
+
+	// Parse condition
+	cond, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if cond == nil {
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	// DO
+	if _, err := p.expect(kwDO); err != nil {
+		return nil, err
+	}
+
+	// Parse statement list until END
+	stmts, err := p.parseCompoundStmtList()
+	if err != nil {
+		return nil, err
+	}
+
+	// END WHILE
+	if _, err := p.expect(kwEND); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(kwWHILE); err != nil {
+		return nil, err
+	}
+
+	// Optional end_label — only a labeled loop takes one. TiDB v8.5.5
+	// parser.y:16342 attaches ProcedurceLabelOpt to ProcedurelabeledLoopStmt;
+	// the unlabeled ProcedureUnlabelLoopStmt (:16302) ends at END WHILE, so a
+	// trailing token there (e.g. "END WHILE zzz") is 1064.
+	var endLabel string
+	if labelName != "" && p.isLabelIdentToken() && p.cur.Type != tokEOF && p.cur.Type != ';' {
+		endLabel = p.cur.Str
+		p.advance()
+	}
+
+	return &nodes.WhileStmt{
+		Loc:      nodes.Loc{Start: start, End: p.prev.End},
+		Label:    labelName,
+		EndLabel: endLabel,
+		Cond:     cond,
+		Stmts:    stmts,
+	}, nil
+}
+
+// parseRepeatStmt parses a REPEAT loop compound statement.
+//
+//	[begin_label:] REPEAT
+//	  statement_list
+//	UNTIL search_condition
+//	END REPEAT [end_label]
+func (p *Parser) parseRepeatStmt(labelName string, labelStart int) (*nodes.RepeatStmt, error) {
+	start := labelStart
+	if labelName == "" {
+		start = p.pos()
+	}
+	p.advance() // consume REPEAT
+
+	// Parse statement list until UNTIL
+	stmts, err := p.parseCompoundStmtList()
+	if err != nil {
+		return nil, err
+	}
+
+	// UNTIL
+	if _, err := p.expect(kwUNTIL); err != nil {
+		return nil, err
+	}
+
+	// Parse condition
+	cond, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if cond == nil {
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	// END REPEAT
+	if _, err := p.expect(kwEND); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(kwREPEAT); err != nil {
+		return nil, err
+	}
+
+	// Optional end_label — only a labeled loop takes one. TiDB v8.5.5
+	// parser.y:16342 attaches ProcedurceLabelOpt to ProcedurelabeledLoopStmt;
+	// the unlabeled ProcedureUnlabelLoopStmt (:16302) ends at END REPEAT, so a
+	// trailing token there (e.g. "END REPEAT zzz") is 1064.
+	var endLabel string
+	if labelName != "" && p.isLabelIdentToken() && p.cur.Type != tokEOF && p.cur.Type != ';' {
+		endLabel = p.cur.Str
+		p.advance()
+	}
+
+	return &nodes.RepeatStmt{
+		Loc:      nodes.Loc{Start: start, End: p.prev.End},
+		Label:    labelName,
+		EndLabel: endLabel,
+		Stmts:    stmts,
+		Cond:     cond,
+	}, nil
+}
+
+// parseLoopStmt parses a LOOP compound statement.
+//
+//	[begin_label:] LOOP
+//	  statement_list
+//	END LOOP [end_label]
+func (p *Parser) parseLoopStmt(labelName string, labelStart int) (*nodes.LoopStmt, error) {
+	start := labelStart
+	if labelName == "" {
+		start = p.pos()
+	}
+	p.advance() // consume LOOP
+
+	// Parse statement list until END
+	stmts, err := p.parseCompoundStmtList()
+	if err != nil {
+		return nil, err
+	}
+
+	// END LOOP
+	if _, err := p.expect(kwEND); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(kwLOOP); err != nil {
+		return nil, err
+	}
+
+	// Optional end_label — only a labeled loop takes one (see parseWhileStmt).
+	// TiDB v8.5.5 has no LOOP in procedures, so this path is unreachable, but
+	// the guard keeps the unlabeled form from accepting a trailing end label.
+	var endLabel string
+	if labelName != "" && p.isLabelIdentToken() && p.cur.Type != tokEOF && p.cur.Type != ';' {
+		endLabel = p.cur.Str
+		p.advance()
+	}
+
+	return &nodes.LoopStmt{
+		Loc:      nodes.Loc{Start: start, End: p.prev.End},
+		Label:    labelName,
+		EndLabel: endLabel,
+		Stmts:    stmts,
+	}, nil
+}
+
+// parseLeaveStmt parses a LEAVE label statement.
+//
+//	LEAVE label
+func (p *Parser) parseLeaveStmt() (*nodes.LeaveStmt, error) {
+	start := p.pos()
+	p.advance() // consume LEAVE
+
+	label, _, err := p.parseLabelIdent()
+	if err != nil {
+		return nil, err
+	}
+
+	return &nodes.LeaveStmt{
+		Loc:   nodes.Loc{Start: start, End: p.prev.End},
+		Label: label,
+	}, nil
+}
+
+// parseIterateStmt parses an ITERATE label statement.
+//
+//	ITERATE label
+func (p *Parser) parseIterateStmt() (*nodes.IterateStmt, error) {
+	start := p.pos()
+	p.advance() // consume ITERATE
+
+	label, _, err := p.parseLabelIdent()
+	if err != nil {
+		return nil, err
+	}
+
+	return &nodes.IterateStmt{
+		Loc:   nodes.Loc{Start: start, End: p.prev.End},
+		Label: label,
+	}, nil
+}
+
+// parseReturnStmt parses a RETURN expr statement.
+//
+//	RETURN expr
+func (p *Parser) parseReturnStmt() (*nodes.ReturnStmt, error) {
+	start := p.pos()
+	p.advance() // consume RETURN
+
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.collectMode() && expr == nil {
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	return &nodes.ReturnStmt{
+		Loc:  nodes.Loc{Start: start, End: p.prev.End},
+		Expr: expr,
+	}, nil
+}
+
+// parseOpenCursorStmt parses an OPEN cursor_name statement.
+//
+//	OPEN cursor_name
+func (p *Parser) parseOpenCursorStmt() (*nodes.OpenCursorStmt, error) {
+	start := p.pos()
+	p.advance() // consume OPEN
+
+	name, _, err := p.parseIdentifier()
+	if err != nil {
+		return nil, err
+	}
+
+	return &nodes.OpenCursorStmt{
+		Loc:  nodes.Loc{Start: start, End: p.prev.End},
+		Name: name,
+	}, nil
+}
+
+// parseFetchCursorStmt parses a FETCH cursor statement.
+//
+//	FETCH [[NEXT] FROM] cursor_name INTO var_name [, var_name] ...
+func (p *Parser) parseFetchCursorStmt() (*nodes.FetchCursorStmt, error) {
+	start := p.pos()
+	p.advance() // consume FETCH
+
+	// ProcedureOptFetchNo — TiDB v8.5.5 parser.y:16098 allows only the empty
+	// prefix, "NEXT FROM", or "FROM"; there is no bare "NEXT". So once NEXT is
+	// seen, FROM is required (e.g. "FETCH NEXT ident INTO ..." is 1064).
+	if p.cur.Type == kwNEXT {
+		p.advance()
+		if _, err := p.expect(kwFROM); err != nil {
+			return nil, err
+		}
+	} else if p.cur.Type == kwFROM {
+		p.advance()
+	}
+
+	// cursor_name
+	name, _, err := p.parseIdentifier()
+	if err != nil {
+		return nil, err
+	}
+
+	// INTO
+	if _, err := p.expect(kwINTO); err != nil {
+		return nil, err
+	}
+
+	// var_name [, var_name] ... — lvalue context (assignment target)
+	var vars []string
+	for {
+		v, _, err := p.parseLvalueIdent()
+		if err != nil {
+			return nil, err
+		}
+		vars = append(vars, v)
+		if p.cur.Type != ',' {
+			break
+		}
+		p.advance()
+	}
+
+	return &nodes.FetchCursorStmt{
+		Loc:  nodes.Loc{Start: start, End: p.prev.End},
+		Name: name,
+		Into: vars,
+	}, nil
+}
+
+// parseCloseCursorStmt parses a CLOSE cursor_name statement.
+//
+//	CLOSE cursor_name
+func (p *Parser) parseCloseCursorStmt() (*nodes.CloseCursorStmt, error) {
+	start := p.pos()
+	p.advance() // consume CLOSE
+
+	name, _, err := p.parseIdentifier()
+	if err != nil {
+		return nil, err
+	}
+
+	return &nodes.CloseCursorStmt{
+		Loc:  nodes.Loc{Start: start, End: p.prev.End},
+		Name: name,
+	}, nil
+}

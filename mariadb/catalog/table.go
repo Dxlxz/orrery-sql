@@ -1,0 +1,354 @@
+package catalog
+
+type Table struct {
+	Name             string
+	Database         *Database
+	Columns          []*Column
+	colByName        map[string]int // lowered name -> index
+	Indexes          []*Index
+	Constraints      []*Constraint
+	Engine           string
+	Charset          string
+	Collation        string
+	Comment          string
+	AutoIncrement    int64
+	Temporary        bool
+	RowFormat        string
+	KeyBlockSize     int
+	Compression      string
+	Encryption       string
+	StatsPersistent  string
+	StatsAutoRecalc  string
+	StatsSamplePages string
+	MinRows          string
+	MaxRows          string
+	AvgRowLength     string
+	Tablespace       string
+	PackKeys         string
+	Checksum         string
+	DelayKeyWrite    string
+	Partitioning     *PartitionInfo
+
+	// System versioning (MariaDB temporal). SystemVersioned is set by
+	// WITH SYSTEM VERSIONING or by any versioned/period column.
+	SystemVersioned bool
+	PeriodStartCol  string
+	PeriodEndCol    string
+
+	// Application-time period: PERIOD FOR <name> (start, end). A table may have
+	// at most one; AppPeriodName is empty when absent.
+	AppPeriodName     string
+	AppPeriodStartCol string
+	AppPeriodEndCol   string
+
+	// droppedByCleanup tracks indexes auto-removed by DROP COLUMN cleanup
+	// during multi-command ALTER TABLE. This allows a subsequent explicit
+	// DROP INDEX in the same ALTER to succeed (matching MySQL 8.0 behavior).
+	droppedByCleanup map[string]bool
+}
+
+// PartitionInfo holds partition metadata for a table.
+type PartitionInfo struct {
+	Type        string   // RANGE, LIST, HASH, KEY
+	Linear      bool     // LINEAR HASH or LINEAR KEY
+	Expr        string   // partition expression (for RANGE/LIST/HASH)
+	Columns     []string // partition columns (for RANGE COLUMNS/LIST COLUMNS/KEY)
+	Algorithm   int      // ALGORITHM={1|2} for KEY partitioning
+	NumParts    int      // PARTITIONS num
+	Partitions  []*PartitionDefInfo
+	SubType     string   // subpartition type (HASH or KEY, "" if none)
+	SubLinear   bool     // LINEAR for subpartition
+	SubExpr     string   // subpartition expression
+	SubColumns  []string // subpartition columns
+	SubAlgo     int      // subpartition ALGORITHM
+	NumSubParts int      // actual subpartition count per partition
+	// MySQL tracks subpartition defaulting separately from NumSubParts.
+	// These mirror partition_info::use_default_subpartitions and
+	// partition_info::use_default_num_subpartitions.
+	UseDefaultSubpartitions    bool
+	UseDefaultNumSubpartitions bool
+	// keyColumns are the columns the partitioning and subpartitioning functions read,
+	// which every unique key must include (partition_key_coverage.go). Empty when the
+	// catalog cannot tell them, which skips the check.
+	keyColumns []string
+
+	// SYSTEM_TIME partitioning (Type == "SYSTEM_TIME").
+	IntervalValue string // INTERVAL <value>
+	IntervalUnit  string // interval unit (MONTH, WEEK, ...)
+	Limit         int    // LIMIT n (0 if none)
+	Starts        string // STARTS <expr> ("" if none)
+	Auto          bool   // AUTO
+}
+
+// PartitionDefInfo holds a single partition definition.
+type PartitionDefInfo struct {
+	Name          string
+	ValueExpr     string // "LESS THAN (...)" or "IN (...)" or ""
+	SystemTime    string // "HISTORY" | "CURRENT" for SYSTEM_TIME partitions
+	Engine        string // ENGINE option for this partition
+	Comment       string // COMMENT option for this partition
+	SubPartitions []*SubPartitionDefInfo
+}
+
+// SubPartitionDefInfo holds a single subpartition definition.
+type SubPartitionDefInfo struct {
+	Name    string
+	Engine  string
+	Comment string
+}
+
+type Column struct {
+	Position          int
+	Name              string
+	DataType          string // normalized (int, varchar, etc.)
+	ColumnType        string // full type string (varchar(100), int unsigned)
+	Nullable          bool
+	Default           *string
+	DefaultKind       ColumnDefaultKind
+	DefaultDropped    bool // true when ALTER COLUMN DROP DEFAULT was used
+	AutoIncrement     bool
+	Charset           string
+	Collation         string
+	Comment           string
+	OnUpdate          string
+	OnUpdateKind      ColumnDefaultKind
+	Generated         *GeneratedColumnInfo
+	Invisible         bool
+	Hidden            ColumnHiddenKind
+	SRID              int          // Spatial Reference ID (0 = not set)
+	DefaultAnalyzed   AnalyzedExpr // Phase 3: analyzed DEFAULT expression
+	GeneratedAnalyzed AnalyzedExpr // Phase 3: analyzed GENERATED ALWAYS AS expression
+	// SystemVersioning is "WITH" / "WITHOUT" for a column-level
+	// WITH/WITHOUT SYSTEM VERSIONING attribute, else "".
+	SystemVersioning string
+	// IsJSON records that the column was declared JSON. MariaDB has no JSON
+	// type and keeps the column as longtext with a json_valid check, which is
+	// what DataType and ColumnType hold; this says what it was written as, for
+	// a caller that needs to tell such a column from a plain longtext.
+	IsJSON bool
+}
+
+type ColumnDefaultKind int
+
+const (
+	ColumnDefaultNone ColumnDefaultKind = iota
+	ColumnDefaultConstant
+	ColumnDefaultCurrentTimestamp
+	ColumnDefaultExpression
+)
+
+type ColumnHiddenKind int
+
+const (
+	ColumnHiddenNone ColumnHiddenKind = iota
+	ColumnHiddenSystem
+)
+
+type GeneratedColumnInfo struct {
+	Expr   string
+	Stored bool
+	// Nondeterministic names the non-deterministic function the expression
+	// calls, spelled as MariaDB spells it in its 1901 message, or "" where it
+	// calls none. It is recorded when the column is defined, while the
+	// expression is still an AST, because a key added later materializes a
+	// VIRTUAL column's value and the server then refuses the expression:
+	// measured on mariadb:11.8.8, `CREATE INDEX idx ON t(a)` over
+	// `a DOUBLE AS (RAND()) VIRTUAL` answers 1901 just as declaring the key
+	// with the table does.
+	Nondeterministic string
+	// Refs holds the columns the expression reads, recorded at the same time
+	// and for the same reason: MariaDB carries nondeterminism through them, so
+	// a materialized column that takes its value from a non-deterministic
+	// generated column is refused too. See nondeterministicDependency.
+	Refs []string
+	// RowBound is "ROW START" / "ROW END" for a system-versioning period
+	// column (GENERATED ALWAYS AS ROW START/END), else "".
+	RowBound string
+}
+
+type View struct {
+	Name            string
+	Database        *Database
+	Definition      string
+	Algorithm       string
+	Definer         string
+	SqlSecurity     string
+	CheckOption     string
+	Columns         []string // All column names (explicit or derived from SELECT)
+	ColumnMetadata  []ViewColumn
+	ExplicitColumns bool   // true if the user specified a column list in CREATE VIEW
+	AnalyzedQuery   *Query // analyzed view body (populated on CREATE VIEW); nil if analysis failed
+	IsUpdatable     bool
+}
+
+type ViewColumn struct {
+	Name      string
+	Nullable  bool
+	Type      *ResolvedType
+	Charset   string
+	Collation string
+}
+
+// Routine represents a stored function or procedure in the catalog.
+type Routine struct {
+	Name            string
+	Database        *Database
+	IsProcedure     bool
+	Definer         string
+	Params          []*RoutineParam
+	Returns         string // return type string for functions (empty for procedures)
+	Body            string
+	Characteristics map[string]string // name -> value (DETERMINISTIC, COMMENT, etc.)
+}
+
+// RoutineParam represents a parameter of a stored routine.
+type RoutineParam struct {
+	Direction string // IN, OUT, INOUT (empty for functions)
+	Name      string
+	TypeName  string // full type string
+}
+
+// Trigger represents a trigger in the catalog.
+type Trigger struct {
+	Name     string
+	Database *Database
+	Table    string // table name the trigger is on
+	Timing   string // BEFORE, AFTER
+	Event    string // INSERT, UPDATE, DELETE
+	Definer  string
+	Body     string
+	// SourceText is the CREATE TRIGGER statement from its TRIGGER keyword to
+	// its end, as the statement was written, which is what SHOW CREATE TRIGGER
+	// echoes. It is empty for a trigger that did not come from a statement
+	// this catalog executed, such as a synced one.
+	SourceText          string
+	CharacterSetClient  string
+	CollationConnection string
+	DatabaseCollation   string
+	Order               *TriggerOrderInfo
+}
+
+// TriggerOrderInfo represents FOLLOWS/PRECEDES ordering.
+type TriggerOrderInfo struct {
+	Follows     bool
+	TriggerName string
+}
+
+// Event represents a scheduled event in the catalog.
+type Event struct {
+	Name         string
+	Database     *Database
+	Definer      string
+	Schedule     string // raw schedule text (e.g. "EVERY 1 HOUR", "AT '2024-01-01 00:00:00'")
+	OnCompletion string // PRESERVE, NOT PRESERVE, or "" (default NOT PRESERVE)
+	Enable       string // ENABLE, DISABLE, DISABLE ON SLAVE, or "" (default ENABLE)
+	Comment      string
+	Body         string
+}
+
+// cloneTable returns a deep copy of the table's mutable state.
+// The returned Table shares the same Name, Database pointer, and scalar fields,
+// but has independent slices and maps so that mutations do not affect the original.
+func cloneTable(src *Table) Table {
+	dst := *src // shallow copy of all scalar fields
+
+	// Deep copy columns.
+	dst.Columns = make([]*Column, len(src.Columns))
+	for i, sc := range src.Columns {
+		col := *sc
+		if sc.Default != nil {
+			def := *sc.Default
+			col.Default = &def
+		}
+		if sc.Generated != nil {
+			gen := *sc.Generated
+			// Refs is a slice, so the struct copy would leave the clone
+			// writing through to it: a rejected ALTER restores this snapshot,
+			// and a rename it had already applied would survive in the
+			// restored table and leave the dependency pointing at a name no
+			// column has.
+			gen.Refs = append([]string(nil), sc.Generated.Refs...)
+			col.Generated = &gen
+		}
+		dst.Columns[i] = &col
+	}
+
+	// Deep copy colByName.
+	dst.colByName = make(map[string]int, len(src.colByName))
+	for k, v := range src.colByName {
+		dst.colByName[k] = v
+	}
+
+	// Deep copy indexes.
+	dst.Indexes = make([]*Index, len(src.Indexes))
+	for i, si := range src.Indexes {
+		idx := *si
+		idx.Table = src // keep pointing to the original table pointer
+		cols := make([]*IndexColumn, len(si.Columns))
+		for j, sc := range si.Columns {
+			ic := *sc
+			cols[j] = &ic
+		}
+		idx.Columns = cols
+		dst.Indexes[i] = &idx
+	}
+
+	// Deep copy constraints.
+	dst.Constraints = make([]*Constraint, len(src.Constraints))
+	for i, sc := range src.Constraints {
+		con := *sc
+		con.Table = src
+		con.Columns = append([]string{}, sc.Columns...)
+		con.RefColumns = append([]string{}, sc.RefColumns...)
+		dst.Constraints[i] = &con
+	}
+
+	// Deep copy partitioning.
+	if src.Partitioning != nil {
+		pi := *src.Partitioning
+		pi.Columns = append([]string{}, src.Partitioning.Columns...)
+		pi.SubColumns = append([]string{}, src.Partitioning.SubColumns...)
+		pi.keyColumns = append([]string(nil), src.Partitioning.keyColumns...)
+		pi.Partitions = make([]*PartitionDefInfo, len(src.Partitioning.Partitions))
+		for i, sp := range src.Partitioning.Partitions {
+			pd := *sp
+			pd.SubPartitions = make([]*SubPartitionDefInfo, len(sp.SubPartitions))
+			for j, ss := range sp.SubPartitions {
+				sd := *ss
+				pd.SubPartitions[j] = &sd
+			}
+			pi.Partitions[i] = &pd
+		}
+		dst.Partitioning = &pi
+	}
+
+	return dst
+}
+
+func (t *Table) GetColumn(name string) *Column {
+	idx, ok := t.colByName[toLower(name)]
+	if !ok {
+		return nil
+	}
+	return t.Columns[idx]
+}
+
+func (t *Table) VisibleColumns() []*Column {
+	result := make([]*Column, 0, len(t.Columns))
+	for _, col := range t.Columns {
+		if col.Hidden == ColumnHiddenNone {
+			result = append(result, col)
+		}
+	}
+	return result
+}
+
+func (t *Table) HiddenColumns() []*Column {
+	result := make([]*Column, 0)
+	for _, col := range t.Columns {
+		if col.Hidden != ColumnHiddenNone {
+			result = append(result, col)
+		}
+	}
+	return result
+}

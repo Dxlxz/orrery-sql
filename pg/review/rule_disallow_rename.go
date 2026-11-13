@@ -1,0 +1,27 @@
+package review
+
+import (
+	"github.com/Dxlxz/orrery-sql/pg/ast"
+	"github.com/Dxlxz/orrery-sql/review"
+)
+
+// checkDisallowRename reports the RENAME TO of a relation a query reads
+// by name (ALTER TABLE, ALTER FOREIGN TABLE, ALTER VIEW, and ALTER
+// MATERIALIZED VIEW) and the rename of a column of any relation kind, at
+// top level or inside a SQL-standard routine body. Renaming an index, a
+// sequence, a constraint, a schema, or another object is not in scope.
+func checkDisallowRename(s *statement, r *reporter) {
+	ast.Inspect(s.node, func(n ast.Node) bool {
+		v, ok := n.(*ast.RenameStmt)
+		if !ok {
+			return true
+		}
+		switch v.RenameType {
+		case ast.OBJECT_TABLE, ast.OBJECT_FOREIGN_TABLE, ast.OBJECT_VIEW, ast.OBJECT_MATVIEW:
+			r.report(review.RenamesObject, s.index, rangeOf(v.Loc), "Renames "+objectKind(v.RenameType)+" "+review.Code(relation(v.Relation))+" to "+review.Code(ident(v.Newname))+".")
+		case ast.OBJECT_COLUMN:
+			r.report(review.RenamesObject, s.index, rangeOf(v.Loc), "Renames column "+review.Code(ident(v.Subname))+" of "+review.Code(relation(v.Relation))+" to "+review.Code(ident(v.Newname))+".")
+		}
+		return true
+	})
+}

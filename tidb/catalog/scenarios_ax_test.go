@@ -1,0 +1,610 @@
+package catalog
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
+
+// TestScenario_AX covers section AX (ALTER TABLE sub-command implicit
+// behaviors) from mysql/catalog/SCENARIOS-mysql-implicit-behavior.md. Each subtest
+// asserts that real MySQL 8.0 and the orrery catalog agree on the
+// post-ALTER state (column order, index list, constraint presence,
+// error behavior) for a given ALTER TABLE sequence.
+//
+// Failures in orrery assertions are NOT proof failures — they are
+// recorded in mysql/catalog/scenarios_bug_queue/ax.md.
+func TestScenario_AX(t *testing.T) {
+	mc, cleanup := scenarioContainer(t)
+	defer cleanup()
+
+	// --- AX.1 ADD COLUMN append / FIRST / AFTER --------------------------
+	t.Run("AX_1_AddColumn_append_first_after", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT, b INT, c INT);
+ALTER TABLE t ADD COLUMN d INT;
+ALTER TABLE t ADD COLUMN e INT FIRST;
+ALTER TABLE t ADD COLUMN f INT AFTER a;`)
+
+		// Oracle: columns ordered.
+		want := []string{"e", "a", "f", "b", "c", "d"}
+		oracle := axOracleColumnOrder(t, mc, "t")
+		assertStringEq(t, "oracle column order", strings.Join(oracle, ","), strings.Join(want, ","))
+
+		// orrery
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+			return
+		}
+		orrery := axOrreryColumnOrder(tbl)
+		assertStringEq(t, "orrery column order", strings.Join(orrery, ","), strings.Join(want, ","))
+	})
+
+	// --- AX.2 DROP COLUMN covered by a composite index rejects ----------
+	t.Run("AX_2_DropColumn_composite_index_rejects", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		// Only the CREATE runs on both; the DROP is expected to fail.
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT, b INT, c INT, INDEX idx_a(a), INDEX idx_ab(a, b), INDEX idx_bc(b, c));`)
+
+		// TiDB v8.5.5 rejects dropping column a — it is covered by the
+		// composite index idx_ab(a, b) — with 8200, unlike MySQL which strips
+		// a from idx_ab and keeps the index on the surviving column.
+		_, oracleErr := mc.db.ExecContext(mc.ctx, `ALTER TABLE t DROP COLUMN a`)
+		if oracleErr == nil {
+			t.Errorf("oracle: expected error dropping composite-index column, got nil")
+		}
+
+		results, _ := c.Exec(`ALTER TABLE t DROP COLUMN a`, nil)
+		if !axExecHasError(results) {
+			t.Errorf("orrery: expected error dropping composite-index column, got nil")
+		}
+	})
+
+	// --- AX.3 DROP COLUMN rejects last-column removal --------------------
+	t.Run("AX_3_DropColumn_rejects_last_column", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT);`)
+
+		// Oracle rejects with ER_CANT_REMOVE_ALL_FIELDS (1090).
+		_, oracleErr := mc.db.ExecContext(mc.ctx, `ALTER TABLE t DROP COLUMN a`)
+		if oracleErr == nil {
+			t.Errorf("oracle: expected error dropping last column, got nil")
+		}
+
+		// orrery should also reject.
+		results, perr := c.Exec(`ALTER TABLE t DROP COLUMN a`, nil)
+		orreryRejected := perr != nil
+		if !orreryRejected {
+			for _, r := range results {
+				if r.Error != nil {
+					orreryRejected = true
+					break
+				}
+			}
+		}
+		if !orreryRejected {
+			t.Errorf("orrery: expected error dropping last column, got nil")
+		}
+	})
+
+	// --- AX.4 DROP COLUMN rejects when referenced by CHECK or GENERATED --
+	t.Run("AX_4_DropColumn_rejects_check_or_generated_ref", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t1 (a INT, b INT, CHECK (a > 0));
+CREATE TABLE t2 (a INT, b INT GENERATED ALWAYS AS (a + 1));`)
+
+		// Oracle: check behavior of both DROPs against this container's
+		// MySQL build. We then assert orrery matches whatever oracle does.
+		_, oracleErrCheck := mc.db.ExecContext(mc.ctx, `ALTER TABLE t1 DROP COLUMN a`)
+		_, oracleErrGen := mc.db.ExecContext(mc.ctx, `ALTER TABLE t2 DROP COLUMN a`)
+
+		// orrery
+		r1, _ := c.Exec(`ALTER TABLE t1 DROP COLUMN a`, nil)
+		orreryBlockedCheck := axExecHasError(r1)
+		if (oracleErrCheck != nil) != orreryBlockedCheck {
+			t.Errorf("orrery vs oracle CHECK-ref DROP divergence: oracleErr=%v orreryBlocked=%v", oracleErrCheck, orreryBlockedCheck)
+		}
+		r2, _ := c.Exec(`ALTER TABLE t2 DROP COLUMN a`, nil)
+		orreryBlockedGen := axExecHasError(r2)
+		if (oracleErrGen != nil) != orreryBlockedGen {
+			t.Errorf("orrery vs oracle GENERATED-ref DROP divergence: oracleErr=%v orreryBlocked=%v", oracleErrGen, orreryBlockedGen)
+		}
+	})
+
+	// --- AX.5 MODIFY COLUMN rewrites spec; attrs NOT inherited ----------
+	t.Run("AX_5_ModifyColumn_rewrites_spec", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT NOT NULL AUTO_INCREMENT PRIMARY KEY, b INT NOT NULL DEFAULT 5 COMMENT 'x');
+ALTER TABLE t MODIFY COLUMN b BIGINT;`)
+
+		var isNullable, colComment string
+		var colDefault *string
+		oracleScan(t, mc, `SELECT IS_NULLABLE, COLUMN_DEFAULT, COLUMN_COMMENT FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t' AND COLUMN_NAME='b'`,
+			&isNullable, &colDefault, &colComment)
+		if isNullable != "YES" {
+			t.Errorf("oracle b nullable: got %q, want YES", isNullable)
+		}
+		if colDefault != nil {
+			t.Errorf("oracle b default: got %v, want nil", *colDefault)
+		}
+		if colComment != "" {
+			t.Errorf("oracle b comment: got %q, want empty", colComment)
+		}
+
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+			return
+		}
+		col := tbl.GetColumn("b")
+		if col == nil {
+			t.Errorf("orrery: column b missing")
+			return
+		}
+		if !col.Nullable {
+			t.Errorf("orrery b nullable: got false, want true (MODIFY should not inherit NOT NULL)")
+		}
+		if col.Default != nil {
+			t.Errorf("orrery b default: got %q, want nil (MODIFY should not inherit DEFAULT)", *col.Default)
+		}
+		if col.Comment != "" {
+			t.Errorf("orrery b comment: got %q, want empty (MODIFY should not inherit COMMENT)", col.Comment)
+		}
+		if !strings.Contains(strings.ToLower(col.ColumnType), "bigint") && col.DataType != "bigint" {
+			t.Errorf("orrery b type: got %q/%q, want bigint", col.DataType, col.ColumnType)
+		}
+	})
+
+	// --- AX.6 CHANGE COLUMN atomic rename+retype ------------------------
+	t.Run("AX_6_ChangeColumn_rename_retype", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT);
+ALTER TABLE t CHANGE COLUMN a b BIGINT NOT NULL;`)
+
+		var colName, dataType, isNullable string
+		oracleScan(t, mc, `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t'`,
+			&colName, &dataType, &isNullable)
+		if colName != "b" || dataType != "bigint" || isNullable != "NO" {
+			t.Errorf("oracle: got (%q,%q,%q), want (b,bigint,NO)", colName, dataType, isNullable)
+		}
+
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+			return
+		}
+		if tbl.GetColumn("a") != nil {
+			t.Errorf("orrery: column a still present after CHANGE")
+		}
+		col := tbl.GetColumn("b")
+		if col == nil {
+			t.Errorf("orrery: column b missing after CHANGE")
+			return
+		}
+		if col.Nullable {
+			t.Errorf("orrery b nullable: got true, want false")
+		}
+		if !strings.Contains(strings.ToLower(col.ColumnType+" "+col.DataType), "bigint") {
+			t.Errorf("orrery b type: got %q/%q, want bigint", col.DataType, col.ColumnType)
+		}
+	})
+
+	// --- AX.7 ADD INDEX auto-name in ALTER context -----------------------
+	t.Run("AX_7_AddIndex_auto_name_alter", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT, b INT, INDEX (a));
+ALTER TABLE t ADD INDEX (b);
+ALTER TABLE t ADD INDEX (a, b);`)
+
+		want := []string{"a", "a_2", "b"}
+		oracle := axOracleIndexNames(t, mc, "t")
+		assertStringEq(t, "oracle index names", strings.Join(oracle, ","), strings.Join(want, ","))
+
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+			return
+		}
+		orrery := axOrreryIndexNames(tbl)
+		assertStringEq(t, "orrery index names", strings.Join(orrery, ","), strings.Join(want, ","))
+	})
+
+	// --- AX.8 ADD UNIQUE / KEY / FULLTEXT implicit index types ----------
+	t.Run("AX_8_AddUnique_Key_Fulltext_types", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT, b VARCHAR(100)) ENGINE=InnoDB;
+ALTER TABLE t ADD UNIQUE (a);
+ALTER TABLE t ADD KEY (b);
+ALTER TABLE t ADD FULLTEXT (b);`)
+
+		// Oracle check: examine STATISTICS for counts. TiDB v8.5.5 keeps the
+		// UNIQUE and the plain KEY but drops the FULLTEXT (ADD FULLTEXT adds
+		// nothing), so there are 2 index rows, not 3.
+		rows := oracleRows(t, mc, `SELECT INDEX_NAME, NON_UNIQUE, INDEX_TYPE FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t' ORDER BY INDEX_NAME`)
+		if len(rows) < 2 {
+			t.Errorf("oracle: expected >=2 index rows (UNIQUE + KEY), got %d", len(rows))
+		}
+
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+			return
+		}
+		var haveUnique, haveFulltext, havePlain bool
+		for _, idx := range tbl.Indexes {
+			if idx.Primary {
+				continue
+			}
+			if idx.Unique {
+				haveUnique = true
+			}
+			if idx.Fulltext {
+				haveFulltext = true
+			}
+			if !idx.Unique && !idx.Fulltext && !idx.Spatial && !idx.Primary {
+				havePlain = true
+			}
+		}
+		if !haveUnique {
+			t.Errorf("orrery: expected a UNIQUE index after ADD UNIQUE")
+		}
+		if !havePlain {
+			t.Errorf("orrery: expected a plain KEY index after ADD KEY")
+		}
+		// TiDB v8.5.5 drops FULLTEXT (ADD FULLTEXT adds nothing); orrery matches,
+		// so no FULLTEXT index is expected.
+		if haveFulltext {
+			t.Errorf("orrery: unexpected FULLTEXT index — TiDB adds none")
+		}
+	})
+
+	// --- AX.9 FK column-level shorthand silent-ignored in CREATE --------
+	t.Run("AX_9_FK_column_shorthand_silent_ignore", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE parent (id INT PRIMARY KEY);
+CREATE TABLE t1 (a INT);
+ALTER TABLE t1 ADD FOREIGN KEY (a) REFERENCES parent(id);
+CREATE TABLE t2 (a INT REFERENCES parent(id));`)
+
+		// Oracle: t1 has FK, t2 has none.
+		oracleT1 := oracleFKNames(t, mc, "t1")
+		if len(oracleT1) != 1 {
+			t.Errorf("oracle t1 FK count: got %d, want 1", len(oracleT1))
+		}
+		oracleT2 := oracleFKNames(t, mc, "t2")
+		if len(oracleT2) != 0 {
+			t.Errorf("oracle t2 FK count: got %d, want 0 (column-level REFERENCES should be ignored)", len(oracleT2))
+		}
+
+		tbl1 := c.GetDatabase("testdb").GetTable("t1")
+		tbl2 := c.GetDatabase("testdb").GetTable("t2")
+		if tbl1 == nil || tbl2 == nil {
+			t.Errorf("orrery: t1 or t2 missing")
+			return
+		}
+		if n := len(orreryFKNames(tbl1)); n != 1 {
+			t.Errorf("orrery t1 FK count: got %d, want 1", n)
+		}
+		if n := len(orreryFKNames(tbl2)); n != 0 {
+			t.Errorf("orrery t2 FK count: got %d, want 0 (column-level REFERENCES should be parsed-but-ignored)", n)
+		}
+	})
+
+	// --- AX.10 RENAME COLUMN preserves attributes ------------------------
+	t.Run("AX_10_RenameColumn_preserves_attrs", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT NOT NULL DEFAULT 5 COMMENT 'hi', INDEX (a));
+ALTER TABLE t RENAME COLUMN a TO aa;`)
+
+		var colName, isNullable, colComment string
+		var colDefault *string
+		oracleScan(t, mc, `SELECT COLUMN_NAME, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_COMMENT
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t'`,
+			&colName, &isNullable, &colDefault, &colComment)
+		if colName != "aa" || isNullable != "NO" || colComment != "hi" {
+			t.Errorf("oracle: got (%q,%q,%q), want (aa,NO,hi)", colName, isNullable, colComment)
+		}
+		if colDefault == nil || *colDefault != "5" {
+			t.Errorf("oracle default: got %v, want 5", colDefault)
+		}
+
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+			return
+		}
+		if tbl.GetColumn("a") != nil {
+			t.Errorf("orrery: column a still present after RENAME COLUMN")
+		}
+		col := tbl.GetColumn("aa")
+		if col == nil {
+			t.Errorf("orrery: column aa missing")
+			return
+		}
+		if col.Nullable {
+			t.Errorf("orrery aa nullable: got true, want false (attrs preserved)")
+		}
+		if col.Default == nil || *col.Default != "5" {
+			t.Errorf("orrery aa default: got %v, want 5", col.Default)
+		}
+		if col.Comment != "hi" {
+			t.Errorf("orrery aa comment: got %q, want hi", col.Comment)
+		}
+	})
+
+	// --- AX.11 RENAME INDEX ---------------------------------------------
+	t.Run("AX_11_RenameIndex", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT, b INT, INDEX old_name (a, b));
+ALTER TABLE t RENAME INDEX old_name TO new_name;`)
+
+		oracle := axOracleIndexNames(t, mc, "t")
+		want := []string{"new_name"}
+		assertStringEq(t, "oracle index names", strings.Join(oracle, ","), strings.Join(want, ","))
+
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+			return
+		}
+		orrery := axOrreryIndexNames(tbl)
+		assertStringEq(t, "orrery index names", strings.Join(orrery, ","), strings.Join(want, ","))
+	})
+
+	// --- AX.12 RENAME TO (table rename via ALTER) -----------------------
+	t.Run("AX_12_RenameTable_via_ALTER", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT);
+ALTER TABLE t RENAME TO t2;`)
+
+		// Oracle: t gone, t2 present.
+		var cnt int64
+		oracleScan(t, mc, `SELECT COUNT(*) FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t'`, &cnt)
+		if cnt != 0 {
+			t.Errorf("oracle: expected t to be gone, count=%d", cnt)
+		}
+		oracleScan(t, mc, `SELECT COUNT(*) FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t2'`, &cnt)
+		if cnt != 1 {
+			t.Errorf("oracle: expected t2 to exist, count=%d", cnt)
+		}
+
+		db := c.GetDatabase("testdb")
+		if db.GetTable("t") != nil {
+			t.Errorf("orrery: table t still present after RENAME TO t2")
+		}
+		if db.GetTable("t2") == nil {
+			t.Errorf("orrery: table t2 missing after RENAME TO")
+		}
+	})
+
+	// --- AX.13 ALTER COLUMN SET/DROP DEFAULT -----------------------------
+	// TiDB has no SET INVISIBLE/VISIBLE; refused_forms_test.go pins that.
+	t.Run("AX_13_AlterColumn_default_visibility", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT NOT NULL, b INT);
+ALTER TABLE t ALTER COLUMN a SET DEFAULT 5;`)
+
+		var colDefault *string
+		oracleScan(t, mc, `SELECT COLUMN_DEFAULT FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t' AND COLUMN_NAME='a'`, &colDefault)
+		if colDefault == nil || *colDefault != "5" {
+			t.Errorf("oracle a default after SET: got %v, want 5", colDefault)
+		}
+
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+			return
+		}
+		colA := tbl.GetColumn("a")
+		if colA == nil {
+			t.Errorf("orrery: column a missing")
+			return
+		}
+		if colA.Default == nil || *colA.Default != "5" {
+			t.Errorf("orrery a default after SET: got %v, want 5", colA.Default)
+		}
+
+		runOnBoth(t, mc, c, `ALTER TABLE t ALTER COLUMN a DROP DEFAULT;`)
+		oracleScan(t, mc, `SELECT COLUMN_DEFAULT FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t' AND COLUMN_NAME='a'`, &colDefault)
+		if colDefault != nil {
+			t.Errorf("oracle a default after DROP: got %q, want nil", *colDefault)
+		}
+		colA = c.GetDatabase("testdb").GetTable("t").GetColumn("a")
+		if colA.Default != nil {
+			t.Errorf("orrery a default after DROP: got %q, want nil", *colA.Default)
+		}
+
+	})
+
+	// --- AX.14 ALTER INDEX VISIBLE / INVISIBLE ---------------------------
+	t.Run("AX_14_AlterIndex_visibility", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT, b INT, INDEX idx_a (a));
+ALTER TABLE t ALTER INDEX idx_a INVISIBLE;`)
+
+		var isVisible string
+		oracleScan(t, mc, `SELECT IS_VISIBLE FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t' AND INDEX_NAME='idx_a' LIMIT 1`, &isVisible)
+		if isVisible != "NO" {
+			t.Errorf("oracle idx_a IS_VISIBLE: got %q, want NO", isVisible)
+		}
+
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+			return
+		}
+		var orreryIdx *Index
+		for _, idx := range tbl.Indexes {
+			if idx.Name == "idx_a" {
+				orreryIdx = idx
+				break
+			}
+		}
+		if orreryIdx == nil {
+			t.Errorf("orrery: index idx_a missing")
+			return
+		}
+		if orreryIdx.Visible {
+			t.Errorf("orrery idx_a Visible: got true, want false after INVISIBLE")
+		}
+	})
+
+	// --- AX.15 Multi-sub-command ALTER — drop/add/rename composed -------
+	t.Run("AX_15_MultiSubCommand_compose", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		if _, err := mc.db.ExecContext(mc.ctx, `CREATE TABLE t (a INT, b INT)`); err != nil {
+			t.Fatalf("oracle create t: %v", err)
+		}
+		if _, err := c.Exec(`CREATE TABLE t (a INT, b INT);`, nil); err != nil {
+			t.Fatalf("orrery create t: %v", err)
+		}
+
+		// TiDB v8.5.5 resolves every subcommand of a multi-command ALTER against
+		// the PRE-ALTER schema, so `ADD INDEX (c)` where column c is added in the
+		// same statement is rejected (1072 column does not exist: c). orrery matches
+		// (MySQL would resolve it against the composed in-progress table).
+		ddl := `ALTER TABLE t
+  ADD COLUMN c INT,
+  DROP COLUMN b,
+  ADD INDEX (c),
+  RENAME COLUMN a TO aa`
+		if _, oracleErr := mc.db.ExecContext(mc.ctx, ddl); oracleErr == nil {
+			t.Errorf("oracle: expected rejection of ADD INDEX on a same-statement column")
+		}
+		results, perr := c.Exec(ddl, nil)
+		orreryErr := perr
+		if orreryErr == nil && axExecHasError(results) {
+			orreryErr = fmt.Errorf("%v", results)
+		}
+		if orreryErr == nil {
+			t.Errorf("orrery: expected rejection of ADD INDEX on a same-statement column, got nil")
+		}
+
+		// The rejected ALTER leaves the table unchanged (columns a, b; no index).
+		want := []string{"a", "b"}
+		oracle := axOracleColumnOrder(t, mc, "t")
+		assertStringEq(t, "oracle column order", strings.Join(oracle, ","), strings.Join(want, ","))
+
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+			return
+		}
+		orrery := axOrreryColumnOrder(tbl)
+		assertStringEq(t, "orrery column order", strings.Join(orrery, ","), strings.Join(want, ","))
+		if len(tbl.Indexes) != 0 {
+			t.Errorf("orrery: expected no index after rejected ALTER, got %v", axOrreryIndexNames(tbl))
+		}
+	})
+}
+
+// axOracleColumnOrder returns the column names of the given table in
+// ORDINAL_POSITION order, as seen by the MySQL container.
+func axOracleColumnOrder(t *testing.T, mc *mysqlContainer, tableName string) []string {
+	t.Helper()
+	rows := oracleRows(t, mc, fmt.Sprintf(
+		`SELECT COLUMN_NAME FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME=%q ORDER BY ORDINAL_POSITION`, tableName))
+	var names []string
+	for _, row := range rows {
+		if len(row) > 0 {
+			names = append(names, asString(row[0]))
+		}
+	}
+	return names
+}
+
+// axOrreryColumnOrder returns the column names of the given orrery table
+// in positional order.
+func axOrreryColumnOrder(tbl *Table) []string {
+	names := make([]string, 0, len(tbl.Columns))
+	for _, col := range tbl.Columns {
+		names = append(names, col.Name)
+	}
+	return names
+}
+
+// axOracleIndexNames returns sorted distinct index names for a table
+// from information_schema.STATISTICS (PRIMARY excluded).
+func axOracleIndexNames(t *testing.T, mc *mysqlContainer, tableName string) []string {
+	t.Helper()
+	rows := oracleRows(t, mc, fmt.Sprintf(
+		`SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME=%q AND INDEX_NAME <> 'PRIMARY'
+         ORDER BY INDEX_NAME`, tableName))
+	var names []string
+	for _, row := range rows {
+		if len(row) > 0 {
+			names = append(names, asString(row[0]))
+		}
+	}
+	return names
+}
+
+// axOrreryIndexNames returns sorted non-primary index names for an orrery table.
+func axOrreryIndexNames(tbl *Table) []string {
+	var names []string
+	for _, idx := range tbl.Indexes {
+		if idx.Primary {
+			continue
+		}
+		names = append(names, idx.Name)
+	}
+	// Simple insertion sort to keep dep-free; tests compare joined strings.
+	for i := 1; i < len(names); i++ {
+		for j := i; j > 0 && names[j-1] > names[j]; j-- {
+			names[j-1], names[j] = names[j], names[j-1]
+		}
+	}
+	return names
+}
+
+// axExecHasError reports whether any ExecResult carries an error.
+func axExecHasError(results []ExecResult) bool {
+	for _, r := range results {
+		if r.Error != nil {
+			return true
+		}
+	}
+	return false
+}

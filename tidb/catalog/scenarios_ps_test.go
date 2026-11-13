@@ -1,0 +1,364 @@
+package catalog
+
+import (
+	"slices"
+	"sort"
+	"strings"
+	"testing"
+)
+
+// TestScenario_PS covers section PS of mysql/catalog/SCENARIOS-mysql-implicit-behavior.md
+// — "Path-split behaviors (CREATE vs ALTER)". Each subtest runs the scenario's
+// DDL against both a real MySQL 8.0 container and the orrery catalog and asserts
+// both match the expected value. Existing TestBugFix_* tests remain unchanged;
+// these TestScenario_PS tests are the durable dual-assertion versions.
+func TestScenario_PS(t *testing.T) {
+	mc, cleanup := scenarioContainer(t)
+	defer cleanup()
+
+	// PS.1 CHECK constraint counter — discarded under TiDB default.
+	// tidb_enable_check_constraint is OFF by default in v8.5.5, so both the
+	// named (t_chk_5) and the unnamed CHECK are parsed and discarded: no
+	// CHECK names are retained or counter-allocated on either engine.
+	t.Run("PS_1_Check_counter_CREATE_fresh", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (
+            a INT,
+            CONSTRAINT t_chk_5 CHECK (a > 0),
+            b INT,
+            CHECK (b < 100)
+        )`)
+
+		var want []string
+
+		rows := oracleRows(t, mc, `
+            SELECT CONSTRAINT_NAME FROM information_schema.CHECK_CONSTRAINTS
+            WHERE CONSTRAINT_SCHEMA='testdb'
+            ORDER BY CONSTRAINT_NAME`)
+		var oracleNames []string
+		for _, r := range rows {
+			oracleNames = append(oracleNames, asString(r[0]))
+		}
+		if !slices.Equal(oracleNames, want) {
+			t.Errorf("PS.1 oracle CHECK names: got %v, want %v", oracleNames, want)
+		}
+
+		orreryNames := psCheckNames(c, "t")
+		if !slices.Equal(orreryNames, want) {
+			t.Errorf("PS.1 orrery CHECK names: got %v, want %v", orreryNames, want)
+		}
+	})
+
+	// PS.2 CHECK constraint counter — discarded on the ALTER path too.
+	// Both the CREATE-time named CHECK and the ALTER ADD CHECK are parsed
+	// and discarded under the default OFF setting, so nothing is retained.
+	t.Run("PS_2_Check_counter_ALTER_maxplus1", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c,
+			`CREATE TABLE t (a INT, b INT, CONSTRAINT t_chk_20 CHECK (a>0))`)
+		runOnBoth(t, mc, c, `ALTER TABLE t ADD CHECK (b>0)`)
+
+		var want []string
+
+		rows := oracleRows(t, mc, `
+            SELECT CONSTRAINT_NAME FROM information_schema.CHECK_CONSTRAINTS
+            WHERE CONSTRAINT_SCHEMA='testdb'
+            ORDER BY CONSTRAINT_NAME`)
+		var oracleNames []string
+		for _, r := range rows {
+			oracleNames = append(oracleNames, asString(r[0]))
+		}
+		if !slices.Equal(oracleNames, want) {
+			t.Errorf("PS.2 oracle CHECK names: got %v, want %v", oracleNames, want)
+		}
+
+		orreryNames := psCheckNames(c, "t")
+		if !slices.Equal(orreryNames, want) {
+			t.Errorf("PS.2 orrery CHECK names: got %v, want %v", orreryNames, want)
+		}
+	})
+
+	// PS.3 FK counter — CREATE path (fresh, user-named NOT seeded).
+	t.Run("PS_3_FK_counter_CREATE_fresh", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE parent (id INT PRIMARY KEY)`)
+		runOnBoth(t, mc, c, `CREATE TABLE child (
+            a INT,
+            CONSTRAINT child_ibfk_5 FOREIGN KEY (a) REFERENCES parent(id),
+            b INT,
+            FOREIGN KEY (b) REFERENCES parent(id)
+        )`)
+
+		// TiDB auto-names the unnamed CREATE-path FK fk_<ordinal> (fk_2),
+		// not child_ibfk_1 as MySQL does.
+		want := []string{"child_ibfk_5", "fk_2"}
+
+		rows := oracleRows(t, mc, `
+            SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='child'
+              AND CONSTRAINT_TYPE='FOREIGN KEY'
+            ORDER BY CONSTRAINT_NAME`)
+		var oracleNames []string
+		for _, r := range rows {
+			oracleNames = append(oracleNames, asString(r[0]))
+		}
+		if !slices.Equal(oracleNames, want) {
+			t.Errorf("PS.3 oracle FK names: got %v, want %v", oracleNames, want)
+		}
+
+		orreryNames := psFKNames(c, "child")
+		if !slices.Equal(orreryNames, want) {
+			t.Errorf("PS.3 orrery FK names: got %v, want %v", orreryNames, want)
+		}
+	})
+
+	// PS.4 FK counter — ALTER path (max+1 over existing generated numbers).
+	t.Run("PS_4_FK_counter_ALTER_maxplus1", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE parent (id INT PRIMARY KEY)`)
+		runOnBoth(t, mc, c, `CREATE TABLE child (
+            a INT,
+            b INT,
+            CONSTRAINT child_ibfk_20 FOREIGN KEY (a) REFERENCES parent(id)
+        )`)
+		runOnBoth(t, mc, c,
+			`ALTER TABLE child ADD FOREIGN KEY (b) REFERENCES parent(id)`)
+
+		// TiDB names the ALTER-added unnamed FK fk_<ordinal> (fk_2), not
+		// child_ibfk_21 (MySQL's max+1 over generated names).
+		want := []string{"child_ibfk_20", "fk_2"}
+
+		rows := oracleRows(t, mc, `
+            SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='child'
+              AND CONSTRAINT_TYPE='FOREIGN KEY'
+            ORDER BY CONSTRAINT_NAME`)
+		var oracleNames []string
+		for _, r := range rows {
+			oracleNames = append(oracleNames, asString(r[0]))
+		}
+		if !slices.Equal(oracleNames, want) {
+			t.Errorf("PS.4 oracle FK names: got %v, want %v", oracleNames, want)
+		}
+
+		orreryNames := psFKNames(c, "child")
+		if !slices.Equal(orreryNames, want) {
+			t.Errorf("PS.4 orrery FK names: got %v, want %v", orreryNames, want)
+		}
+	})
+
+	// PS.5 DEFAULT NOW() / fsp precision mismatch must error.
+	// MySQL rejects DATETIME(6) DEFAULT NOW() with ER_INVALID_DEFAULT (1067).
+	// orrery currently accepts — this is a HIGH severity strictness gap.
+	t.Run("PS_5_Datetime_fsp_mismatch_errors", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		ddl := `CREATE TABLE t (a DATETIME(6) DEFAULT NOW())`
+
+		_, oracleErr := mc.db.ExecContext(mc.ctx, ddl)
+		if oracleErr == nil {
+			t.Errorf("PS.5 oracle: expected MySQL to reject DATETIME(6) DEFAULT NOW() with ER_INVALID_DEFAULT, got success")
+		} else if !strings.Contains(oracleErr.Error(), "1067") &&
+			!strings.Contains(strings.ToLower(oracleErr.Error()), "invalid default") {
+			t.Errorf("PS.5 oracle: unexpected error text: %v", oracleErr)
+		}
+
+		var orreryErr error
+		results, parseErr := c.Exec(ddl, nil)
+		if parseErr != nil {
+			orreryErr = parseErr
+		} else {
+			for _, r := range results {
+				if r.Error != nil {
+					orreryErr = r.Error
+					break
+				}
+			}
+		}
+		if orreryErr == nil {
+			t.Errorf("PS.5 orrery: KNOWN BUG — expected ER_INVALID_DEFAULT-style error, got success (see mysql/catalog/scenarios_bug_queue/ps.md)")
+		}
+	})
+
+	// PS.6 HASH partition ADD — seeded from count.
+	// orrery has no ALTER TABLE ... ADD PARTITION support; this scenario is
+	// expected to fail on orrery. Oracle side verifies the MySQL behavior.
+	t.Run("PS_6_Hash_partition_ADD_seeded", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c,
+			`CREATE TABLE t (id INT) PARTITION BY HASH(id) PARTITIONS 3`)
+		// Only run the ALTER on the oracle — some orrery builds have no support.
+		// We still try it on orrery and report mismatch.
+		alter := `ALTER TABLE t ADD PARTITION PARTITIONS 2`
+		if _, err := mc.db.ExecContext(mc.ctx, alter); err != nil {
+			t.Errorf("PS.6 oracle ALTER failed: %v", err)
+		}
+
+		// Oracle partition names.
+		rows := oracleRows(t, mc, `
+            SELECT PARTITION_NAME FROM information_schema.PARTITIONS
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t'
+            ORDER BY PARTITION_ORDINAL_POSITION`)
+		var oracleNames []string
+		for _, r := range rows {
+			oracleNames = append(oracleNames, asString(r[0]))
+		}
+		wantOracle := []string{"p0", "p1", "p2", "p3", "p4"}
+		if !slices.Equal(oracleNames, wantOracle) {
+			t.Errorf("PS.6 oracle partition names: got %v, want %v", oracleNames, wantOracle)
+		}
+
+		// orrery side: attempt the ALTER; record whether it produced the
+		// expected 5-partition layout.
+		results, parseErr := c.Exec(alter, nil)
+		var orreryAlterErr error
+		if parseErr != nil {
+			orreryAlterErr = parseErr
+		} else {
+			for _, r := range results {
+				if r.Error != nil {
+					orreryAlterErr = r.Error
+					break
+				}
+			}
+		}
+
+		var orreryNames []string
+		if tbl := c.GetDatabase("testdb").GetTable("t"); tbl != nil && tbl.Partitioning != nil {
+			for _, p := range tbl.Partitioning.Partitions {
+				orreryNames = append(orreryNames, p.Name)
+			}
+		}
+		if orreryAlterErr != nil || !slices.Equal(orreryNames, wantOracle) {
+			t.Errorf("PS.6 orrery: KNOWN GAP — expected partition names %v; got %v (alter err: %v)", wantOracle, orreryNames, orreryAlterErr)
+		}
+	})
+
+	// PS.7 FK name collision — user-named c_ibfk_1 does NOT collide with the
+	// generator's name under TiDB: the unnamed FK is auto-named fk_<ordinal>
+	// (fk_2), so there is no duplicate. MySQL rejects with ER_FK_DUP_NAME
+	// (1826); TiDB and orrery both accept the statement.
+	t.Run("PS_7_FK_name_collision_allowed", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		// Parent table first (both sides).
+		runOnBoth(t, mc, c, `CREATE TABLE p (id INT PRIMARY KEY)`)
+
+		ddl := `CREATE TABLE c (
+            a INT,
+            CONSTRAINT c_ibfk_1 FOREIGN KEY (a) REFERENCES p(id),
+            b INT,
+            FOREIGN KEY (b) REFERENCES p(id)
+        )`
+
+		if _, oracleErr := mc.db.ExecContext(mc.ctx, ddl); oracleErr != nil {
+			t.Errorf("PS.7 oracle: expected success (TiDB auto-names the unnamed FK fk_2, no collision), got %v", oracleErr)
+		}
+
+		var orreryErr error
+		results, parseErr := c.Exec(ddl, nil)
+		if parseErr != nil {
+			orreryErr = parseErr
+		} else {
+			for _, r := range results {
+				if r.Error != nil {
+					orreryErr = r.Error
+					break
+				}
+			}
+		}
+		if orreryErr != nil {
+			t.Errorf("PS.7 orrery: expected success (no FK name collision under TiDB naming), got %v", orreryErr)
+		}
+	})
+
+	// PS.8 CHECK constraint duplicate name — discarded, so no dup-name error.
+	// MySQL scopes CHECK names per schema and rejects the second table with
+	// ER_CHECK_CONSTRAINT_DUP_NAME (3822). Under the default OFF setting the
+	// CHECK is discarded, so the "duplicate" is a no-op and both engines
+	// accept the second CREATE TABLE.
+	t.Run("PS_8_Check_dup_name_schema_scope", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		// First create must succeed on both.
+		runOnBoth(t, mc, c,
+			`CREATE TABLE t1 (a INT, CONSTRAINT my_rule CHECK (a > 0))`)
+
+		ddl2 := `CREATE TABLE t2 (b INT, CONSTRAINT my_rule CHECK (b > 0))`
+
+		if _, oracleErr := mc.db.ExecContext(mc.ctx, ddl2); oracleErr != nil {
+			t.Errorf("PS.8 oracle: expected success (CHECK discarded), got %v", oracleErr)
+		}
+
+		var orreryErr error
+		results, parseErr := c.Exec(ddl2, nil)
+		if parseErr != nil {
+			orreryErr = parseErr
+		} else {
+			for _, r := range results {
+				if r.Error != nil {
+					orreryErr = r.Error
+					break
+				}
+			}
+		}
+		if orreryErr != nil {
+			t.Errorf("PS.8 orrery: expected success (CHECK discarded), got %v", orreryErr)
+		}
+	})
+}
+
+// orreryCheckNames returns the CHECK constraint names from the orrery catalog
+// for the given table (in testdb), sorted.
+func psCheckNames(c *Catalog, table string) []string {
+	db := c.GetDatabase("testdb")
+	if db == nil {
+		return nil
+	}
+	tbl := db.GetTable(table)
+	if tbl == nil {
+		return nil
+	}
+	var names []string
+	for _, con := range tbl.Constraints {
+		if con.Type == ConCheck {
+			names = append(names, con.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// orreryFKNames returns the FOREIGN KEY constraint names from the orrery catalog
+// for the given table (in testdb), sorted.
+func psFKNames(c *Catalog, table string) []string {
+	db := c.GetDatabase("testdb")
+	if db == nil {
+		return nil
+	}
+	tbl := db.GetTable(table)
+	if tbl == nil {
+		return nil
+	}
+	var names []string
+	for _, con := range tbl.Constraints {
+		if con.Type == ConForeignKey {
+			names = append(names, con.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}

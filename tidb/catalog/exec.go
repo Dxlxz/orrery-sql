@@ -1,0 +1,515 @@
+package catalog
+
+import (
+	"fmt"
+
+	nodes "github.com/Dxlxz/orrery-sql/tidb/ast"
+	mysqlparser "github.com/Dxlxz/orrery-sql/tidb/parser"
+)
+
+type ExecOptions struct {
+	ContinueOnError bool
+}
+
+type ExecResult struct {
+	Index   int
+	SQL     string
+	Line    int // 1-based start line in the original SQL
+	Skipped bool
+	Error   error
+}
+
+func (c *Catalog) Exec(sql string, opts *ExecOptions) ([]ExecResult, error) {
+	list, err := mysqlparser.Parse(sql)
+	if err != nil {
+		return nil, err
+	}
+	if list == nil || len(list.Items) == 0 {
+		return nil, nil
+	}
+
+	lineIndex := buildLineIndex(sql)
+
+	continueOnError := false
+	if opts != nil {
+		continueOnError = opts.ContinueOnError
+	}
+
+	results := make([]ExecResult, 0, len(list.Items))
+	for i, item := range list.Items {
+		locStart := stmtLocStart(item)
+		result := ExecResult{
+			Index: i,
+			Line:  offsetToLine(lineIndex, locStart),
+		}
+
+		if isDML(item) {
+			result.Skipped = true
+			results = append(results, result)
+			continue
+		}
+
+		// A `?` parameter marker binds a value only in a prepared statement, so
+		// it is never valid in catalog DDL. The parser accepts it as a general
+		// operand (a default, generated-column or CHECK expression, a view
+		// body), so refuse it here before processUtility stores the expression.
+		// Parse has already bounded the tree height, so the walk is safe.
+		if containsParamMarker(item) {
+			result.Error = &Error{
+				Code:     0,
+				SQLState: "HY000",
+				Message:  "parameter marker (?) is not allowed in a DDL statement",
+			}
+			results = append(results, result)
+			if !continueOnError {
+				break
+			}
+			continue
+		}
+
+		execErr := c.processUtility(item, sql)
+		result.Error = execErr
+		results = append(results, result)
+
+		if execErr != nil && !continueOnError {
+			break
+		}
+	}
+	return results, nil
+}
+
+func LoadSQL(sql string) (*Catalog, error) {
+	c := New()
+	results, err := c.Exec(sql, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range results {
+		if r.Error != nil {
+			return c, r.Error
+		}
+	}
+	return c, nil
+}
+
+// execSet handles SET statements that affect catalog behavior.
+// Most SET variables are silently accepted (session-level settings like NAMES,
+// CHARACTER SET, sql_mode). Variables that affect DDL behavior (foreign_key_checks)
+// update the catalog state.
+func (c *Catalog) execSet(stmt *nodes.SetStmt) error {
+	for _, asgn := range stmt.Assignments {
+		varName := toLower(asgn.Column.Column)
+		switch varName {
+		case "foreign_key_checks":
+			// Extract the value.
+			val := nodeToSQLValue(asgn.Value)
+			switch toLower(val) {
+			case "0", "off", "false":
+				c.foreignKeyChecks = false
+			case "1", "on", "true":
+				c.foreignKeyChecks = true
+			}
+		case "tidb_enable_check_constraint":
+			switch toLower(nodeToSQLValue(asgn.Value)) {
+			case "0", "off", "false":
+				c.checkConstraints = false
+			case "1", "on", "true":
+				c.checkConstraints = true
+			}
+		case "names", "character set":
+			// Silently accept — these affect character encoding but
+			// the in-memory catalog doesn't need to change behavior.
+		default:
+			// Silently accept all other SET variables (sql_mode, etc.).
+		}
+	}
+	return nil
+}
+
+// nodeToSQLValue extracts a simple string value from an expression node.
+// A unary plus is read through: SET foreign_key_checks = +0 turns the checks
+// off on TiDB v8.5.5, and +1 back on.
+func nodeToSQLValue(expr nodes.ExprNode) string {
+	switch e := expr.(type) {
+	case *nodes.UnaryExpr:
+		if e.Op == nodes.UnaryPlus {
+			return nodeToSQLValue(e.Operand)
+		}
+		return ""
+	case *nodes.StringLit:
+		return e.Value
+	case *nodes.IntLit:
+		return fmt.Sprintf("%d", e.Value)
+	case *nodes.FloatLit:
+		return e.Value
+	case *nodes.BoolLit:
+		if e.Value {
+			return "1"
+		}
+		return "0"
+	case *nodes.ColumnRef:
+		return e.Column
+	default:
+		return ""
+	}
+}
+
+func isDML(stmt nodes.Node) bool {
+	switch stmt.(type) {
+	case *nodes.SelectStmt, *nodes.InsertStmt, *nodes.UpdateStmt, *nodes.DeleteStmt:
+		return true
+	default:
+		return false
+	}
+}
+
+// processUtility applies one statement. source is the text it was parsed
+// from, which its Loc offsets index into, or "" when there is none.
+func (c *Catalog) processUtility(stmt nodes.Node, source string) error {
+	switch s := stmt.(type) {
+	case *nodes.CreateDatabaseStmt:
+		return c.createDatabase(s)
+	case *nodes.CreateTableStmt:
+		return c.createTable(s, true)
+	case *nodes.CreateIndexStmt:
+		return c.createIndex(s)
+	case *nodes.CreateViewStmt:
+		return c.createView(s, source, true)
+	case *nodes.AlterTableStmt:
+		return c.alterTable(s)
+	case *nodes.AlterDatabaseStmt:
+		return c.alterDatabase(s)
+	case *nodes.CreatePlacementPolicyStmt:
+		return c.createPlacementPolicy(s)
+	case *nodes.AlterPlacementPolicyStmt:
+		return c.alterPlacementPolicy(s)
+	case *nodes.DropPlacementPolicyStmt:
+		return c.dropPlacementPolicy(s)
+	case *nodes.AlterRangeStmt:
+		return c.alterRange(s)
+	case *nodes.DropTableStmt:
+		return c.dropTable(s)
+	case *nodes.DropDatabaseStmt:
+		return c.dropDatabase(s)
+	case *nodes.DropIndexStmt:
+		return c.dropIndex(s)
+	case *nodes.DropViewStmt:
+		return c.dropView(s)
+	case *nodes.RenameTableStmt:
+		return c.renameTable(s)
+	case *nodes.TruncateStmt:
+		return c.truncateTable(s)
+	case *nodes.UseStmt:
+		return c.useDatabase(s)
+	case *nodes.CreateFunctionStmt, *nodes.DropRoutineStmt, *nodes.AlterRoutineStmt:
+		// TiDB parses CREATE/DROP PROCEDURE but rejects stored routines at
+		// execution (8108); the catalog keeps a routine model for the Define*
+		// loader path, but Exec matches TiDB and refuses. The parser already
+		// refuses the FUNCTION and ALTER forms (1064), so a procedure is all
+		// that reaches here.
+		return errStoredRoutineUnsupported()
+	case *nodes.CreateTriggerStmt:
+		return c.createTrigger(s)
+	case *nodes.DropTriggerStmt:
+		return c.dropTrigger(s)
+	case *nodes.CreateEventStmt:
+		return c.createEvent(s)
+	case *nodes.AlterEventStmt:
+		return c.alterEvent(s)
+	case *nodes.DropEventStmt:
+		return c.dropEvent(s)
+	case *nodes.SetStmt:
+		return c.execSet(s)
+	case *nodes.CreateBindingStmt, *nodes.DropBindingStmt, *nodes.SetBindingStmt:
+		// A SQL plan binding records a plan for later statements and
+		// changes no schema object. The statements it carries are not run
+		// either, so the catalog reads neither of them.
+		return nil
+	case *nodes.DropStatsStmt, *nodes.LoadStatsStmt, *nodes.CreateStatisticsStmt, *nodes.DropStatisticsStmt:
+		// TiDB's standalone statistics statements. DROP STATS discards a
+		// table's statistics, LOAD STATS reads a dump back, and CREATE and
+		// DROP STATISTICS make and drop an extended statistic. None
+		// changes a schema the catalog holds -- no table, column, index,
+		// or option -- so each is applied as a no-op rather than left to
+		// the default arm, where an unmodelled statement and a deliberate
+		// no-op read the same. ANALYZE TABLE reaches the default arm for
+		// the same reason and has always been a no-op there.
+		return nil
+	case *nodes.LoadDataStmt, *nodes.ImportIntoStmt:
+		// The bulk-load statements. Both write rows into a table that
+		// exists already and neither changes a schema the catalog holds --
+		// no table, column, index, or option -- so each is applied as a
+		// no-op rather than left to the default arm, where an unmodelled
+		// statement and a deliberate no-op read the same. A change script
+		// may hold either next to its DDL.
+		return nil
+	case *nodes.CreateUserStmt, *nodes.AlterUserStmt, *nodes.DropUserStmt,
+		*nodes.RenameUserStmt, *nodes.CreateRoleStmt, *nodes.DropRoleStmt,
+		*nodes.SetPasswordStmt, *nodes.GrantStmt, *nodes.RevokeStmt,
+		*nodes.GrantRoleStmt, *nodes.RevokeRoleStmt, *nodes.SetRoleStmt,
+		*nodes.SetDefaultRoleStmt:
+		// The user and privilege statements. A change script holds them
+		// next to its DDL -- a GRANT on the table a migration just made,
+		// a CREATE USER for the service that will read it -- and none of
+		// them changes a schema the catalog holds: it models no user, no
+		// role and no grant. Each is applied as a no-op rather than left
+		// to the default arm, where an unmodelled statement and a
+		// deliberate no-op read the same.
+		return nil
+	case *nodes.SplitRegionStmt, *nodes.DistributeTableStmt:
+		// SPLIT ... TABLE pre-splits regions and DISTRIBUTE TABLE
+		// schedules replicas. Neither changes a schema the catalog
+		// holds -- no table, column, index, or option -- so both are
+		// applied as a no-op rather than left to the default arm, where
+		// an unmodelled statement and a deliberate no-op read the same.
+		return nil
+	case *nodes.RecommendIndexStmt, *nodes.SetConfigStmt, *nodes.CancelDistributionJobStmt,
+		*nodes.KillStmt, *nodes.FlushStmt:
+		// TiDB's index advisor, its dynamic configuration, a job cancel, a
+		// session kill and FLUSH. RECOMMEND INDEX RUN only reports: it plans
+		// over hypothetical indexes and leaves SHOW CREATE TABLE as it was, and
+		// APPLY, which sounds as if it adds the index, answers 1105 "unsupported
+		// action apply" on v8.5.5 (both measured). The others change a server's
+		// state, not a schema the catalog holds, so each is applied as a no-op
+		// rather than left to the default arm, where an unmodelled statement and
+		// a deliberate no-op read the same.
+		return nil
+	case *nodes.BRIEStmt, *nodes.RecoverTableStmt, *nodes.FlashbackTableStmt,
+		*nodes.FlashbackDatabaseStmt, *nodes.FlashbackToTimestampStmt:
+		// TiDB's backup, restore, recover and flashback statements. A
+		// BACKUP reads and changes nothing, and neither do the log task and
+		// BR job statements. The others do change a
+		// schema, but none of them says how: RESTORE, RECOVER TABLE and
+		// the two bring-back FLASHBACK forms each put back an object
+		// whose definition is in a backup or in a dropped table the
+		// catalog keeps no record of, and FLASHBACK ... TO TIMESTAMP
+		// rolls data back to a point the catalog never saw. So the
+		// catalog has nothing to apply and applies nothing, rather than
+		// guess at a definition it does not hold.
+		//
+		// In particular FLASHBACK TABLE t TO t1 is not a rename, and is
+		// deliberately not read as one: t has to be gone already for the
+		// statement to succeed, and t1 is created. Its sibling makes
+		// that plain -- v8.5.5 answers 1007, "Can't create database 'd';
+		// database exists", for FLASHBACK DATABASE d when d is still
+		// there.
+		//
+		// Each is dispatched here rather than left to the default arm,
+		// where an unmodelled statement and a deliberate no-op read the
+		// same.
+		return nil
+	case *nodes.ExplainStmt:
+		// EXPLAIN ANALYZE runs the statement it carries, and on TiDB that
+		// reaches ALTER TABLE: EXPLAIN ANALYZE ALTER TABLE t ADD COLUMN c
+		// adds the column (tidb/parser/explain_forms_test.go measures it
+		// against v8.5.5), so the catalog applies what it carries. A plain
+		// EXPLAIN reports a plan and changes nothing.
+		if s.Analyze && s.Stmt != nil {
+			return c.processUtility(s.Stmt, source)
+		}
+		return nil
+	case *nodes.PlanReplayerStmt:
+		// PLAN REPLAYER DUMP EXPLAIN ANALYZE runs the statement it carries
+		// for the same reason EXPLAIN ANALYZE does, and reaches the same one
+		// DDL: on pingcap/tidb:v8.5.5 PLAN REPLAYER DUMP EXPLAIN ANALYZE
+		// ALTER TABLE t ADD COLUMN c adds the column, while PLAN REPLAYER
+		// DUMP EXPLAIN ALTER TABLE t ADD COLUMN c writes a dump and leaves
+		// the table alone (both measured; pinned by
+		// tidb/catalog/plan_replayer_test.go). Every other form -- SLOW
+		// QUERY, a file name, LOAD and CAPTURE -- carries no statement and
+		// changes no schema the catalog holds.
+		if s.Analyze && s.Stmt != nil {
+			return c.processUtility(s.Stmt, source)
+		}
+		return nil
+	case *nodes.TraceStmt:
+		// TRACE runs the statement it traces, so the catalog applies it:
+		// TRACE SET foreign_key_checks = 0 leaves the session variable at 0
+		// on v8.5.5. TRACE PLAN and TRACE PLAN TARGET = '...' trace the
+		// optimizer instead and run nothing, leaving it at 1 (both
+		// measured; pinned by tidb/catalog/trace_test.go).
+		//
+		// The traced statement is never DDL -- upstream's TraceableStmt
+		// names none, and TRACE ALTER TABLE t ADD COLUMN c is a 1064 -- so
+		// SET is the one thing here the catalog models. It is applied
+		// through the same arm all the same, rather than special-cased,
+		// because what TRACE runs is what the catalog must see.
+		if !s.TracePlan && s.Stmt != nil {
+			return c.processUtility(s.Stmt, source)
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+// buildLineIndex returns the byte offset of each line start.
+func buildLineIndex(sql string) []int {
+	index := []int{0}
+	for i := 0; i < len(sql); i++ {
+		if sql[i] == '\n' {
+			index = append(index, i+1)
+		}
+	}
+	return index
+}
+
+// offsetToLine converts a byte offset to a 1-based line number.
+func offsetToLine(lineIndex []int, offset int) int {
+	lo, hi := 0, len(lineIndex)-1
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if lineIndex[mid] <= offset {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return lo + 1
+}
+
+// stmtLocStart extracts Loc.Start from a statement node.
+// Uses a type switch over the statement types handled by processUtility,
+// plus common DML types. All have a Loc field set by the parser.
+func stmtLocStart(node nodes.Node) int {
+	switch s := node.(type) {
+	case *nodes.CreateDatabaseStmt:
+		return s.Loc.Start
+	case *nodes.CreateTableStmt:
+		return s.Loc.Start
+	case *nodes.CreateIndexStmt:
+		return s.Loc.Start
+	case *nodes.CreateViewStmt:
+		return s.Loc.Start
+	case *nodes.AlterTableStmt:
+		return s.Loc.Start
+	case *nodes.AlterDatabaseStmt:
+		return s.Loc.Start
+	case *nodes.CreatePlacementPolicyStmt:
+		return s.Loc.Start
+	case *nodes.AlterPlacementPolicyStmt:
+		return s.Loc.Start
+	case *nodes.DropPlacementPolicyStmt:
+		return s.Loc.Start
+	case *nodes.CreateSequenceStmt:
+		return s.Loc.Start
+	case *nodes.AlterSequenceStmt:
+		return s.Loc.Start
+	case *nodes.DropSequenceStmt:
+		return s.Loc.Start
+	case *nodes.DropTableStmt:
+		return s.Loc.Start
+	case *nodes.DropDatabaseStmt:
+		return s.Loc.Start
+	case *nodes.DropIndexStmt:
+		return s.Loc.Start
+	case *nodes.DropViewStmt:
+		return s.Loc.Start
+	case *nodes.RenameTableStmt:
+		return s.Loc.Start
+	case *nodes.TruncateStmt:
+		return s.Loc.Start
+	case *nodes.UseStmt:
+		return s.Loc.Start
+	case *nodes.CreateFunctionStmt:
+		return s.Loc.Start
+	case *nodes.DropRoutineStmt:
+		return s.Loc.Start
+	case *nodes.AlterRoutineStmt:
+		return s.Loc.Start
+	case *nodes.CreateTriggerStmt:
+		return s.Loc.Start
+	case *nodes.DropTriggerStmt:
+		return s.Loc.Start
+	case *nodes.CreateEventStmt:
+		return s.Loc.Start
+	case *nodes.AlterEventStmt:
+		return s.Loc.Start
+	case *nodes.DropEventStmt:
+		return s.Loc.Start
+	case *nodes.SetStmt:
+		return s.Loc.Start
+	case *nodes.CreateBindingStmt:
+		return s.Loc.Start
+	case *nodes.DropBindingStmt:
+		return s.Loc.Start
+	case *nodes.SetBindingStmt:
+		return s.Loc.Start
+	case *nodes.CreateResourceGroupStmt:
+		return s.Loc.Start
+	case *nodes.AlterResourceGroupStmt:
+		return s.Loc.Start
+	case *nodes.DropResourceGroupStmt:
+		return s.Loc.Start
+	case *nodes.SetResourceGroupStmt:
+		return s.Loc.Start
+	case *nodes.CalibrateResourceStmt:
+		return s.Loc.Start
+	case *nodes.RecommendIndexStmt:
+		return s.Loc.Start
+	case *nodes.SetConfigStmt:
+		return s.Loc.Start
+	case *nodes.AlterRangeStmt:
+		return s.Loc.Start
+	case *nodes.CancelDistributionJobStmt:
+		return s.Loc.Start
+	case *nodes.KillStmt:
+		return s.Loc.Start
+	case *nodes.FlushStmt:
+		return s.Loc.Start
+	case *nodes.BRIEStmt:
+		return s.Loc.Start
+	case *nodes.AddQueryWatchStmt:
+		return s.Loc.Start
+	case *nodes.DropQueryWatchStmt:
+		return s.Loc.Start
+	case *nodes.CreateUserStmt:
+		return s.Loc.Start
+	case *nodes.AlterUserStmt:
+		return s.Loc.Start
+	case *nodes.DropUserStmt:
+		return s.Loc.Start
+	case *nodes.RenameUserStmt:
+		return s.Loc.Start
+	case *nodes.CreateRoleStmt:
+		return s.Loc.Start
+	case *nodes.DropRoleStmt:
+		return s.Loc.Start
+	case *nodes.SetPasswordStmt:
+		return s.Loc.Start
+	case *nodes.GrantStmt:
+		return s.Loc.Start
+	case *nodes.RevokeStmt:
+		return s.Loc.Start
+	case *nodes.GrantRoleStmt:
+		return s.Loc.Start
+	case *nodes.RevokeRoleStmt:
+		return s.Loc.Start
+	case *nodes.SetRoleStmt:
+		return s.Loc.Start
+	case *nodes.SetDefaultRoleStmt:
+		return s.Loc.Start
+	case *nodes.ExplainStmt:
+		// The whole EXPLAIN, not the statement it carries: an ExecResult's
+		// line is the line the caller wrote.
+		return s.Loc.Start
+	case *nodes.TraceStmt:
+		return s.Loc.Start
+	case *nodes.PlanReplayerStmt:
+		return s.Loc.Start
+	case *nodes.LoadDataStmt:
+		return s.Loc.Start
+	case *nodes.ImportIntoStmt:
+		return s.Loc.Start
+	case *nodes.SelectStmt:
+		return s.Loc.Start
+	case *nodes.InsertStmt:
+		return s.Loc.Start
+	case *nodes.UpdateStmt:
+		return s.Loc.Start
+	case *nodes.DeleteStmt:
+		return s.Loc.Start
+	default:
+		return 0
+	}
+}

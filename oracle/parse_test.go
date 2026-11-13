@@ -1,0 +1,155 @@
+package oracle
+
+import (
+	"testing"
+
+	"github.com/Dxlxz/orrery-sql/oracle/ast"
+)
+
+func TestParseSplitScript(t *testing.T) {
+	sql := "SELECT 1 FROM dual;\nBEGIN NULL; END;\n/\nSELECT 2 FROM dual;"
+
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(stmts) != 3 {
+		t.Fatalf("got %d statements, want 3", len(stmts))
+	}
+
+	if stmts[0].Text != "SELECT 1 FROM dual" {
+		t.Fatalf("stmt[0].Text = %q", stmts[0].Text)
+	}
+	if _, ok := stmts[0].AST.(*ast.SelectStmt); !ok {
+		t.Fatalf("stmt[0].AST = %T, want SelectStmt", stmts[0].AST)
+	}
+	if stmts[0].ByteStart != 0 || stmts[0].ByteEnd != len("SELECT 1 FROM dual") {
+		t.Fatalf("stmt[0] range = [%d,%d]", stmts[0].ByteStart, stmts[0].ByteEnd)
+	}
+	if stmts[0].Start != (Position{Line: 1, Column: 1}) {
+		t.Fatalf("stmt[0].Start = %+v", stmts[0].Start)
+	}
+
+	if stmts[1].Text != "\nBEGIN NULL; END;" {
+		t.Fatalf("stmt[1].Text = %q", stmts[1].Text)
+	}
+	if _, ok := stmts[1].AST.(*ast.PLSQLBlock); !ok {
+		t.Fatalf("stmt[1].AST = %T, want PLSQLBlock", stmts[1].AST)
+	}
+	if ast.NodeLoc(stmts[1].AST).Start != stmts[1].ByteStart+1 {
+		t.Fatalf("stmt[1] AST Loc.Start = %d, want %d", ast.NodeLoc(stmts[1].AST).Start, stmts[1].ByteStart+1)
+	}
+
+	if stmts[2].Text != "\nSELECT 2 FROM dual" {
+		t.Fatalf("stmt[2].Text = %q", stmts[2].Text)
+	}
+	if stmts[2].Start != (Position{Line: 4, Column: 1}) {
+		t.Fatalf("stmt[2].Start = %+v", stmts[2].Start)
+	}
+}
+
+func TestParseWrappedProcedure(t *testing.T) {
+	sql := "CREATE OR REPLACE PROCEDURE wrapped_proc WRAPPED\n" +
+		"a000000\n" +
+		"abcd\n" +
+		"/\n" +
+		"SELECT 1 FROM dual;"
+
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(stmts) != 2 {
+		t.Fatalf("got %d statements, want 2", len(stmts))
+	}
+	if stmts[0].Text != "CREATE OR REPLACE PROCEDURE wrapped_proc WRAPPED\na000000\nabcd" {
+		t.Fatalf("stmt[0].Text = %q", stmts[0].Text)
+	}
+	proc, ok := stmts[0].AST.(*ast.CreateProcedureStmt)
+	if !ok {
+		t.Fatalf("stmt[0].AST = %T, want CreateProcedureStmt", stmts[0].AST)
+	}
+	if !proc.Wrapped {
+		t.Fatal("stmt[0].AST.Wrapped = false, want true")
+	}
+	if proc.Body != nil {
+		t.Fatalf("stmt[0].AST.Body = %T, want nil", proc.Body)
+	}
+}
+
+func TestParseWrappedProcedureWithOperatorPayload(t *testing.T) {
+	sql := "CREATE OR REPLACE procedure\n" +
+		"--++WRAP_VERSION:1\n" +
+		"         wrapped_proc wrapped\n" +
+		"a000000\n" +
+		"abc=\n" +
+		"/\n" +
+		"SELECT 1 FROM dual;"
+
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(stmts) != 2 {
+		t.Fatalf("got %d statements, want 2", len(stmts))
+	}
+	proc, ok := stmts[0].AST.(*ast.CreateProcedureStmt)
+	if !ok {
+		t.Fatalf("stmt[0].AST = %T, want CreateProcedureStmt", stmts[0].AST)
+	}
+	if !proc.Wrapped {
+		t.Fatal("stmt[0].AST.Wrapped = false, want true")
+	}
+	if proc.Body != nil {
+		t.Fatalf("stmt[0].AST.Body = %T, want nil", proc.Body)
+	}
+}
+
+func TestParseCreateTableWithRemarkColumn(t *testing.T) {
+	sql := `create table NCF_DI_PO_SOURCE_TEMP
+(
+    data_id             number not null
+        constraint NC_DI_pk
+            primary key,
+    purchase_receive_id number,
+    po_number           varchar2(60),
+    sku_code            varchar2(100),
+    qty                 number,
+    receive_number      varchar2(100),
+    ETD                 date,
+    ETA                 date,
+    ATD                 date,
+    SO_NUMBER           varchar2(100),
+    SO_line_amount      number(10,2),
+    source              varchar2(100),
+    remark              varchar2(100),
+    prompt              varchar2(100),
+    spool               varchar2(100),
+    attribute1          varchar2(100),
+    attribute2          varchar2(100)
+)`
+
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("got %d statements, want 1", len(stmts))
+	}
+	if _, ok := stmts[0].AST.(*ast.CreateTableStmt); !ok {
+		t.Fatalf("stmt[0].AST = %T, want CreateTableStmt", stmts[0].AST)
+	}
+}
+
+func TestParseReturnsErrorForSQLPlusCommands(t *testing.T) {
+	sql := "SET DEFINE OFF\n" +
+		"PROMPT setup\n" +
+		"SELECT 1 FROM dual;\n" +
+		"SPOOL out.log\n" +
+		"SELECT 2 FROM dual;\n" +
+		"EXIT SUCCESS\n"
+
+	if _, err := Parse(sql); err == nil {
+		t.Fatal("Parse() error = nil, want SQL*Plus command parse error")
+	}
+}

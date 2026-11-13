@@ -1,0 +1,1015 @@
+// Package parser — F4 parser entry point and dispatch framework.
+//
+// The Parser struct, Parse function, and ParseBestEffort function defined
+// in this file provide the public recursive-descent parser API for Doris SQL.
+// Actual per-statement parsing is stubbed out — F4 ships only the framework.
+// Each concrete statement type (SELECT, INSERT, CREATE, etc.) is added by
+// Tier 1+ DAG nodes that replace specific dispatch cases in parseStmt below.
+package parser
+
+import (
+	"github.com/Dxlxz/orrery-sql/starrocks/ast"
+	"strings"
+)
+
+// Parser is a recursive-descent parser for Doris SQL. It operates on a
+// single segment of input (one top-level statement produced by Split) at a
+// time; callers should use Parse or ParseBestEffort instead of constructing
+// Parsers directly.
+type Parser struct {
+	lexer      *Lexer
+	input      string       // the segment text (used for error reporting)
+	baseOffset int          // absolute offset of input within original source (subtract from Loc to index into input)
+	cur        Token        // current token
+	prev       Token        // previous token (for error context)
+	nextBuf    Token        // buffered lookahead token
+	hasNext    bool         // whether nextBuf is valid
+	errors     []ParseError // collected errors for best-effort mode
+
+	// strictTrailing mirrors the parseSingle mode: strict entry points
+	// reject unconsumed trailing tokens and refuse best-effort fallbacks
+	// (such as EXPLAIN's raw-query recovery) that would mask a nested
+	// parse failure.
+	strictTrailing bool
+
+	// rawQueries lists every query body this parse captured as raw text
+	// without parsing it (subquery placeholders, the CTAS query), in source
+	// order, so the strict entry point can validate them. In strict mode a
+	// subquery body that parsed in place is already valid and is not listed.
+	// restore truncates it, so an abandoned speculative parse leaves nothing
+	// behind.
+	rawQueries []rawQuery
+
+	// parenGroupEnd records where the raw scan of each '(' group ended (its
+	// matching ')', or EOF), by the offset of the '('. A subquery body whose
+	// in-place parse fails is scanned raw, and so is every enclosing body
+	// whose parse fails after it; jumping over the groups already scanned
+	// keeps that linear.
+	parenGroupEnd map[int]parenReplay
+
+	// speculating counts the typed-literal guesses in progress: array<t>[...]
+	// and map<k,v>{...} parse a type and fall back to the identifier when no
+	// literal follows, and the identifier path meets the next ARRAY or MAP of
+	// that type and guesses again. While a guess is in progress every type it
+	// parses is recorded in typeMemo by start offset, and the next guess
+	// replays the record instead of parsing the type again: rereading it made
+	// array<array<...>> n levels deep cost O(n²).
+	speculating int
+	typeMemo    map[int]typeReplay
+
+	depth int // nesting depth of the productions being parsed (see enterNesting)
+}
+
+// typeReplay is a recorded parseDataType result, the state the parse ended
+// in with the lex errors on the way (as a parenReplay), and the nesting depth
+// it started at. A type holds no expression, so it captures no query bodies.
+// A parse that hit the nesting limit is not recorded, so a record holds for
+// any depth up to the one it started at.
+type typeReplay struct {
+	typ   *ast.TypeName
+	err   error
+	end   parenReplay
+	depth int
+}
+
+// parenReplay is the state the raw scan of a '(' group left behind, with the
+// lex errors it recorded past that '(', so replaying it is indistinguishable
+// from scanning again.
+type parenReplay struct {
+	end     parserCheckpoint
+	lexErrs []LexError
+}
+
+// recordParenReplay captures the current state as the end of a scan that
+// started at the '(' at absolute offset open.
+func (p *Parser) recordParenReplay(open int) parenReplay {
+	rel := open - p.baseOffset
+	i := len(p.lexer.errors)
+	for i > 0 && p.lexer.errors[i-1].Loc.Start > rel {
+		i--
+	}
+	return parenReplay{end: p.save(), lexErrs: append([]LexError(nil), p.lexer.errors[i:]...)}
+}
+
+// replayParen moves the parser to the end state r records, adding the lex
+// errors a rescan would record from the current lexer position on.
+func (p *Parser) replayParen(r parenReplay) {
+	for _, e := range r.lexErrs {
+		if e.Loc.Start >= p.lexer.pos {
+			p.lexer.errors = append(p.lexer.errors, e)
+		}
+	}
+	p.lexer.pos, p.lexer.start = r.end.lexPos, r.end.lexStart
+	p.cur, p.prev, p.nextBuf, p.hasNext = r.end.cur, r.end.prev, r.end.nextBuf, r.end.hasNext
+}
+
+// rawQuery is a query body captured as raw text: the text and the absolute
+// byte offset of its first character in the parser's input.
+// rawQuery is a query body captured as raw text: the text, the absolute
+// byte offset of its first character in the parser's input, and the nesting
+// depth it was captured at, which the nested parse that validates it starts
+// from so the depth limit counts the levels around it too.
+type rawQuery struct {
+	text  string
+	start int
+	depth int
+}
+
+// nextToken returns the next token from the lexer, transparently skipping
+// optimizer-hint spans (/*+ ... */). Hints carry no syntax of their own that
+// any production needs to see, so skipping them here keeps every production
+// hint-agnostic instead of threading an optional hint through each one.
+func (p *Parser) nextToken() Token {
+	tok := p.lexer.NextToken()
+	for tok.Kind == tokHintStart {
+		for tok.Kind != tokHintEnd && tok.Kind != tokEOF {
+			tok = p.lexer.NextToken()
+		}
+		if tok.Kind == tokEOF {
+			return tok
+		}
+		tok = p.lexer.NextToken()
+	}
+	return tok
+}
+
+// advance consumes the current token and moves to the next one.
+// Returns the token that was just consumed (the new "previous" token).
+func (p *Parser) advance() Token {
+	p.prev = p.cur
+	if p.hasNext {
+		p.cur = p.nextBuf
+		p.hasNext = false
+	} else {
+		p.cur = p.nextToken()
+	}
+	return p.prev
+}
+
+// peek returns the current token without consuming it.
+func (p *Parser) peek() Token {
+	return p.cur
+}
+
+// parserCheckpoint snapshots the parser + lexer position so a speculative parse
+// can be rolled back. It is a bounded backtracking primitive for prefix-
+// ambiguous grammar (e.g. map<k,v>{...} literal vs the column `map` compared
+// with `<`). It is NOT safe across input-rewriting lexer paths (conditional
+// comments), which do not occur inside the constructs it is used for.
+type parserCheckpoint struct {
+	cur, prev, nextBuf Token
+	hasNext            bool
+	lexPos, lexStart   int
+	errLen, lexErrLen  int
+	rawLen             int // len(p.rawQueries)
+}
+
+// save captures the current parser state.
+func (p *Parser) save() parserCheckpoint {
+	return parserCheckpoint{
+		cur:       p.cur,
+		prev:      p.prev,
+		nextBuf:   p.nextBuf,
+		hasNext:   p.hasNext,
+		lexPos:    p.lexer.pos,
+		lexStart:  p.lexer.start,
+		errLen:    len(p.errors),
+		lexErrLen: len(p.lexer.errors),
+		rawLen:    len(p.rawQueries),
+	}
+}
+
+// restore rolls the parser + lexer back to a saved checkpoint, discarding any
+// tokens consumed and errors collected since.
+func (p *Parser) restore(c parserCheckpoint) {
+	p.cur = c.cur
+	p.prev = c.prev
+	p.nextBuf = c.nextBuf
+	p.hasNext = c.hasNext
+	p.lexer.pos = c.lexPos
+	p.lexer.start = c.lexStart
+	p.errors = p.errors[:c.errLen]
+	p.lexer.errors = p.lexer.errors[:c.lexErrLen]
+	if len(p.rawQueries) > c.rawLen {
+		p.rawQueries = p.rawQueries[:c.rawLen]
+	}
+}
+
+// peekNext returns the token AFTER the current one without consuming it
+// (one-token lookahead beyond cur). Used to disambiguate based on the
+// token following the current position.
+func (p *Parser) peekNext() Token {
+	if !p.hasNext {
+		p.nextBuf = p.nextToken()
+		p.hasNext = true
+	}
+	return p.nextBuf
+}
+
+// match tries each given token kind; if cur matches any, it is consumed
+// and returned with ok=true. Used for optional tokens.
+func (p *Parser) match(types ...int) (Token, bool) {
+	for _, t := range types {
+		if p.cur.Kind == t {
+			return p.advance(), true
+		}
+	}
+	return Token{}, false
+}
+
+// expect consumes the current token if it matches the expected kind.
+// Otherwise returns a ParseError describing the mismatch.
+func (p *Parser) expect(tokenType int) (Token, error) {
+	if p.cur.Kind == tokenType {
+		return p.advance(), nil
+	}
+	return Token{}, p.syntaxErrorAtCur()
+}
+
+// syntaxErrorAtCur returns a *ParseError describing a syntax error at
+// the current token position. If cur is tokEOF, the message says "at
+// end of input"; otherwise "at or near X".
+func (p *Parser) syntaxErrorAtCur() *ParseError {
+	var msg string
+	if p.cur.Kind == tokEOF {
+		msg = "syntax error at end of input"
+	} else {
+		text := p.cur.Str
+		if text == "" {
+			text = TokenName(p.cur.Kind)
+		}
+		msg = "syntax error at or near " + text
+	}
+	return &ParseError{
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: msg,
+	}
+}
+
+// skipToNextStatement advances the parser past the current erroneous
+// statement to the next ; at depth 0 within the current segment, or to
+// tokEOF. Always consumes at least one token to guarantee progress.
+//
+// Because Parse uses Split to pre-segment the input, each segment usually
+// contains one statement — skipToNextStatement's typical behavior inside
+// a segment is to advance to EOF.
+func (p *Parser) skipToNextStatement() {
+	// Always consume at least one token to avoid infinite loops.
+	if p.cur.Kind != tokEOF {
+		p.advance()
+	}
+	depth := 0
+	for p.cur.Kind != tokEOF {
+		switch p.cur.Kind {
+		case int('('), int('['), int('{'):
+			depth++
+		case int(')'), int(']'), int('}'):
+			if depth > 0 {
+				depth--
+			}
+		case int(';'):
+			if depth == 0 {
+				p.advance()
+				return
+			}
+		}
+		p.advance()
+	}
+}
+
+// unsupported emits a "statement type X not yet supported" ParseError at
+// the current token, advances to the next statement boundary, and returns
+// (nil, err). Used by every stubbed dispatch case in F4.
+//
+// Tier 1+ DAG nodes REPLACE individual dispatch cases with real parse
+// functions. Those real functions do NOT call unsupported — they consume
+// tokens themselves and produce real AST nodes.
+func (p *Parser) unsupported(stmtName string) (ast.Node, error) {
+	err := &ParseError{
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: stmtName + " statement parsing is not yet supported",
+	}
+	p.skipToNextStatement()
+	return nil, err
+}
+
+// unknownStatementError reports a statement that starts with a token the
+// dispatch switch doesn't recognize. It is called from the default branch
+// of parseStmt.
+func (p *Parser) unknownStatementError() *ParseError {
+	if p.cur.Kind == tokEOF {
+		return &ParseError{
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: "syntax error at end of input",
+		}
+	}
+	tokText := p.cur.Str
+	if tokText == "" {
+		tokText = TokenName(p.cur.Kind)
+	}
+	return &ParseError{
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: "unknown or unsupported statement starting with " + tokText,
+	}
+}
+
+// parseStmt parses one top-level statement by dispatching on the first
+// keyword. For stubs-only F4, every dispatch case calls the unsupported
+// helper that appends a "not yet supported" ParseError and returns
+// (nil, err).
+//
+// Tier 1+ DAG nodes REPLACE specific cases with real implementations.
+// The dispatch switch itself is not expected to change — only the bodies
+// of individual case branches.
+func (p *Parser) parseStmt() (ast.Node, error) {
+	if err := p.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer p.leaveNesting()
+	switch p.cur.Kind {
+	// DDL
+	case kwCREATE:
+		createTok := p.advance() // consume CREATE; cur is now the object type keyword
+		switch p.cur.Kind {
+		case kwINDEX:
+			return p.parseCreateIndex(createTok.Loc)
+		case kwDATABASE, kwSCHEMA:
+			return p.parseCreateDatabase()
+		case kwTABLE, kwTEMPORARY:
+			return p.parseCreateTable()
+		case kwEXTERNAL:
+			// Peek past EXTERNAL to distinguish CREATE EXTERNAL CATALOG,
+			// CREATE EXTERNAL RESOURCE, from CREATE EXTERNAL TABLE.
+			switch p.peekNext().Kind {
+			case kwCATALOG:
+				return p.parseCreateCatalog()
+			case kwRESOURCE:
+				p.advance() // consume EXTERNAL
+				return p.parseCreateResource(createTok.Loc, true)
+			}
+			return p.parseCreateTable()
+		case kwCATALOG:
+			return p.parseCreateCatalog()
+		case kwWORKLOAD:
+			// CREATE WORKLOAD GROUP ... or CREATE WORKLOAD POLICY ...
+			next := p.peekNext()
+			if next.Kind == kwGROUP {
+				return p.parseCreateWorkloadGroup(createTok.Loc)
+			}
+			if next.Kind == kwPOLICY {
+				return p.parseCreateWorkloadPolicy(createTok.Loc)
+			}
+			return p.unsupported("CREATE WORKLOAD")
+		case kwRESOURCE:
+			return p.parseCreateResource(createTok.Loc, false)
+		case kwSQL_BLOCK_RULE:
+			return p.parseCreateSQLBlockRule(createTok.Loc)
+		case kwVIEW:
+			return p.parseCreateView(createTok.Loc, false)
+		case kwMATERIALIZED:
+			return p.parseCreateMTMV(createTok.Loc)
+		case kwPROCEDURE:
+			return p.parseCreateProcedure(createTok.Loc, false)
+		case kwFUNCTION, kwAGGREGATE, kwALIAS, kwGLOBAL:
+			return p.parseCreateFunction(createTok.Loc)
+		case kwOR:
+			// CREATE OR REPLACE VIEW ... or CREATE OR REPLACE PROCEDURE ...
+			p.advance() // consume OR
+			if _, err := p.expect(kwREPLACE); err != nil {
+				return nil, err
+			}
+			if p.cur.Kind == kwPROCEDURE {
+				return p.parseCreateProcedure(createTok.Loc, true)
+			}
+			return p.parseCreateView(createTok.Loc, true)
+		case kwSTORAGE:
+			p.advance() // consume STORAGE
+			return p.parseCreateStorage(createTok.Loc)
+		case kwREPOSITORY:
+			return p.parseCreateRepository(createTok.Loc, false)
+		case kwREAD:
+			// CREATE READ ONLY REPOSITORY ...
+			p.advance() // consume READ
+			if _, err := p.expect(kwONLY); err != nil {
+				return nil, err
+			}
+			return p.parseCreateRepository(createTok.Loc, true)
+		case kwSTAGE:
+			return p.parseCreateStage(createTok.Loc)
+		case kwFILE:
+			return p.parseCreateFile(createTok.Loc)
+		case kwROW:
+			p.advance() // consume ROW
+			return p.parseCreateRowPolicy(createTok.Loc)
+		case kwENCRYPTKEY:
+			return p.parseCreateEncryptKey(createTok.Loc)
+		case kwDICTIONARY:
+			return p.parseCreateDictionary(createTok.Loc)
+		case kwROLE:
+			return p.parseCreateRole(createTok.Loc)
+		case kwUSER:
+			return p.parseCreateUser(createTok.Loc)
+		case kwROUTINE:
+			return p.parseCreateRoutineLoad(createTok.Loc)
+		case kwJOB:
+			return nil, p.rejectJobStatement()
+		default:
+			return p.unsupported("CREATE")
+		}
+	case kwALTER:
+		alterTok := p.advance() // consume ALTER; cur is now the object type keyword
+		switch p.cur.Kind {
+		case kwDATABASE, kwSCHEMA:
+			return p.parseAlterDatabase()
+		case kwTABLE:
+			return p.parseAlterTable()
+		case kwVIEW:
+			return p.parseAlterView()
+		case kwMATERIALIZED:
+			return p.parseAlterMTMV(alterTok.Loc)
+		case kwCATALOG:
+			return p.parseAlterCatalog()
+		case kwSTORAGE:
+			p.advance() // consume STORAGE
+			return p.parseAlterStorage(alterTok.Loc)
+		case kwREPOSITORY:
+			return p.parseAlterRepository(alterTok.Loc)
+		case kwWORKLOAD:
+			// ALTER WORKLOAD GROUP ... or ALTER WORKLOAD POLICY ...
+			alterLoc := p.prev.Loc
+			next := p.peekNext()
+			if next.Kind == kwGROUP {
+				return p.parseAlterWorkloadGroup(alterLoc)
+			}
+			if next.Kind == kwPOLICY {
+				return p.parseAlterWorkloadPolicy(alterLoc)
+			}
+			return p.unsupported("ALTER WORKLOAD")
+		case kwRESOURCE:
+			return p.parseAlterResource(p.prev.Loc)
+		case kwSQL_BLOCK_RULE:
+			return p.parseAlterSQLBlockRule(p.prev.Loc)
+		case kwDICTIONARY:
+			return p.parseAlterDictionary(p.prev.Loc)
+		case kwROLE:
+			return p.parseAlterRole(p.prev.Loc)
+		case kwUSER:
+			return p.parseAlterUser(p.prev.Loc)
+		case kwROUTINE:
+			return p.parseAlterRoutineLoad(alterTok.Loc)
+		case kwSYSTEM:
+			return p.parseSystemAlter(alterTok.Loc)
+		case kwJOB:
+			return nil, p.rejectJobStatement()
+		default:
+			return p.unsupported("ALTER")
+		}
+	case kwDROP:
+		dropTok := p.advance() // consume DROP; cur is now the object type keyword
+		switch p.cur.Kind {
+		case kwINDEX:
+			return p.parseDropIndex(dropTok.Loc)
+		case kwDATABASE, kwSCHEMA:
+			return p.parseDropDatabase()
+		case kwTABLE, kwTEMPORARY:
+			return p.parseDropTable(dropTok.Loc)
+		case kwVIEW:
+			return p.parseDropView(dropTok.Loc)
+		case kwMATERIALIZED:
+			return p.parseDropMTMV(dropTok.Loc)
+		case kwCATALOG:
+			return p.parseDropCatalog()
+		case kwSTORAGE:
+			p.advance() // consume STORAGE
+			return p.parseDropStorage(dropTok.Loc)
+		case kwREPOSITORY:
+			return p.parseDropRepository(dropTok.Loc)
+		case kwSTAGE:
+			return p.parseDropStage(dropTok.Loc)
+		case kwFILE:
+			return p.parseDropFile(dropTok.Loc)
+		case kwWORKLOAD:
+			// DROP WORKLOAD GROUP ... or DROP WORKLOAD POLICY ...
+			next := p.peekNext()
+			if next.Kind == kwGROUP {
+				return p.parseDropWorkloadGroup(dropTok.Loc)
+			}
+			if next.Kind == kwPOLICY {
+				return p.parseDropWorkloadPolicy(dropTok.Loc)
+			}
+			return p.unsupported("DROP WORKLOAD")
+		case kwRESOURCE:
+			return p.parseDropResource(dropTok.Loc)
+		case kwSQL_BLOCK_RULE:
+			return p.parseDropSQLBlockRule(dropTok.Loc)
+		case kwROW:
+			p.advance() // consume ROW
+			return p.parseDropRowPolicy(dropTok.Loc)
+		case kwENCRYPTKEY:
+			return p.parseDropEncryptKey(dropTok.Loc)
+		case kwDICTIONARY:
+			return p.parseDropDictionary(dropTok.Loc)
+		case kwROLE:
+			return p.parseDropRole(dropTok.Loc)
+		case kwUSER:
+			return p.parseDropUser(dropTok.Loc)
+		case kwJOB:
+			return nil, p.rejectJobStatement()
+		case kwSTATS:
+			p.advance() // consume STATS
+			return p.parseDropStats(dropTok.Loc, "")
+		case kwEXPIRED:
+			p.advance() // consume EXPIRED
+			if _, err := p.expect(kwSTATS); err != nil {
+				return nil, err
+			}
+			return p.parseDropStats(dropTok.Loc, "EXPIRED")
+		case kwCACHED:
+			p.advance() // consume CACHED
+			if _, err := p.expect(kwSTATS); err != nil {
+				return nil, err
+			}
+			return p.parseDropStats(dropTok.Loc, "CACHED")
+		case kwPROCEDURE:
+			return p.parseDropProcedure(dropTok.Loc)
+		case kwFUNCTION, kwGLOBAL:
+			return p.parseDropFunction(dropTok.Loc)
+		default:
+			return p.unsupported("DROP")
+		}
+	case kwTRUNCATE:
+		return p.parseTruncateTable()
+
+	// DML
+	case int('('):
+		// Parenthesized query expression: (SELECT ...) [UNION ...] — parens
+		// nest freely, so a further '(' is admitted too (engine-verified:
+		// ((SELECT 1)) parses).
+		if next := p.peekNext(); next.Kind == kwSELECT || next.Kind == kwWITH || next.Kind == int('(') {
+			paren, err := p.parseParenSelect()
+			if err != nil {
+				return nil, err
+			}
+			return p.parseSetOpTail(paren)
+		}
+		return p.unsupported("(")
+	case kwSELECT:
+		left, err := p.parseSelectStmt()
+		if err != nil {
+			return nil, err
+		}
+		return p.parseSetOpTail(left)
+	case kwWITH:
+		return p.parseWithStatement()
+	case kwINSERT:
+		return p.parseInsert()
+	case kwUPDATE:
+		updateTok := p.advance() // consume UPDATE
+		return p.parseUpdateStmt(updateTok.Loc.Start)
+	case kwDELETE:
+		deleteTok := p.advance() // consume DELETE
+		return p.parseDeleteStmt(deleteTok.Loc.Start)
+	case kwMERGE:
+		mergeTok := p.advance() // consume MERGE; cur is now INTO
+		return p.parseMergeStmt(mergeTok.Loc)
+	case kwCALL:
+		return p.parseCallProcedure()
+
+	// Load / Export / Copy
+	case kwLOAD:
+		return p.parseLoad()
+	case kwEXPORT:
+		return p.parseExport()
+	case kwCOPY:
+		return p.parseCopyInto()
+
+	// Transaction
+	case kwBEGIN:
+		return p.parseBeginStmt()
+	case kwCOMMIT:
+		return p.parseCommitStmt()
+	case kwROLLBACK:
+		return p.parseRollbackStmt()
+
+	// DCL
+	case kwGRANT:
+		startLoc := p.cur.Loc
+		p.advance()
+		return p.parseGrant(startLoc)
+	case kwREVOKE:
+		startLoc := p.cur.Loc
+		p.advance()
+		return p.parseRevoke(startLoc)
+
+	// Show / Info
+	case kwSHOW:
+		return p.parseShow()
+	case kwDESCRIBE:
+		return p.parseDescribe()
+	case kwDESC:
+		return p.parseDescribe()
+	case kwEXPLAIN:
+		return p.parseExplain()
+	case kwUSE:
+		return p.parseUse()
+	case kwSWITCH:
+		// SWITCH catalog_name — Doris catalog switch; parse as a USE-like statement.
+		p.advance() // consume SWITCH
+		stmt := &ast.UseStmt{Loc: p.prev.Loc}
+		if isIdentifierToken(p.cur.Kind) {
+			ident, _, err := p.parseIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Catalog = ident
+		}
+		stmt.Loc.End = p.prev.Loc.End
+		return stmt, nil
+	case kwHELP:
+		return p.parseHelp()
+
+	// Set / Unset
+	case kwSET:
+		setTok := p.advance() // consume SET
+		// SET DEFAULT STORAGE VAULT name
+		if p.cur.Kind == kwDEFAULT && p.peekNext().Kind == kwSTORAGE {
+			return p.parseSetDefaultStorageVault(setTok.Loc)
+		}
+		// SET PASSWORD = '...'
+		if p.cur.Kind == kwPASSWORD {
+			return p.parseSetPassword(setTok.Loc)
+		}
+		// Generic variable assignment / NAMES / CHARSET / TRANSACTION
+		return p.parseGenericSet(setTok.Loc)
+	case kwUNSET:
+		unsetTok := p.advance() // consume UNSET
+		// UNSET DEFAULT STORAGE VAULT
+		if p.cur.Kind == kwDEFAULT && p.peekNext().Kind == kwSTORAGE {
+			return p.parseUnsetDefaultStorageVault(unsetTok.Loc)
+		}
+		return p.parseGenericUnset(unsetTok.Loc)
+
+	// Admin / System
+	case kwADMIN:
+		adminTok := p.advance() // consume ADMIN
+		return p.parseAdminStmt(adminTok.Loc)
+	case kwKILL:
+		killTok := p.advance() // consume KILL
+		if p.cur.Kind == kwANALYZE {
+			return p.parseKillAnalyze(killTok.Loc)
+		}
+		return p.parseKill(killTok.Loc)
+	case kwLOCK:
+		lockTok := p.advance() // consume LOCK
+		return p.parseLockTables(lockTok.Loc)
+	case kwUNLOCK:
+		unlockTok := p.advance() // consume UNLOCK
+		return p.parseUnlockTables(unlockTok.Loc)
+	case kwINSTALL:
+		installTok := p.advance() // consume INSTALL
+		return p.parseInstallPlugin(installTok.Loc)
+	case kwUNINSTALL:
+		uninstallTok := p.advance() // consume UNINSTALL
+		return p.parseUninstallPlugin(uninstallTok.Loc)
+
+	// Backup / Restore / Recovery
+	case kwBACKUP:
+		backupTok := p.advance() // consume BACKUP
+		return p.parseBackup(backupTok.Loc)
+	case kwRESTORE:
+		restoreTok := p.advance() // consume RESTORE
+		return p.parseRestore(restoreTok.Loc)
+	case kwRECOVER:
+		recoverTok := p.advance() // consume RECOVER
+		return p.parseRecover(recoverTok.Loc)
+
+	// Materialized View / Refresh
+	case kwREFRESH:
+		refreshTok := p.advance() // consume REFRESH; cur is now the object type keyword
+		switch p.cur.Kind {
+		case kwMATERIALIZED:
+			return p.parseRefreshMTMV(refreshTok.Loc)
+		case kwCATALOG:
+			return p.parseRefreshCatalog()
+		case kwDICTIONARY:
+			return p.parseRefreshDictionary(refreshTok.Loc)
+		}
+		return p.unsupported("REFRESH")
+
+	// Job control
+	case kwCANCEL:
+		cancelTok := p.advance() // consume CANCEL
+		if p.cur.Kind == kwMATERIALIZED || p.cur.Kind == kwTASK {
+			return nil, p.rejectJobStatement()
+		}
+		if p.cur.Kind == kwDECOMMISSION {
+			return p.parseCancelDecommission(cancelTok.Loc)
+		}
+		return p.parseCancelGeneric(cancelTok.Loc)
+	case kwPAUSE:
+		pauseTok := p.advance() // consume PAUSE
+		if p.cur.Kind == kwMATERIALIZED || p.cur.Kind == kwJOB {
+			return nil, p.rejectJobStatement()
+		}
+		if p.cur.Kind == kwROUTINE {
+			return p.parsePauseRoutineLoad(pauseTok.Loc)
+		}
+		if p.cur.Kind == kwALL {
+			p.advance() // consume ALL
+			if p.cur.Kind == kwROUTINE {
+				return p.parsePauseAllRoutineLoad(pauseTok.Loc)
+			}
+			return p.unsupported("PAUSE ALL")
+		}
+		return p.unsupported("PAUSE")
+	case kwRESUME:
+		resumeTok := p.advance() // consume RESUME
+		if p.cur.Kind == kwMATERIALIZED || p.cur.Kind == kwJOB {
+			return nil, p.rejectJobStatement()
+		}
+		if p.cur.Kind == kwROUTINE {
+			return p.parseResumeRoutineLoad(resumeTok.Loc)
+		}
+		if p.cur.Kind == kwALL {
+			p.advance() // consume ALL
+			if p.cur.Kind == kwROUTINE {
+				return p.parseResumeAllRoutineLoad(resumeTok.Loc)
+			}
+			return p.unsupported("RESUME ALL")
+		}
+		return p.unsupported("RESUME")
+
+	case kwSTOP:
+		stopTok := p.advance() // consume STOP
+		if p.cur.Kind == kwROUTINE {
+			return p.parseStopRoutineLoad(stopTok.Loc)
+		}
+		return p.unsupported("STOP")
+
+	// Analyze / Sync / Warm
+	case kwANALYZE:
+		p.advance() // consume ANALYZE
+		return p.parseAnalyze()
+	case kwSYNC:
+		syncTok := p.advance() // consume SYNC
+		return p.parseSyncStmt(syncTok.Loc)
+	case kwWARM:
+		warmTok := p.advance() // consume WARM
+		return p.parseWarmUp(warmTok.Loc)
+
+	// Clean
+	case kwCLEAN:
+		cleanTok := p.advance() // consume CLEAN
+		return p.parseClean(cleanTok.Loc)
+
+	// BUILD INDEX came with the doris fork, but the StarRocks engine rejects
+	// the statement in every form (container-verified) — index builds happen
+	// through ALTER TABLE here. Rejecting keeps parity with the engine.
+	case kwBUILD:
+		return nil, p.unknownStatementError()
+
+	default:
+		return nil, p.unknownStatementError()
+	}
+}
+
+// ParseResult holds the outcome of a best-effort parse. File contains
+// all successfully-parsed statements (empty for stubs-only F4); Errors
+// contains every ParseError encountered plus any LexErrors promoted from
+// the underlying Lexer.
+type ParseResult struct {
+	File   *ast.File
+	Errors []ParseError
+}
+
+// Parse is the strict entry point: returns all errors encountered while
+// parsing the full input, and — unlike ParseBestEffort — rejects a segment
+// whose statement parse succeeds without consuming every token. Before this
+// check, any valid statement prefix with an unparseable tail was silently
+// accepted with a truncated AST (`SELECT a[1] FROM t` once parsed as
+// `SELECT a` with no FROM at all), which downstream analysis could not tell
+// from a complete parse. The returned *ast.File always reflects whatever
+// statements parsed successfully — even in the error case, the File may
+// be non-empty.
+func Parse(input string) (*ast.File, error) {
+	result := parseAll(input, true, 0)
+	if len(result.Errors) == 0 {
+		return result.File, nil
+	}
+	return result.File, ParseErrors(result.Errors)
+}
+
+// ParseBestEffort runs Split to segment the input, then parses each segment
+// via parseSingle. Errors from individual segments are collected; all
+// successfully-parsed statements are appended to the result File.
+//
+// Unlike Parse, ParseBestEffort TOLERATES unconsumed trailing tokens after a
+// successfully-parsed statement prefix: partial or in-progress input still
+// yields whatever prefix parsed. Completion and other partial-input callers
+// depend on this tolerance — do not add the strict trailing-token check here.
+func ParseBestEffort(input string) *ParseResult {
+	return parseAll(input, false, 0)
+}
+
+// parseAll is the shared implementation behind Parse and ParseBestEffort:
+// Split the input, parse each segment, collect nodes and errors.
+// strictTrailing selects whether parseSingle rejects unconsumed trailing
+// tokens. depth is the nesting depth the parse starts at: zero for a
+// statement, and for a raw query body the depth it was captured at.
+func parseAll(input string, strictTrailing bool, depth int) *ParseResult {
+	file := &ast.File{Loc: ast.Loc{Start: 0, End: len(input)}}
+	result := &ParseResult{File: file}
+
+	for _, seg := range Split(input) {
+		node, errs := parseSingle(seg.Text, seg.ByteStart, strictTrailing, depth)
+		if node != nil {
+			file.Stmts = append(file.Stmts, node)
+		}
+		result.Errors = append(result.Errors, errs...)
+	}
+
+	// Split drops segments that lex to nothing, which also drops their lex
+	// errors: Parse("/* unterminated") produced zero segments and zero
+	// errors. Strict mode lexes the whole input once more and promotes any
+	// error the per-segment parses did not already report (matched by
+	// position — segment offsets are absolute).
+	if strictTrailing {
+		lx := NewLexer(input)
+		for lx.NextToken().Kind != tokEOF {
+		}
+		if lexErrs := lx.Errors(); len(lexErrs) > 0 {
+			// Matched through a set: scanning result.Errors once per lex
+			// error was quadratic in the number of errors.
+			reported := make(map[int]bool, len(result.Errors)+len(lexErrs))
+			for _, e := range result.Errors {
+				reported[e.Position] = true
+			}
+			for _, le := range lexErrs {
+				if reported[le.Loc.Start] {
+					continue
+				}
+				reported[le.Loc.Start] = true
+				result.Errors = append(result.Errors, ParseError{Position: le.Loc.Start, End: le.Loc.End, Message: le.Msg})
+			}
+		}
+	}
+
+	return result
+}
+
+// parseSingle parses one segment (one top-level statement) into a single
+// ast.Node. Returns (node, errors) where node may be nil if the segment
+// failed to parse and errors is the list of ParseErrors encountered,
+// including any LexErrors promoted from the underlying Lexer.
+//
+// segText is the statement text (without the trailing ; delimiter); it comes
+// from Segment.Text. baseOffset is the byte offset of segText within the
+// original input — passed to NewLexerWithOffset so token Loc values are
+// absolute. depth is the nesting depth the parse starts at (see parseAll).
+func parseSingle(segText string, baseOffset int, strictTrailing bool, depth int) (ast.Node, []ParseError) {
+	p := &Parser{
+		lexer:          NewLexerWithOffset(segText, baseOffset),
+		input:          segText,
+		baseOffset:     baseOffset,
+		strictTrailing: strictTrailing,
+		depth:          depth,
+	}
+	p.advance() // prime cur with the first token
+
+	var result ast.Node
+	if p.cur.Kind != tokEOF {
+		first := p.cur
+		node, err := p.parseStmt()
+		// A tree too deep for a recursive walk is dropped here, before
+		// anything (the raw query validation below, or the caller) walks it.
+		if node != nil && treeTooHigh(node, len(segText)) {
+			node = nil
+			if err == nil {
+				err = nestedTooDeeply(first.Loc)
+			}
+		}
+		if err != nil {
+			if pe, ok := err.(*ParseError); ok {
+				p.errors = append(p.errors, *pe)
+			} else {
+				p.errors = append(p.errors, ParseError{
+					Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+					Message: err.Error(),
+				})
+			}
+		}
+		// A statement must be followed by end-of-input: parseStmt succeeded
+		// but left tokens behind, so the segment is NOT one well-formed
+		// statement. Without this check the tail is silently dropped
+		// (stmts=1, errs=0) and downstream analysis sees a truncated AST.
+		// EOF is asserted only on the success path — a parse that already
+		// errored left cur mid-statement, and asserting EOF there would
+		// emit a spurious second diagnostic.
+		if strictTrailing && err == nil && p.cur.Kind != tokEOF {
+			p.errors = append(p.errors, *p.syntaxErrorAtCur())
+			node = nil
+			// Drain the rest of the segment: the lexer is lazy, so any
+			// lexical error past this point (an unterminated string, say)
+			// has not been reached yet and Errors() below could not
+			// promote it into the diagnostics.
+			for p.cur.Kind != tokEOF {
+				p.advance()
+			}
+		} else if strictTrailing && err == nil {
+			// The placeholder scans captured each subquery body and the CTAS
+			// query as raw text without parsing it, so the outer statement
+			// can succeed around a body the engine rejects. Strict mode
+			// parses every body now and drops the statement when one fails.
+			if errs := p.validateRawQueries(); len(errs) > 0 {
+				p.errors = append(p.errors, errs...)
+				node = nil
+			}
+		}
+		result = node
+	}
+
+	// Promote any lex errors into ParseErrors. The Lexer's Errors() getter
+	// returns positions already shifted by baseOffset.
+	for _, le := range p.lexer.Errors() {
+		p.errors = append(p.errors, ParseError{Position: le.Loc.Start, End: le.Loc.End, Message: le.Msg})
+	}
+	// A lex error (an unterminated comment after a complete statement, say)
+	// surfaces only now, after the node was built. Strict mode returns no
+	// node for a segment that carries any error; best-effort keeps the prefix.
+	if strictTrailing && len(p.errors) > 0 {
+		result = nil
+	}
+
+	return result, dedupeErrors(p.errors)
+}
+
+// dedupeErrors drops a later error that repeats an earlier one's position and
+// message. A raw query body validated by a nested strict parse reports its
+// lexical errors once there and once more when the outer lexer, which
+// scanned the same bytes, promotes its own; the diagnostic must appear once.
+func dedupeErrors(errs []ParseError) []ParseError {
+	if len(errs) < 2 {
+		return errs
+	}
+	type key struct {
+		pos int
+		msg string
+	}
+	seen := make(map[key]bool, len(errs))
+	out := errs[:0]
+	for _, e := range errs {
+		k := key{e.Position, e.Message}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, e)
+	}
+	return out
+}
+
+// isQueryBody reports whether a statement may stand as a subquery body.
+func isQueryBody(n ast.Node) bool {
+	switch n.(type) {
+	case *ast.SelectStmt, *ast.SetOpStmt, *ast.ParenSelect:
+		return true
+	}
+	return false
+}
+
+// validateRawQueries strictly parses every query body this parse captured as
+// raw text and returns the errors in the outer statement's coordinates. A body
+// must be exactly one query (SELECT, a set operation, or a grouped query): the
+// engine rejects an empty body, a comment-only body, several statements, and
+// a non-query statement in that position. Nested placeholders are validated
+// by the inner strict parse, which starts at the depth the body was captured
+// at: starting from zero, it counted a body's levels apart from the levels
+// around it, so nested bodies escaped the limit.
+func (p *Parser) validateRawQueries() []ParseError {
+	var out []ParseError
+	for _, q := range p.rawQueries {
+		if strings.TrimSpace(q.text) == "" {
+			out = append(out, ParseError{Position: q.start, End: q.start, Message: "subquery must contain exactly one query"})
+			continue
+		}
+		res := parseAll(q.text, true, q.depth)
+		if len(res.Errors) > 0 {
+			for _, e := range res.Errors {
+				e.Position += q.start
+				if e.End >= 0 {
+					e.End += q.start
+				}
+				out = append(out, e)
+			}
+			continue
+		}
+		if len(res.File.Stmts) != 1 {
+			out = append(out, ParseError{Position: q.start, End: q.start + len(q.text), Message: "subquery must contain exactly one query"})
+			continue
+		}
+		if !isQueryBody(res.File.Stmts[0]) {
+			out = append(out, ParseError{Position: q.start, End: q.start + len(q.text), Message: "subquery must contain exactly one query"})
+		}
+	}
+	return out
+}

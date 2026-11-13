@@ -1,0 +1,276 @@
+package pg
+
+import (
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/Dxlxz/orrery-sql/pg/ast"
+)
+
+func TestParse(t *testing.T) {
+	tests := []struct {
+		name      string
+		sql       string
+		wantCount int
+		checks    func(t *testing.T, stmts []Statement)
+	}{
+		{
+			name:      "single SELECT",
+			sql:       "SELECT 1",
+			wantCount: 1,
+			checks: func(t *testing.T, stmts []Statement) {
+				s := stmts[0]
+				if s.Text != "SELECT 1" {
+					t.Errorf("text = %q, want %q", s.Text, "SELECT 1")
+				}
+				if _, ok := s.AST.(*ast.SelectStmt); !ok {
+					t.Errorf("AST type = %T, want *ast.SelectStmt", s.AST)
+				}
+				if s.ByteStart != 0 || s.ByteEnd != 8 {
+					t.Errorf("byte range = [%d,%d), want [0,8)", s.ByteStart, s.ByteEnd)
+				}
+				if s.Start.Line != 1 || s.Start.Column != 1 {
+					t.Errorf("start = %+v, want {1,1}", s.Start)
+				}
+			},
+		},
+		{
+			name:      "two statements with semicolons",
+			sql:       "SELECT 1; SELECT 2;",
+			wantCount: 2,
+			checks: func(t *testing.T, stmts []Statement) {
+				if stmts[0].Text != "SELECT 1;" {
+					t.Errorf("stmt[0].text = %q, want %q", stmts[0].Text, "SELECT 1;")
+				}
+				if stmts[1].Text != " SELECT 2;" {
+					t.Errorf("stmt[1].text = %q, want %q", stmts[1].Text, " SELECT 2;")
+				}
+				if stmts[1].ByteStart != 9 {
+					t.Errorf("stmt[1].ByteStart = %d, want 9", stmts[1].ByteStart)
+				}
+			},
+		},
+		{
+			name:      "multiline",
+			sql:       "SELECT\n  1;\nSELECT\n  2;",
+			wantCount: 2,
+			checks: func(t *testing.T, stmts []Statement) {
+				if stmts[0].Start.Line != 1 {
+					t.Errorf("stmt[0] start line = %d, want 1", stmts[0].Start.Line)
+				}
+				if stmts[1].Start.Line != 3 {
+					t.Errorf("stmt[1] start line = %d, want 3", stmts[1].Start.Line)
+				}
+			},
+		},
+		{
+			name:      "CREATE TABLE",
+			sql:       "CREATE TABLE t (id int);",
+			wantCount: 1,
+			checks: func(t *testing.T, stmts []Statement) {
+				if _, ok := stmts[0].AST.(*ast.CreateStmt); !ok {
+					t.Errorf("AST type = %T, want *ast.CreateStmt", stmts[0].AST)
+				}
+			},
+		},
+		{
+			name:      "empty input",
+			sql:       "",
+			wantCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stmts, err := Parse(tt.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tt.sql, err)
+			}
+			if len(stmts) != tt.wantCount {
+				t.Fatalf("Parse(%q) got %d statements, want %d", tt.sql, len(stmts), tt.wantCount)
+			}
+			if tt.checks != nil {
+				tt.checks(t, stmts)
+			}
+		})
+	}
+}
+
+func TestParsePosition(t *testing.T) {
+	sql := "SELECT 1;\nINSERT INTO t VALUES (1);\nDELETE FROM t;"
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stmts) != 3 {
+		t.Fatalf("got %d stmts, want 3", len(stmts))
+	}
+
+	// Line 1: "SELECT 1;"
+	if stmts[0].Start != (Position{1, 1}) {
+		t.Errorf("stmt[0].Start = %+v, want {1,1}", stmts[0].Start)
+	}
+
+	// Line 2: "INSERT INTO t VALUES (1);"
+	if stmts[1].Start.Line != 2 {
+		t.Errorf("stmt[1].Start.Line = %d, want 2", stmts[1].Start.Line)
+	}
+
+	// Line 3: "DELETE FROM t;"
+	if stmts[2].Start.Line != 3 {
+		t.Errorf("stmt[2].Start.Line = %d, want 3", stmts[2].Start.Line)
+	}
+}
+
+func TestParseError(t *testing.T) {
+	_, err := Parse("SELECTT FROM")
+	if err == nil {
+		t.Fatal("expected parse error")
+	}
+}
+
+// TestParseCopyInlineDataPipeline verifies the full pg.Parse pipeline on the
+// pg_dump plain-format shape: statement texts reconstruct the input
+// losslessly and the COPY statement's text includes its inline data block.
+func TestParseCopyInlineDataPipeline(t *testing.T) {
+	sql := "COPY t (a, b) FROM stdin;\nx;y\t1\n\\N\t2\n\\.\nSELECT 1;"
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if len(stmts) != 2 {
+		t.Fatalf("expected 2 statements, got %d", len(stmts))
+	}
+	var rebuilt string
+	for _, s := range stmts {
+		rebuilt += s.Text
+	}
+	if rebuilt != sql {
+		t.Fatalf("statement texts do not reconstruct input:\ngot  %q\nwant %q", rebuilt, sql)
+	}
+	if !strings.HasSuffix(stmts[0].Text, "\\.\n") {
+		t.Fatalf("COPY statement text %q does not include its data block", stmts[0].Text)
+	}
+	if stmts[1].Text != "SELECT 1;" {
+		t.Fatalf("second statement text = %q, want %q", stmts[1].Text, "SELECT 1;")
+	}
+}
+
+// TestParseRealPgDumpPipeline runs the committed real pg_dump 17.7 output
+// (verbatim, including \restrict/\unrestrict bracket lines — corpus rule
+// C19) through the full pg.Parse pipeline: zero errors and all statements
+// recovered.
+func TestParseRealPgDumpPipeline(t *testing.T) {
+	data, err := os.ReadFile("testdata/pg_dump_17_restrict.sql")
+	if err != nil {
+		t.Fatalf("read dump: %v", err)
+	}
+	stmts, err := Parse(string(data))
+	if err != nil {
+		t.Fatalf("pipeline failed on real pg_dump output: %v", err)
+	}
+	if len(stmts) != 18 {
+		t.Fatalf("expected 18 statements, got %d", len(stmts))
+	}
+	// COPY inline data must ride along inside its statement.
+	foundCopy := false
+	for _, s := range stmts {
+		if cs, ok := s.AST.(*ast.CopyStmt); ok && cs.InlineData != "" {
+			foundCopy = true
+		}
+	}
+	if !foundCopy {
+		t.Fatal("no COPY statement with inline data found in dump")
+	}
+}
+
+// TestParseCommentSweepFollowups pins the parse-layer halves of the review
+// sweep fixes: BOM'd scripts parse (psql strips the BOM), and same-line SQL
+// after a COPY statement stays a real statement instead of being swallowed
+// into InlineData.
+func TestParseCommentSweepFollowups(t *testing.T) {
+	t.Run("BOM script parses", func(t *testing.T) {
+		stmts, err := Parse("\xEF\xBB\xBFSELECT 1;")
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		if len(stmts) != 1 {
+			t.Fatalf("expected 1 statement, got %d", len(stmts))
+		}
+	})
+
+	t.Run("BOM copy pipeline", func(t *testing.T) {
+		stmts, err := Parse("\xEF\xBB\xBFCOPY t FROM stdin;\na\t1\n\\.\nSELECT 2;")
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		if len(stmts) != 2 {
+			t.Fatalf("expected 2 statements, got %d", len(stmts))
+		}
+	})
+
+	t.Run("same-line SQL after copy is not swallowed", func(t *testing.T) {
+		stmts, err := Parse("COPY t FROM stdin; SELECT 42;")
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		if len(stmts) != 2 {
+			t.Fatalf("expected 2 statements, got %d: the trailing SELECT must stay a statement", len(stmts))
+		}
+	})
+}
+
+// TestParseMetacommandAnywhere pins parse-layer metacommand handling under
+// the D7 anywhere rule: the lexer consumes backslash+letter through end of
+// line like a comment, so metacommands work at statement boundaries, at
+// byte zero, and mid-statement (engine-verified: psql executes \echo
+// mid-buffer and the SQL continues around it).
+func TestParseMetacommandAnywhere(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  int
+	}{
+		{"byte-zero header", "\\restrict abc\nSELECT 1;", 1},
+		{"mid-statement metacommand", "SELECT\n\\echo hi\n1;", 1},
+		{"mid-line after semicolon", "SELECT 1; \\echo mid\nSELECT 2;", 2},
+		{"metacommand only", "\\restrict abc\n", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmts, err := Parse(tc.input)
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+			n := 0
+			for _, s := range stmts {
+				if !s.Empty() {
+					n++
+				}
+			}
+			if n != tc.want {
+				t.Fatalf("got %d statements, want %d", n, tc.want)
+			}
+		})
+	}
+}
+
+func TestParse_ColumnsCountCodePoints(t *testing.T) {
+	// Statement positions are what Bytebase reports to users, whose Position
+	// counts columns in code points; 'é' is two bytes and one column.
+	sql := "SELECT 'é'; SELECT 2"
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(stmts) != 2 {
+		t.Fatalf("got %d statements, want 2", len(stmts))
+	}
+	if stmts[0].End != (Position{Line: 1, Column: 12}) {
+		t.Errorf("stmt[0].End = %+v, want line 1 column 12 (after the ';')", stmts[0].End)
+	}
+	if stmts[1].Start != (Position{Line: 1, Column: 13}) {
+		t.Errorf("stmt[1].Start = %+v, want line 1 column 13", stmts[1].Start)
+	}
+}

@@ -1,0 +1,447 @@
+package review
+
+import (
+	"strings"
+
+	"github.com/Dxlxz/orrery-sql/pg/ast"
+	"github.com/Dxlxz/orrery-sql/pg/parser"
+)
+
+// ident writes an identifier the way quote_identifier does: bare when it
+// is a plain lower-case name that is not a keyword needing quotes,
+// double-quoted otherwise. The parser folds unquoted names, so this is
+// the closest the message gets to the SQL's spelling.
+//
+// pg: src/backend/utils/adt/ruleutils.c — quote_identifier
+func ident(name string) string {
+	if name == "" {
+		return `""`
+	}
+	plain := true
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c == '_':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			plain = false
+		}
+	}
+	if plain {
+		if kw := parser.LookupKeyword(name); kw == nil || kw.Category == parser.UnreservedKeyword {
+			return name
+		}
+	}
+	return `"` + escapeLines(strings.ReplaceAll(name, `"`, `""`)) + `"`
+}
+
+// escapeLines writes a line break inside quoted text as \n or \r, so a
+// message stays one line whatever a name or a string holds.
+func escapeLines(s string) string {
+	return strings.NewReplacer("\n", `\n`, "\r", `\r`).Replace(s)
+}
+
+// qualified joins name parts with dots.
+func qualified(parts []string) string {
+	quoted := make([]string, len(parts))
+	for i, p := range parts {
+		quoted[i] = ident(p)
+	}
+	return strings.Join(quoted, ".")
+}
+
+// relation names a RangeVar as written: schema-qualified when the SQL was.
+func relation(rv *ast.RangeVar) string {
+	if rv == nil {
+		return ""
+	}
+	parts := make([]string, 0, 3)
+	if rv.Catalogname != "" {
+		parts = append(parts, rv.Catalogname)
+	}
+	if rv.Schemaname != "" {
+		parts = append(parts, rv.Schemaname)
+	}
+	parts = append(parts, rv.Relname)
+	return qualified(parts)
+}
+
+// strings returns the String items of a name list.
+func nameParts(list *ast.List) []string {
+	if list == nil {
+		return nil
+	}
+	parts := make([]string, 0, len(list.Items))
+	for _, item := range list.Items {
+		if s, ok := item.(*ast.String); ok {
+			parts = append(parts, s.Str)
+		}
+	}
+	return parts
+}
+
+// objectName writes a DROP object that is one name as the SQL named it:
+// a name, a type, or a routine or operator with its argument types. The
+// objects named by parts of several kinds, such as a cast or a trigger,
+// are written by dropTarget.
+func objectName(kind ast.ObjectType, obj ast.Node) string {
+	switch v := obj.(type) {
+	case *ast.String:
+		return ident(v.Str)
+	case *ast.List:
+		return qualified(nameParts(v))
+	case *ast.TypeName:
+		return typeName(v)
+	case *ast.ObjectWithArgs:
+		name := qualified(nameParts(v.Objname))
+		if kind == ast.OBJECT_OPERATOR {
+			name = operatorName(nameParts(v.Objname))
+		}
+		switch {
+		case v.ArgsUnspecified:
+			return name
+		case v.Objargs == nil && kind == ast.OBJECT_AGGREGATE:
+			// An aggregate with no argument list is written (*); a
+			// routine with none is written ().
+			return name + "(*)"
+		default:
+			return name + "(" + strings.Join(typeNames(v.Objargs), ", ") + ")"
+		}
+	}
+	return ""
+}
+
+// collapseSpace puts SQL text on one line: each run of whitespace outside
+// a quoted identifier, string, or dollar-quoted string becomes one space,
+// comments go, and leading and trailing whitespace goes. Whitespace
+// inside quotes is part of the name or value and stays, except that a
+// line break there is written as \n or \r so the result is still one
+// line.
+func collapseSpace(s string) string {
+	var b strings.Builder
+	pending := false
+	writeQuoted := func(text string) {
+		for i := 0; i < len(text); i++ {
+			switch text[i] {
+			case '\n':
+				b.WriteString(`\n`)
+			case '\r':
+				b.WriteString(`\r`)
+			default:
+				b.WriteByte(text[i])
+			}
+		}
+	}
+	for i := 0; i < len(s); {
+		c := s[i]
+		if isSpace(c) {
+			pending = b.Len() > 0
+			i++
+			continue
+		}
+		if strings.HasPrefix(s[i:], "--") {
+			// As in the lexer, the comment ends at a line feed or a
+			// carriage return.
+			end := strings.IndexAny(s[i:], "\n\r")
+			if end < 0 {
+				end = len(s) - i
+			}
+			pending = b.Len() > 0
+			i += end
+			continue
+		}
+		if strings.HasPrefix(s[i:], "/*") {
+			// Block comments nest.
+			depth, j := 0, i
+			for j < len(s) {
+				switch {
+				case strings.HasPrefix(s[j:], "/*"):
+					depth++
+					j += 2
+				case strings.HasPrefix(s[j:], "*/"):
+					depth--
+					j += 2
+				default:
+					j++
+				}
+				if depth == 0 {
+					break
+				}
+			}
+			pending = b.Len() > 0
+			i = j
+			continue
+		}
+		if pending {
+			b.WriteByte(' ')
+			pending = false
+		}
+		end := i + 1
+		switch {
+		case c == '"' || c == '\'':
+			// An escape string, E'...', hides a quote behind a backslash;
+			// a doubled quote closes and reopens, which reads the same.
+			escape := c == '\'' && i > 0 && (s[i-1] == 'E' || s[i-1] == 'e')
+			end = quotedEnd(s, i, escape)
+		case c == '$':
+			if tag := dollarTag(s[i:]); tag != "" {
+				if j := strings.Index(s[i+len(tag):], tag); j >= 0 {
+					end = i + len(tag) + j + len(tag)
+				} else {
+					end = len(s)
+				}
+			}
+		}
+		writeQuoted(s[i:end])
+		i = end
+	}
+	return b.String()
+}
+
+// quotedEnd returns the offset just past the quoted text that starts at
+// s[i], or len(s) when it is not closed.
+func quotedEnd(s string, i int, escape bool) int {
+	quote := s[i]
+	for j := i + 1; j < len(s); j++ {
+		switch {
+		case escape && s[j] == '\\':
+			j++
+		case s[j] == quote:
+			return j + 1
+		}
+	}
+	return len(s)
+}
+
+// dollarTag returns the $tag$ delimiter that s starts with, or "" when s
+// does not start one: the tag is empty or an identifier that does not
+// begin with a digit, and $1 is a parameter, not a delimiter.
+func dollarTag(s string) string {
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '$':
+			return s[:i+1]
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_', c >= 0x80:
+		case c >= '0' && c <= '9' && i > 1:
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+func listOf(n ast.Node) *ast.List {
+	l, _ := n.(*ast.List)
+	return l
+}
+
+// typeNames writes the types of an argument list; a missing type, the
+// NONE side of a unary operator, reads NONE.
+func typeNames(args *ast.List) []string {
+	if args == nil {
+		return nil
+	}
+	names := make([]string, 0, len(args.Items))
+	for _, item := range args.Items {
+		if tn, ok := item.(*ast.TypeName); ok {
+			names = append(names, typeName(tn))
+		} else {
+			names = append(names, "NONE")
+		}
+	}
+	return names
+}
+
+// operatorName writes an operator name: the schema, if any, as an
+// identifier and the operator itself as written, since an operator is
+// not an identifier and is never quoted.
+func operatorName(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	op := parts[len(parts)-1]
+	if len(parts) == 1 {
+		return op
+	}
+	return qualified(parts[:len(parts)-1]) + "." + op
+}
+
+// typeName writes a type the way format_type_be does when the type is
+// known to be pg_catalog's, which is how the server's own messages name
+// it: the grammar qualifies every type it spells with keywords (int
+// becomes pg_catalog.int4), and such a type, or one the SQL qualified
+// itself, takes its SQL name (integer). Any other type is written as the
+// SQL named it: an unqualified name such as int4 or "varchar" is found
+// through the search path, which may put a schema with a type of that
+// name before pg_catalog, so the review cannot tell which type it is. An
+// array is one [] whatever dimensions it declares, since they do not
+// change the type. A %TYPE reference stays as written: the server
+// resolves it to the column's type, which the review does not know.
+//
+// pg: src/backend/utils/adt/format_type.c — format_type_extended
+func typeName(tn *ast.TypeName) string {
+	parts := nameParts(tn.Names)
+	if tn.PctType {
+		return qualified(parts) + "%TYPE"
+	}
+	name := qualified(parts)
+	if len(parts) == 2 && parts[0] == "pg_catalog" {
+		name = ident(parts[1])
+		if sqlName, ok := sqlTypeNames[parts[1]]; ok {
+			name = sqlName
+		}
+	}
+	if tn.ArrayBounds != nil {
+		name += "[]"
+	}
+	return name
+}
+
+// sqlTypeNames are the built-in types format_type_be writes under their
+// SQL names instead of their catalog names. Every other type is written
+// as quote_identifier writes its name.
+//
+// pg: src/backend/utils/adt/format_type.c — format_type_extended
+var sqlTypeNames = map[string]string{
+	"bit":         "bit",
+	"bool":        "boolean",
+	"bpchar":      "character",
+	"float4":      "real",
+	"float8":      "double precision",
+	"int2":        "smallint",
+	"int4":        "integer",
+	"int8":        "bigint",
+	"interval":    "interval",
+	"json":        "json",
+	"numeric":     "numeric",
+	"time":        "time without time zone",
+	"timestamp":   "timestamp without time zone",
+	"timestamptz": "timestamp with time zone",
+	"timetz":      "time with time zone",
+	"varbit":      "bit varying",
+	"varchar":     "character varying",
+}
+
+// objectKind names an ObjectType the way the DROP keyword does.
+func objectKind(t ast.ObjectType) string {
+	switch t {
+	case ast.OBJECT_TABLE:
+		return "table"
+	case ast.OBJECT_COLUMN:
+		return "column"
+	case ast.OBJECT_VIEW:
+		return "view"
+	case ast.OBJECT_MATVIEW:
+		return "materialized view"
+	case ast.OBJECT_INDEX:
+		return "index"
+	case ast.OBJECT_SEQUENCE:
+		return "sequence"
+	case ast.OBJECT_SCHEMA:
+		return "schema"
+	case ast.OBJECT_DATABASE:
+		return "database"
+	case ast.OBJECT_TYPE:
+		return "type"
+	case ast.OBJECT_DOMAIN:
+		return "domain"
+	case ast.OBJECT_FUNCTION:
+		return "function"
+	case ast.OBJECT_PROCEDURE:
+		return "procedure"
+	case ast.OBJECT_ROUTINE:
+		return "routine"
+	case ast.OBJECT_AGGREGATE:
+		return "aggregate"
+	case ast.OBJECT_OPERATOR:
+		return "operator"
+	case ast.OBJECT_OPCLASS:
+		return "operator class"
+	case ast.OBJECT_OPFAMILY:
+		return "operator family"
+	case ast.OBJECT_TRIGGER:
+		return "trigger"
+	case ast.OBJECT_EVENT_TRIGGER:
+		return "event trigger"
+	case ast.OBJECT_POLICY:
+		return "policy"
+	case ast.OBJECT_RULE:
+		return "rule"
+	case ast.OBJECT_EXTENSION:
+		return "extension"
+	case ast.OBJECT_FOREIGN_TABLE:
+		return "foreign table"
+	case ast.OBJECT_FOREIGN_SERVER:
+		return "server"
+	case ast.OBJECT_FDW:
+		return "foreign data wrapper"
+	case ast.OBJECT_COLLATION:
+		return "collation"
+	case ast.OBJECT_CONVERSION:
+		return "conversion"
+	case ast.OBJECT_CAST:
+		return "cast"
+	case ast.OBJECT_LANGUAGE:
+		return "language"
+	case ast.OBJECT_STATISTIC_EXT:
+		return "statistics"
+	case ast.OBJECT_PUBLICATION:
+		return "publication"
+	case ast.OBJECT_SUBSCRIPTION:
+		return "subscription"
+	case ast.OBJECT_TSCONFIGURATION:
+		return "text search configuration"
+	case ast.OBJECT_TSDICTIONARY:
+		return "text search dictionary"
+	case ast.OBJECT_TSPARSER:
+		return "text search parser"
+	case ast.OBJECT_TSTEMPLATE:
+		return "text search template"
+	case ast.OBJECT_ACCESS_METHOD:
+		return "access method"
+	case ast.OBJECT_TRANSFORM:
+		return "transform"
+	case ast.OBJECT_ROLE:
+		return "role"
+	case ast.OBJECT_TABLESPACE:
+		return "tablespace"
+	default:
+		return "object"
+	}
+}
+
+// roleNames lists the roles of a RoleSpec list; special roles read as
+// their keyword.
+func roleNames(list *ast.List) []string {
+	if list == nil {
+		return nil
+	}
+	names := make([]string, 0, len(list.Items))
+	for _, item := range list.Items {
+		rs, ok := item.(*ast.RoleSpec)
+		if !ok {
+			continue
+		}
+		names = append(names, roleName(rs))
+	}
+	return names
+}
+
+func roleName(rs *ast.RoleSpec) string {
+	if rs == nil {
+		return ""
+	}
+	switch ast.RoleSpecType(rs.Roletype) {
+	case ast.ROLESPEC_CURRENT_ROLE:
+		return "CURRENT_ROLE"
+	case ast.ROLESPEC_CURRENT_USER:
+		return "CURRENT_USER"
+	case ast.ROLESPEC_SESSION_USER:
+		return "SESSION_USER"
+	case ast.ROLESPEC_PUBLIC:
+		return "PUBLIC"
+	default:
+		return ident(rs.Rolename)
+	}
+}

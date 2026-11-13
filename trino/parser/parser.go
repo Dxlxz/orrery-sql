@@ -1,0 +1,893 @@
+// Package parser implements a hand-written recursive-descent parser for Trino
+// SQL (Trino 481 grammar, derived from the official SqlBase.g4).
+//
+// This file is the parser-foundation node: it ships the Parser struct, the
+// token-cursor primitives (advance / peek / peekNext / match / expect), the
+// public Parse / ParseBestEffort entry points, the per-segment driver
+// (parseSingle), and the top-level statement-dispatch switch (parseStmt).
+//
+// Per-statement parsing is STUBBED here — the foundation ships only the
+// dispatch framework. Every dispatch case routes to a real parse function or,
+// where that function does not yet exist, to the unsupported helper which
+// records a "not yet supported" ParseError. Later DAG nodes (types,
+// expressions, parser-select, parser-ddl, parser-dml, …) REPLACE individual
+// dispatch-case bodies with concrete parsers that build real ast.Node trees.
+//
+// The dispatch switch enumerates every first-keyword of Trino's `statement`
+// and `rootQuery`/`queryPrimary` grammar rules so that bytebase's Diagnose —
+// which runs on every statement — never emits a false "unknown statement"
+// diagnostic for syntactically valid Trino. Reaching a stubbed case is correct
+// foundation behavior; reaching the default (unknown) branch for a valid
+// statement is a bug.
+//
+// The package mirrors orrery's doris/parser and snowflake/parser conventions: a
+// stateless Lexer feeds the Parser one Token{Kind, Str, Ival, Loc} at a time
+// with two-token lookahead, and source positions are byte offsets.
+package parser
+
+import (
+	"sort"
+	"strings"
+
+	"github.com/Dxlxz/orrery-sql/trino/ast"
+)
+
+// Parser is a recursive-descent parser for Trino SQL. It operates on a single
+// segment of input (one top-level statement produced by Split) at a time;
+// callers should use Parse or ParseBestEffort instead of constructing Parsers
+// directly.
+type Parser struct {
+	lexer      *Lexer
+	input      string       // the segment text (used for error reporting)
+	baseOffset int          // absolute offset of input within the original source
+	cur        Token        // current token
+	prev       Token        // previous token (for error context)
+	nextBuf    Token        // buffered lookahead token
+	hasNext    bool         // whether nextBuf is valid
+	errors     []ParseError // collected errors for best-effort mode
+
+	// strictTrailing mirrors the parseSingle mode: the strict entry point
+	// rejects a segment whose statement parsed but left tokens behind,
+	// dropping the truncated node; best-effort keeps the parsed prefix.
+	strictTrailing bool
+
+	// rawQueries lists every query body this parse captured as raw text
+	// without parsing it (expression subquery placeholders, SHOW STATS FOR
+	// (query)), in source order, so the strict entry point can validate them.
+	// In strict mode an expression subquery body that parsed in place is
+	// already valid and is not listed. restore truncates it, so an abandoned
+	// speculative parse leaves nothing behind.
+	rawQueries []rawQuery
+
+	// parenQueryFail holds every parseParenQuery failure by the offset of its
+	// '('. parseParenRelationOrSubquery speculates a query at each level of a
+	// nested `((((t))))` FROM group and rewinds when it fails, and the next
+	// level down fails on the same tokens; recording the failures keeps that
+	// linear.
+	parenQueryFail map[int]parenFailure
+
+	// parenRelationFail holds every parseParenRelationOrSubquery failure by
+	// the offset of its '('. When a FROM group nested in a derived table
+	// fails, as in `((SELECT * FROM ((SELECT * FROM t WHERE) x)) x)`, the
+	// derived table's query fails with it and every level above reparses the
+	// group as a relation; recording the failures keeps that linear.
+	parenRelationFail map[int]parenFailure
+
+	// parenGroupEnd records where the raw scan of each '(' group ended (its
+	// matching ')', or EOF), by the offset of the '('. A subquery body whose
+	// in-place parse fails is scanned raw, and so is every enclosing body
+	// whose parse fails after it; jumping over the groups already scanned
+	// keeps that linear.
+	parenGroupEnd map[int]parenReplay
+
+	// speculating counts the readings in progress that are abandoned for
+	// another reading of the same tokens when they fail: the special SUBSTRING
+	// and POSITION forms, TRIM's FROM form, a JSON_OBJECT member's leading KEY
+	// keyword, and a ROW type's field list. Every level nested inside one
+	// reads the inner level both ways too, so `substring(substring(…, 1), 1)`
+	// doubled the work per level. While a reading is in progress, every
+	// primary expression and type it parses is recorded by start offset, and
+	// the other reading replays the record instead of parsing the tokens again.
+	speculating int
+	primaryMemo map[int]exprReplay
+	typeMemo    map[int]typeReplay
+
+	depth      int         // nesting depth of the productions being parsed (see enterNesting)
+	nestingErr *ParseError // the first nesting failure; the statement fails with it
+
+	// prepareBodies counts the PREPARE bodies being parsed (see
+	// parsePrepareBody), prepareTokens lists the segment's tokens from the
+	// outermost one on (see prepareBodyEnd), and prepareWraps counts the
+	// prefixes the error of a PREPARE in another one's body still lacks (see
+	// invalidPrepareBody).
+	prepareBodies int
+	prepareTokens []ast.Loc
+	prepareWraps  map[*ParseError]int
+
+	// routineNestingFailed is set once the in-place parse of a WITH FUNCTION
+	// subquery body nested too deeply (see parseRoutineSubquery).
+	routineNestingFailed bool
+}
+
+// parenReplay is the state a scan or parse starting at a '(' left behind.
+// The lex errors on the way follow from the lexer position (see Lexer), so
+// replaying it is indistinguishable from running it again.
+type parenReplay struct {
+	end parserCheckpoint
+}
+
+// parenFailure is a recorded parseParenQuery or parseParenRelationOrSubquery
+// failure: its error and where the failed parse stopped. The raw query bodies
+// the parse captured are not kept: a caller that receives a parse error
+// either rewinds past them or fails the statement, and neither reads them.
+type parenFailure struct {
+	err error
+	parenReplay
+}
+
+// recordParenReplay captures the current state as the end of a scan or parse
+// that started at a '('.
+func (p *Parser) recordParenReplay() parenReplay {
+	return parenReplay{end: p.checkpoint()}
+}
+
+// replayParen moves the parser to the end state r records.
+func (p *Parser) replayParen(r parenReplay) {
+	p.replayTo(r.end)
+}
+
+// replayTo moves the parser to the token state c records. The captured query
+// bodies are left alone; a replay that captured some appends them itself.
+func (p *Parser) replayTo(c parserCheckpoint) {
+	p.lexer.pos, p.lexer.start = c.lexPos, c.lexStart
+	p.cur, p.prev, p.nextBuf, p.hasNext = c.cur, c.prev, c.nextBuf, c.hasNext
+}
+
+// exprReplay is a recorded parsePrimary result: the expression or the error,
+// and where the parse stopped. A primary expression parses the same from a
+// given token wherever it occurs, so replaying it is indistinguishable from
+// parsing it again. raws holds the query bodies it captured raw. A failure
+// keeps none, for the reason parenFailure gives.
+type exprReplay struct {
+	expr Expr
+	err  error
+	raws []rawQuery
+	end  parserCheckpoint
+}
+
+// typeReplay is a recorded parseType result. A type holds no expression, so
+// it captures no query bodies.
+type typeReplay struct {
+	typ *DataType
+	err error
+	end parserCheckpoint
+}
+
+// rawQuery is a query body captured as raw text: the text and the absolute
+// byte offset of its first character in the parser's input, and the nesting
+// depth it was captured at, where its validation starts. A recorded
+// primary expression's bodies are kept as one rawQuery holding them in group,
+// so recording a primary copies only the entries its own parse appended.
+//
+// Two kinds of entry stand for an expression subquery body that was parsed in
+// place, and report what parsing it again from its text would have, where
+// that parse would have (see parseSubqueryPlaceholder). One with lexOnly set
+// stands for a body that parsed in place over lex errors, its text spanning
+// [start, end), and reports the lex errors there. One with routine set stands
+// for a body that is a WITH FUNCTION statement: its text is text, from start;
+// its lex errors are those in [start, end); the bodies captured raw in it are
+// in group.
+type rawQuery struct {
+	text    string
+	start   int
+	depth   int
+	group   []rawQuery
+	lexOnly bool
+	end     int
+	routine *routineBody
+}
+
+// routineBody is what the in-place parse of a WITH FUNCTION subquery body
+// found that its validation reports: whether its tree is too high for the
+// statement (see treeTooHigh), and its first token, where that error is.
+type routineBody struct {
+	tooHigh bool
+	first   ast.Loc
+}
+
+// advance consumes the current token and moves to the next one. Returns the
+// token that was just consumed (the new "previous" token).
+func (p *Parser) advance() Token {
+	p.prev = p.cur
+	if p.hasNext {
+		p.cur = p.nextBuf
+		p.hasNext = false
+	} else {
+		p.cur = p.lexer.NextToken()
+	}
+	return p.prev
+}
+
+// peek returns the current token without consuming it.
+func (p *Parser) peek() Token {
+	return p.cur
+}
+
+// peekNext returns the token AFTER the current one without consuming it
+// (one-token lookahead beyond cur). Used to disambiguate based on the token
+// following the current position.
+func (p *Parser) peekNext() Token {
+	if !p.hasNext {
+		p.nextBuf = p.lexer.NextToken()
+		p.hasNext = true
+	}
+	return p.nextBuf
+}
+
+// match tries each given token kind; if cur matches any, it is consumed and
+// returned with ok == true. Used for optional tokens.
+func (p *Parser) match(kinds ...TokenKind) (Token, bool) {
+	for _, k := range kinds {
+		if p.cur.Kind == k {
+			return p.advance(), true
+		}
+	}
+	return Token{}, false
+}
+
+// expect consumes the current token if it matches the expected kind. Otherwise
+// returns a ParseError describing the mismatch (without consuming anything).
+func (p *Parser) expect(kind TokenKind) (Token, error) {
+	if p.cur.Kind == kind {
+		return p.advance(), nil
+	}
+	return Token{}, p.syntaxErrorAtCur()
+}
+
+// syntaxErrorAtCur returns a *ParseError describing a syntax error at the
+// current token position. At EOF the message says "at end of input"; otherwise
+// "at or near X", where X is the token's source text or, for value-less tokens
+// (operators, EOF), its symbolic name.
+func (p *Parser) syntaxErrorAtCur() *ParseError {
+	var msg string
+	if p.cur.Kind == tokEOF {
+		msg = "syntax error at end of input"
+	} else {
+		text := p.cur.Str
+		if text == "" {
+			text = TokenName(p.cur.Kind)
+		}
+		msg = "syntax error at or near " + text
+	}
+	return &ParseError{
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: msg,
+	}
+}
+
+// skipToNextStatement advances the parser past the current erroneous statement
+// to the next ';' at bracket-depth 0 within the current segment, or to tokEOF.
+// Always consumes at least one token to guarantee forward progress.
+//
+// Because Parse pre-segments the input with Split, each segment usually
+// contains a single statement, so skipToNextStatement's typical behavior is to
+// advance to EOF.
+func (p *Parser) skipToNextStatement() {
+	// Always consume at least one token to avoid infinite loops.
+	if p.cur.Kind != tokEOF {
+		p.advance()
+	}
+	depth := 0
+	for p.cur.Kind != tokEOF {
+		switch p.cur.Kind {
+		case int('('), int('['), int('{'):
+			depth++
+		case int(')'), int(']'), int('}'):
+			if depth > 0 {
+				depth--
+			}
+		case int(';'):
+			if depth == 0 {
+				p.advance()
+				return
+			}
+		}
+		p.advance()
+	}
+}
+
+// unsupported emits a "<name> statement parsing is not yet supported"
+// ParseError at the current token, skips to the next statement boundary, and
+// returns (nil, err). Used by every stubbed dispatch case in the foundation.
+//
+// Later DAG nodes REPLACE individual dispatch cases with real parse functions.
+// Those functions do NOT call unsupported — they consume tokens and build real
+// ast.Node values.
+func (p *Parser) unsupported(name string) (ast.Node, error) {
+	err := &ParseError{
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: name + " statement parsing is not yet supported",
+	}
+	p.skipToNextStatement()
+	return nil, err
+}
+
+// unknownStatementError reports a statement that starts with a token the
+// dispatch switch does not recognize. Called from the default branch of
+// parseStmt. Distinct from unsupported so Diagnose can tell "valid Trino, not
+// yet implemented" apart from "not valid Trino".
+func (p *Parser) unknownStatementError() *ParseError {
+	if p.cur.Kind == tokEOF {
+		return &ParseError{
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: "syntax error at end of input",
+		}
+	}
+	text := p.cur.Str
+	if text == "" {
+		text = TokenName(p.cur.Kind)
+	}
+	return &ParseError{
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: "unknown or unsupported statement starting with " + text,
+	}
+}
+
+// parseStmt parses one top-level statement by dispatching on the leading
+// keyword(s). The arms enumerate the first-token vocabulary of Trino's
+// `statement` rule plus the query-starting tokens of `rootQuery` /
+// `queryPrimary` (SELECT, WITH, TABLE, VALUES, '('). For the foundation every
+// arm routes to the unsupported stub; later nodes replace the bodies.
+//
+// CREATE / DROP / ALTER / SET / RESET / COMMENT / DESCRIBE / SHOW are
+// second-keyword-dispatched in the grammar; the foundation keeps the dispatch
+// flat (one stub per leading keyword) because the per-object parsers do not
+// exist yet. Later nodes will introduce the inner switches (compare
+// doris/parser.go's CREATE/DROP/ALTER fan-out) as they add object parsers.
+func (p *Parser) parseStmt() (ast.Node, error) {
+	if err := p.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer p.leaveNesting()
+	switch p.cur.Kind {
+	// --- Query (rootQuery / queryPrimary leading tokens) ---
+	// SELECT / WITH / TABLE / VALUES / '(' all begin a query; parser-select's
+	// parseQueryStmt parses the whole query layer.
+	//
+	// A leading `WITH FUNCTION` is the rootQuery inline-routine prefix
+	// (parser-routines node, function_def.go), NOT a CTE. It is valid only at
+	// the statement level (and after EXPLAIN, which recurses into parseStmt) —
+	// Trino 481 REJECTS `WITH FUNCTION …` inside a subquery — so it is detected
+	// HERE and routed to parseWithFunctionQuery, while the subquery parseQuery
+	// path keeps rejecting it.
+	case kwWITH:
+		if p.peekNext().Kind == kwFUNCTION {
+			return p.parseWithFunctionQuery()
+		}
+		return p.parseQueryStmt()
+	case kwSELECT, kwTABLE, kwVALUES, int('('):
+		return p.parseQueryStmt()
+
+	// --- Session / catalog context ---
+	case kwUSE:
+		return p.parseUseStmt()
+
+	// --- DDL ---
+	case kwCREATE:
+		// CREATE ROLE belongs to the parser-dcl-tcl node (grant_revoke.go);
+		// CREATE [OR REPLACE] FUNCTION is the parser-routines node
+		// (function_def.go); every other CREATE object is a parser-ddl concern
+		// (still stubbed).
+		if p.peekNext().Kind == kwROLE {
+			createTok := p.advance() // consume CREATE
+			p.advance()              // consume ROLE
+			return p.parseCreateRoleStmt(createTok.Loc.Start)
+		}
+		// CREATE FUNCTION (peekNext == FUNCTION) is this node's. CREATE OR
+		// REPLACE FUNCTION needs three-token lookahead (past OR REPLACE) to
+		// distinguish from CREATE OR REPLACE TABLE/VIEW/MATERIALIZED VIEW
+		// (parser-ddl), which exceeds the parser's two-token window; it is
+		// detected by createOrReplaceFunctionFollows, which peeks the raw input
+		// for the keyword after OR REPLACE without consuming.
+		if p.peekNext().Kind == kwFUNCTION || (p.peekNext().Kind == kwOR && p.createOrReplaceFunctionFollows()) {
+			createTok := p.advance() // consume CREATE
+			return p.parseCreateFunctionStmt(createTok.Loc.Start)
+		}
+		// Every other CREATE object is a parser-ddl concern. The object keyword
+		// follows CREATE directly, except after the optional OR REPLACE prefix
+		// (CREATE OR REPLACE { TABLE | VIEW | MATERIALIZED VIEW }), which the
+		// per-object parsers handle. createObjectKeyword peeks past an
+		// OR REPLACE without consuming so dispatch can route on the object word.
+		switch p.createObjectKeyword() {
+		case kwTABLE:
+			return p.parseCreateTableStmt(p.cur.Loc.Start)
+		case kwSCHEMA:
+			return p.parseCreateSchemaStmt(p.cur.Loc.Start)
+		case kwVIEW:
+			return p.parseCreateViewStmt(p.cur.Loc.Start)
+		case kwMATERIALIZED:
+			return p.parseCreateMaterializedViewStmt(p.cur.Loc.Start)
+		case kwCATALOG:
+			return p.parseCreateCatalogStmt(p.cur.Loc.Start)
+		}
+		return p.unsupported("CREATE")
+	case kwDROP:
+		// DROP ROLE belongs to the parser-dcl-tcl node (grant_revoke.go);
+		// DROP FUNCTION is the parser-routines node (function_def.go); every
+		// other DROP object is a parser-ddl concern (still stubbed).
+		if p.peekNext().Kind == kwROLE {
+			dropTok := p.advance() // consume DROP
+			p.advance()            // consume ROLE
+			return p.parseDropRoleStmt(dropTok.Loc.Start)
+		}
+		if p.peekNext().Kind == kwFUNCTION {
+			dropTok := p.advance() // consume DROP
+			p.advance()            // consume FUNCTION
+			return p.parseDropFunctionStmt(dropTok.Loc.Start)
+		}
+		// DROP CATALOG has its own parser (catalog_ddl.go); every other DROP
+		// object (TABLE / SCHEMA / VIEW / MATERIALIZED VIEW) is parseDropStmt.
+		if p.peekNext().Kind == kwCATALOG {
+			return p.parseDropCatalogStmt(p.cur.Loc.Start)
+		}
+		switch p.peekNext().Kind {
+		case kwTABLE, kwSCHEMA, kwVIEW, kwMATERIALIZED:
+			return p.parseDropStmt(p.cur.Loc.Start)
+		}
+		return p.unsupported("DROP")
+	case kwALTER:
+		// ALTER fans out on the object keyword (second token).
+		switch p.peekNext().Kind {
+		case kwTABLE:
+			return p.parseAlterTableStmt(p.cur.Loc.Start)
+		case kwSCHEMA:
+			return p.parseAlterSchemaStmt(p.cur.Loc.Start)
+		case kwVIEW:
+			return p.parseAlterViewStmt(p.cur.Loc.Start)
+		case kwMATERIALIZED:
+			return p.parseAlterMaterializedViewStmt(p.cur.Loc.Start)
+		}
+		return p.unsupported("ALTER")
+	case kwCOMMENT:
+		return p.parseCommentStmt(p.cur.Loc.Start)
+	case kwANALYZE:
+		return p.parseAnalyzeStmt(p.cur.Loc.Start)
+	case kwREFRESH:
+		return p.parseRefreshMaterializedViewStmt(p.cur.Loc.Start)
+
+	// --- DML --- [parser-dml node: insert.go, update_delete.go, merge.go]
+	case kwINSERT:
+		return p.parseInsertStmt()
+	case kwDELETE:
+		return p.parseDeleteStmt()
+	case kwUPDATE:
+		return p.parseUpdateStmt()
+	case kwMERGE:
+		return p.parseMergeStmt()
+	case kwTRUNCATE:
+		return p.parseTruncateStmt()
+
+	// --- Procedures ---
+	case kwCALL:
+		return p.parseCallStmt()
+
+	// --- DCL (roles / privileges) --- [parser-dcl-tcl node: grant_revoke.go]
+	case kwGRANT:
+		return p.parseGrantStmt()
+	case kwREVOKE:
+		return p.parseRevokeStmt()
+	case kwDENY:
+		return p.parseDenyStmt()
+
+	// --- Session / path / time zone ---
+	case kwSET:
+		// SET fans out on the second keyword: SESSION (setSession /
+		// setSessionAuthorization), ROLE (setRole), PATH (setPath), TIME
+		// (setTimeZone). See session.go.
+		return p.parseSetStmt()
+	case kwRESET:
+		// RESET SESSION { AUTHORIZATION | name }. See session.go.
+		return p.parseResetStmt()
+
+	// --- Inspection ---
+	case kwSHOW:
+		// SHOW family + DESCRIBE/DESC aliases. See show.go.
+		return p.parseShowStmt()
+	case kwEXPLAIN:
+		// EXPLAIN / EXPLAIN ANALYZE. See explain_call.go.
+		return p.parseExplainStmt()
+	case kwDESCRIBE:
+		// DESCRIBE INPUT/OUTPUT <name> are prepared-statement introspection
+		// (parser-dcl-tcl: prepared.go), claimed only when INPUT/OUTPUT is
+		// followed by a statement name. INPUT/OUTPUT are NON-RESERVED, so a
+		// bare `DESCRIBE INPUT` or `DESCRIBE INPUT.col` is the SHOW COLUMNS
+		// alias `DESCRIBE qualifiedName` (INPUT/OUTPUT as the table name).
+		if (p.peekNext().Kind == kwINPUT || p.peekNext().Kind == kwOUTPUT) && p.describeIntrospectionFollows() {
+			descTok := p.advance() // consume DESCRIBE
+			kind := p.advance()    // consume INPUT / OUTPUT
+			if kind.Kind == kwINPUT {
+				return p.parseDescribeInputStmt(descTok.Loc.Start)
+			}
+			return p.parseDescribeOutputStmt(descTok.Loc.Start)
+		}
+		// DESCRIBE name == SHOW COLUMNS (parser-utility). See show.go.
+		return p.parseDescribeStmt()
+	case kwDESC:
+		// DESC name == SHOW COLUMNS; DESC has no prepared form.
+		return p.parseDescribeStmt()
+
+	// --- Transactions --- [parser-dcl-tcl node: transaction.go]
+	case kwSTART:
+		return p.parseStartTransactionStmt()
+	case kwCOMMIT:
+		return p.parseCommitStmt()
+	case kwROLLBACK:
+		return p.parseRollbackStmt()
+
+	// --- Prepared statements --- [parser-dcl-tcl node: prepared.go]
+	case kwPREPARE:
+		return p.parsePrepareStmt()
+	case kwDEALLOCATE:
+		return p.parseDeallocateStmt()
+	case kwEXECUTE:
+		return p.parseExecuteStmt()
+
+	default:
+		return nil, p.unknownStatementError()
+	}
+}
+
+// ParseResult holds the outcome of a best-effort parse. File contains every
+// statement that parsed successfully (empty while statement bodies are
+// stubbed); Errors contains every ParseError encountered, including LexErrors
+// promoted from the underlying Lexer.
+type ParseResult struct {
+	File   *ast.File
+	Errors []ParseError
+}
+
+// Parse is the strict entry point. It returns the parsed File and, when any
+// segment fails, a ParseErrors listing every error; the File holds only the
+// statements that parsed completely, so a caller that reports errors can
+// still show what parsed. A
+// segment whose statement parsed but left tokens behind is a syntax error at
+// the first leftover token and contributes no node: before this, `SELECT a
+// FROM t 1 2` returned the truncated SELECT next to its error, and a
+// consumer that read the File without the errors analyzed less than the
+// engine would execute.
+func Parse(input string) (*ast.File, error) {
+	result := parseAll(input, true)
+	if len(result.Errors) == 0 {
+		return result.File, nil
+	}
+	return result.File, ParseErrors(result.Errors)
+}
+
+// ParseBestEffort is the tolerant entry point for partial or in-progress
+// input. Unlike Parse, it keeps a statement whose prefix parsed even when
+// tokens follow it, and reports no error for them; every other error is still
+// collected. Nothing in the repository consumes this today: Diagnose, query
+// type classification, and query span extraction all read Parse. Do not add
+// the strict trailing-token check here.
+func ParseBestEffort(input string) *ParseResult {
+	return parseAll(input, false)
+}
+
+// parseAll is the shared implementation behind Parse and ParseBestEffort:
+// Split the input, parse each segment, collect nodes and errors.
+// strictTrailing selects whether parseSingle rejects unconsumed trailing
+// tokens.
+func parseAll(input string, strictTrailing bool) *ParseResult {
+	return parseSegments(input, Split(input), strictTrailing, 0)
+}
+
+// parseSegments parses segs, the statements of input, and collects their
+// nodes and errors (see parseAll). depth is the nesting depth the statements
+// start at: 0, or for a query body this parse validates on behalf of an
+// enclosing statement (see validateRawQuery), the depth there, so the
+// nesting limit counts the enclosing levels too.
+func parseSegments(input string, segs []Segment, strictTrailing bool, depth int) *ParseResult {
+	file := &ast.File{Loc: ast.Loc{Start: 0, End: len(input)}}
+	result := &ParseResult{File: file}
+
+	for _, seg := range segs {
+		node, errs := parseSingle(seg.Text, seg.ByteStart, strictTrailing, depth)
+		if strictTrailing && depth == 0 && len(errs) > 0 {
+			errs = bracketedSemicolonFirst(seg, errs)
+		}
+		if node != nil {
+			file.Stmts = append(file.Stmts, node)
+		}
+		result.Errors = append(result.Errors, errs...)
+	}
+
+	// Split drops segments that lex to nothing, and with them their lex
+	// errors: Parse("/* unterminated") produced zero segments and zero
+	// errors. Strict mode lexes the whole input once more and promotes any
+	// error the per-segment parses did not already report (matched by
+	// position; segment offsets are absolute).
+	if strictTrailing {
+		lx := NewLexer(input)
+		for lx.NextToken().Kind != tokEOF {
+		}
+		if lexErrs := lx.Errors(); len(lexErrs) > 0 {
+			// Matched through a set: scanning result.Errors once per lex
+			// error was quadratic in the number of errors.
+			reported := make(map[int]bool, len(result.Errors)+len(lexErrs))
+			for _, e := range result.Errors {
+				reported[e.Position] = true
+			}
+			for _, le := range lexErrs {
+				if reported[le.Loc.Start] {
+					continue
+				}
+				reported[le.Loc.Start] = true
+				result.Errors = append(result.Errors, ParseError{Position: le.Loc.Start, End: le.Loc.End, Message: le.Msg})
+			}
+		}
+	}
+
+	return result
+}
+
+// parseSingle parses one segment (one top-level statement) into a single
+// ast.Node. Returns (node, errors) where node may be nil if the segment failed
+// to parse and errors lists every ParseError encountered, including LexErrors
+// promoted from the underlying Lexer.
+//
+// segText is the statement text without the trailing ';' (from Segment.Text).
+// baseOffset is segText's byte offset within the original input; it is passed
+// to NewLexerWithOffset so token and error Loc values stay absolute.
+// strictTrailing selects whether a statement that parsed without consuming the
+// whole segment is rejected (node dropped) or kept as the parsed prefix.
+// depth is the nesting depth the statement starts at (see parseAll).
+func parseSingle(segText string, baseOffset int, strictTrailing bool, depth int) (ast.Node, []ParseError) {
+	p := &Parser{
+		lexer:          NewLexerWithOffset(segText, baseOffset),
+		input:          segText,
+		baseOffset:     baseOffset,
+		strictTrailing: strictTrailing,
+		depth:          depth,
+	}
+	p.advance() // prime cur with the first token
+
+	var result ast.Node
+	if p.cur.Kind != tokEOF {
+		first := p.cur
+		node, err := p.parseStmt()
+		if p.nestingErr != nil {
+			// The statement nests too deeply on some reading, even when a
+			// speculative parse fell back to another reading that got through:
+			// it fails with the first nesting error (see enterNesting).
+			node, err = nil, p.nestingErr
+		} else if err == nil && p.treeTooHigh(node, len(segText)) {
+			// Checked before anything below walks the tree.
+			node, err = nil, &ParseError{Position: first.Loc.Start, End: first.Loc.End, Message: nestingTooDeep}
+		}
+		if err != nil {
+			if pe, ok := err.(*ParseError); ok {
+				p.errors = append(p.errors, *pe)
+			} else {
+				p.errors = append(p.errors, ParseError{
+					Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+					Message: err.Error(),
+				})
+			}
+		} else if strictTrailing && p.cur.Kind != tokEOF {
+			// A statement parsed cleanly but did not consume the whole segment:
+			// the leftover tokens are a syntax error (e.g. `SELECT a a a`,
+			// `SELECT 1 garbage`). Each segment holds exactly one top-level
+			// statement (Split cut on ';'), so any trailing token is invalid here,
+			// and the segment as a whole does not parse: drop the node like every
+			// other reject path does. EOF is asserted only on the success path; a
+			// parse that already errored left cur mid-statement, and asserting EOF
+			// there would emit a spurious second diagnostic.
+			p.errors = append(p.errors, *p.syntaxErrorAtCur())
+			node = nil
+			// Drain the rest of the segment: the lexer is lazy, so a lexical
+			// error past this point (an unterminated string, say) has not been
+			// reached yet and Errors() below could not promote it.
+			for p.cur.Kind != tokEOF {
+				p.advance()
+			}
+		} else if strictTrailing {
+			// The placeholder scan captured each expression subquery's body
+			// as raw text without parsing it, so the outer statement can
+			// succeed around a body Trino rejects: `SELECT (SELECT 1 FROM t
+			// a b)`. Strict mode parses every body now and drops the
+			// statement when one fails.
+			if errs := p.validateSubqueries(); len(errs) > 0 {
+				p.errors = append(p.errors, errs...)
+				node = nil
+			}
+		}
+		result = node
+	}
+
+	// Promote any lex errors into ParseErrors. The Lexer's Errors() getter
+	// returns positions already shifted by baseOffset.
+	for _, le := range p.lexer.Errors() {
+		p.errors = append(p.errors, ParseError{Position: le.Loc.Start, End: le.Loc.End, Message: le.Msg})
+	}
+	// A lex error (an unterminated comment after a complete statement, say)
+	// surfaces only now, after the node was built. Strict mode returns no
+	// node for a segment that carries any error; best-effort keeps the prefix.
+	if strictTrailing && len(p.errors) > 0 {
+		result = nil
+	}
+
+	return result, dedupeErrors(p.errors)
+}
+
+// bracketedSemicolonFirst returns errs, the errors of a statement, with an
+// error at the statement's first ';' inside parentheses or brackets in
+// front when errs starts after it. Trino's grammar puts ';' only between
+// the statements of a routine body (SqlBase.g4 sqlStatementList), never
+// inside brackets, so that ';' is a syntax error, and Trino reports the
+// first error it reads. The parse reports the error of a query body before
+// the errors of the bodies nested in it, so without this,
+// `(SELECT (SELECT 1;) + !1)` in a routine body reported the '!', though
+// Trino reports the ';'. Only a routine definition holds such a ';': Split
+// cuts every other statement at each one.
+func bracketedSemicolonFirst(seg Segment, errs []ParseError) []ParseError {
+	if strings.IndexByte(seg.Text, ';') < 0 {
+		return errs
+	}
+	lx := NewLexerWithOffset(seg.Text, seg.ByteStart)
+	depth := 0
+	for tok := lx.NextToken(); tok.Kind != tokEOF && tok.Loc.Start < errs[0].Position; tok = lx.NextToken() {
+		switch tok.Kind {
+		case int('('), int('['), int('{'):
+			depth++
+		case int(')'), int(']'), int('}'):
+			if depth > 0 {
+				depth--
+			}
+		case int(';'):
+			if depth > 0 {
+				first := ParseError{Position: tok.Loc.Start, End: tok.Loc.End, Message: "syntax error at or near ;"}
+				return dedupeErrors(append([]ParseError{first}, errs...))
+			}
+		}
+	}
+	return errs
+}
+
+// dedupeErrors drops a later error that repeats an earlier one's position and
+// message. A raw query body validated by a nested strict parse reports its
+// lexical errors once there and once more when the outer lexer, which
+// scanned the same bytes, promotes its own; the diagnostic must appear once.
+func dedupeErrors(errs []ParseError) []ParseError {
+	if len(errs) < 2 {
+		return errs
+	}
+	type key struct {
+		pos int
+		msg string
+	}
+	seen := make(map[key]bool, len(errs))
+	out := errs[:0]
+	for _, e := range errs {
+		k := key{e.Position, e.Message}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, e)
+	}
+	return out
+}
+
+// validateSubqueries strictly parses every query body this parse captured as
+// raw text (expression subquery placeholders, SHOW STATS FOR (query)) and
+// returns the errors in the outer statement's coordinates. A body must be
+// exactly one query: Trino rejects an empty body, a comment-only body, several
+// statements, and a non-query statement in that position (checked against the
+// oracle). Nested placeholders are validated by the inner strict parse.
+func (p *Parser) validateSubqueries() []ParseError {
+	return p.validateRawQueries(p.rawQueries)
+}
+
+// validateRawQueries validates the query bodies in qs (see
+// validateSubqueries). A lexOnly entry reports the lex errors in its span,
+// leaving out the ones an earlier lexOnly entry reported: the spans of bodies
+// nested in each other nest, and reporting each error once per enclosing body
+// was quadratic. The copies left out are duplicates the caller drops anyway
+// (dedupeErrors), like the ones a parsed body reports again here.
+func (p *Parser) validateRawQueries(qs []rawQuery) []ParseError {
+	var out []ParseError
+	lexErrs := p.lexer.errors[:p.lexer.errorCount()]
+	base := p.lexer.baseOffset
+	// next[i] is the first lex error from i on that no lexOnly entry has
+	// reported yet, path-compressed.
+	var next []int
+	unreported := func(i int) int {
+		root := i
+		for root < len(next) && next[root] != root {
+			root = next[root]
+		}
+		for i < len(next) && next[i] != root {
+			next[i], i = root, next[i]
+		}
+		return root
+	}
+	reportLexErrs := func(start, end int) {
+		if next == nil {
+			next = make([]int, len(lexErrs))
+			for i := range next {
+				next[i] = i
+			}
+		}
+		from := sort.Search(len(lexErrs), func(i int) bool { return lexErrs[i].Loc.Start+base >= start })
+		for i := unreported(from); i < len(lexErrs) && lexErrs[i].Loc.Start+base < end; i = unreported(i + 1) {
+			le := lexErrs[i]
+			out = append(out, ParseError{Position: le.Loc.Start + base, End: le.Loc.End + base, Message: le.Msg})
+			next[i] = i + 1
+		}
+	}
+	var visit func(qs []rawQuery)
+	visit = func(qs []rawQuery) {
+		for _, q := range qs {
+			switch {
+			case q.lexOnly:
+				reportLexErrs(q.start, q.end)
+			case q.routine != nil:
+				// What parsing the body's text reported: the tree-height error
+				// or the errors of the bodies captured raw in it, then its lex
+				// errors; and when it reported none, that the body is no query.
+				r := q.routine
+				n := len(out)
+				if r.tooHigh {
+					out = append(out, ParseError{Position: r.first.Start, End: r.first.End, Message: nestingTooDeep})
+				} else {
+					visit(q.group)
+				}
+				reportLexErrs(q.start, q.end)
+				if len(out) == n {
+					out = append(out, ParseError{Position: q.start, End: q.start + len(q.text), Message: "subquery must contain exactly one query"})
+				}
+			case q.group != nil:
+				visit(q.group)
+			default:
+				out = append(out, p.validateRawQuery(q)...)
+			}
+		}
+	}
+	visit(qs)
+	return out
+}
+
+// validateRawQuery validates one query body captured as raw text by parsing
+// its text, and returns the errors in the outer statement's coordinates.
+//
+// The text is parsed as one statement, not split at its ';' tokens first. A
+// ';' reaches a body only in a routine definition, the one statement Split
+// keeps whole across a ';', and Trino rejects a ';' anywhere in a subquery.
+// Split, the text of `(SELECT 1; )` was the query `SELECT 1` and an empty
+// statement, which Split drops, so strict Parse accepted it. Parsed whole,
+// the ';' is a token left over after the query, reported where it is, as
+// Trino reports it.
+func (p *Parser) validateRawQuery(q rawQuery) []ParseError {
+	if strings.TrimSpace(q.text) == "" {
+		return []ParseError{{Position: q.start, End: q.start, Message: "subquery must contain exactly one query"}}
+	}
+	res := parseSegments(q.text, []Segment{{Text: q.text, ByteEnd: len(q.text)}}, true, q.depth)
+	if len(res.Errors) > 0 {
+		out := make([]ParseError, 0, len(res.Errors))
+		for _, e := range res.Errors {
+			e.Position += q.start
+			if e.End >= 0 {
+				e.End += q.start
+			}
+			out = append(out, e)
+		}
+		return out
+	}
+	if len(res.File.Stmts) != 1 {
+		return []ParseError{{Position: q.start, End: q.start + len(q.text), Message: "subquery must contain exactly one query"}}
+	}
+	if qs, ok := res.File.Stmts[0].(*QueryStmt); !ok || qs.Query == nil {
+		return []ParseError{{Position: q.start, End: q.start + len(q.text), Message: "subquery must contain exactly one query"}}
+	}
+	return nil
+}

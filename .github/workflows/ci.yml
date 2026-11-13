@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    # One job on the org's self-hosted runners. It tests what the PR touches
+    # (scripts/affected-packages.sh); every test runs here, and nothing is
+    # skipped or nightly. Tests start the servers they need as testcontainers.
+    runs-on: self-hosted
+    timeout-minutes: 30
+    env:
+      # Sweep sizes the old nightly used; they add ~20 s here, so every PR gets them.
+      PAREN_FUZZ_SIZE: '10000'
+      SPLITTEST_N: '1000000'
+      S3DIFF_N: '2000'
+      WALK_SWEEP_N: '500'
+      # Caps the live rows the §3.4 real-SQL corpora measure against TiDB. Sample
+      # 1 (885 rows) runs in full here; it bounds the larger samples still to land.
+      TIDB_CORPUS_N: '3000'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # affected-packages.sh diffs against the base branch
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false # the runner keeps GOCACHE/GOMODCACHE between runs
+
+      # Both steps regenerate committed code and fail if the result differs from
+      # what the PR holds. `git add -A` so a generated file that is new counts too.
+      - name: Walkers are in sync
+        run: |
+          go generate ./pg/ast/... ./redshift/ast/... ./mysql/ast/... ./mariadb/ast/... \
+            ./tidb/ast/... ./oceanbase/ast/... ./mssql/ast/... ./oracle/ast/... \
+            ./snowflake/ast/... ./googlesql/ast/...
+          git add -A && git diff --cached --exit-code
+
+      - name: Proto is formatted, lint-clean, generated and non-breaking
+        working-directory: proto
+        env:
+          BUF: go run github.com/bufbuild/buf/cmd/buf@v1.72.0 # the only pin
+        run: |
+          $BUF format -w
+          $BUF lint
+          $BUF generate
+          $BUF breaking --against 'https://github.com/Dxlxz/orrery-sql.git#branch=main,subdir=proto'
+          git add -A && git diff --cached --exit-code
+
+      - name: Build
+        run: go build ./...
+
+      # Fails an edited judge's answer, a regression committed as orrery's
+      # verdict, and a pin bump that also changes code (enginetest/compat.Guard).
+      - name: Engine answers change only by recording
+        run: go run ./enginetest/cmd/compatcheck origin/${{ github.base_ref }}
+
+      - name: Affected packages
+        id: affected
+        run: |
+          targets=$(scripts/affected-packages.sh origin/${{ github.base_ref }})
+          echo "$targets"
+          echo "pkgs=$(tr ' ' '\n' <<< "$targets" | grep '^\./' | xargs)" >> "$GITHUB_OUTPUT"
+          echo "modules=$(tr ' ' '\n' <<< "$targets" | grep -v '^\./' | xargs)" >> "$GITHUB_OUTPUT"
+
+      # Builds every test binary and runs none, so a test that does not compile
+      # fails the job in a minute instead of after the half-hour run.
+      - name: Compile tests
+        if: steps.affected.outputs.pkgs != ''
+        run: go test -count=1 -exec /bin/true ${{ steps.affected.outputs.pkgs }}
+
+      - name: Test
+        if: steps.affected.outputs.pkgs != ''
+        # Each package starts its own servers, and Trino (a JVM sized to the
+        # host) is the heavy one, so its packages run one at a time, beside the
+        # rest. OceanBase's packages replay recorded answers and start no
+        # server. go test's default 10m per package is too tight: oracle/review
+        # takes 7 min, and over 10 on a busy runner. 20m leaves room and still
+        # lets a hung package print its goroutine dump before the job's
+        # 30-minute cap.
+        run: |
+          pkgs=$(go list ${{ steps.affected.outputs.pkgs }})
+          heavy='/trino/'
+          lane() { { grep -E "$1" <<< "$pkgs" || true; } | xargs -r go test -p=1 -count=1 -timeout=20m; }
+          lane "$heavy" & trino=$!
+          status=0
+          { grep -vE "$heavy" <<< "$pkgs" || true; } | xargs -r go test -p=8 -count=1 -timeout=20m || status=1
+          wait "$trino" || status=1
+          exit "$status"
+
+      - name: Nested modules (own go.mod, not reached by ./...)
+        if: steps.affected.outputs.modules != ''
+        run: |
+          status=0
+          for m in ${{ steps.affected.outputs.modules }}; do
+            (cd "$m" && go test -count=1 ./...) || status=1
+          done
+          exit "$status"

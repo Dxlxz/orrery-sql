@@ -1,0 +1,76 @@
+package ast
+
+import "reflect"
+
+//go:generate go run ./cmd/genwalker
+
+// Visitor defines the interface for AST traversal.
+// Visit is called for each node during a depth-first walk.
+// If Visit returns a non-nil Visitor, Walk recurses into the node's children
+// with the returned Visitor, then calls Visit(nil) to signal post-order.
+// If Visit returns nil, children are not visited.
+type Visitor interface {
+	Visit(node Node) Visitor
+}
+
+// Walk traverses an AST in depth-first order. It calls v.Visit(node);
+// if that returns a non-nil visitor w, it walks each child node with w,
+// then calls w.Visit(nil).
+func Walk(v Visitor, node Node) {
+	if isNilNode(node) {
+		return
+	}
+	// The generated walker has no case for a List inside a List, such as each
+	// function of a RangeFunction.
+	if list, ok := node.(*List); ok {
+		walkList(v, list)
+		return
+	}
+	w := v.Visit(node)
+	if w == nil {
+		return
+	}
+	walkChildren(w, node)
+	w.Visit(nil)
+}
+
+// isNilNode reports whether node is nil or an interface holding a typed nil
+// pointer, such as a (*TypeName)(nil) stored in a List item. The generated
+// walker dereferences the node's fields, so walking a typed nil would panic.
+func isNilNode(node Node) bool {
+	if node == nil {
+		return true
+	}
+	v := reflect.ValueOf(node)
+	return v.Kind() == reflect.Pointer && v.IsNil()
+}
+
+// Inspect traverses an AST in depth-first order, calling f for each node.
+// If f returns true, Inspect recurses into the node's children.
+func Inspect(node Node, f func(Node) bool) {
+	Walk(inspector(f), node)
+}
+
+type inspector func(Node) bool
+
+func (f inspector) Visit(node Node) Visitor {
+	if node != nil && f(node) {
+		return f
+	}
+	return nil
+}
+
+// walkList visits a List node and then walks each of its items.
+func walkList(v Visitor, list *List) {
+	if list == nil {
+		return
+	}
+	w := v.Visit(list)
+	if w == nil {
+		return
+	}
+	for _, item := range list.Items {
+		Walk(w, item)
+	}
+	w.Visit(nil)
+}

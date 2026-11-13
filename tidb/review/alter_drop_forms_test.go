@@ -1,0 +1,35 @@
+package review
+
+import (
+	"testing"
+
+	"github.com/Dxlxz/orrery-sql/review"
+)
+
+// TestAlterDropForms checks the review of the ALTER TABLE ... DROP forms
+// whose parse follows TiDB's AlterTableSpec: a column drop with RESTRICT or
+// CASCADE, with or without IF EXISTS, is a column drop over its whole
+// subcommand, and DROP PRIMARY or DROP FOREIGN without KEY is a syntax error
+// rather than a drop.
+func TestAlterDropForms(t *testing.T) {
+	runCases(t, review.DisallowDropObject, []ruleCase{{
+		name: "a column drop with RESTRICT or CASCADE",
+		sql:  "ALTER TABLE t DROP COLUMN n RESTRICT, DROP IF EXISTS code CASCADE;",
+		want: []finding{
+			{0, "DROP COLUMN n RESTRICT", "Drops column `n` of `t`.", []int{0}},
+			{0, "DROP IF EXISTS code CASCADE", "Drops column `code` of `t`.", []int{0}},
+		},
+	}})
+	runCases(t, review.Syntax, []ruleCase{
+		{
+			name: "DROP PRIMARY without KEY",
+			sql:  "ALTER TABLE t DROP PRIMARY, DROP FOREIGN KEY fk_p;",
+			want: []finding{{0, "", "unexpected token", []int{0}}},
+		},
+		{
+			name: "DROP FOREIGN without KEY",
+			sql:  "ALTER TABLE t DROP FOREIGN fk_p;",
+			want: []finding{{0, "", "unexpected token", []int{0}}},
+		},
+	})
+}

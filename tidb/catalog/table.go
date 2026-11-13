@@ -1,0 +1,294 @@
+package catalog
+
+type Table struct {
+	Name          string
+	Database      *Database
+	Columns       []*Column
+	colByName     map[string]int // lowered name -> index
+	Indexes       []*Index
+	Constraints   []*Constraint
+	Engine        string
+	Charset       string
+	Collation     string
+	Comment       string
+	AutoIncrement int64
+	Temporary     bool
+	RowFormat     string
+	KeyBlockSize  int
+	// Compression is the table's COMPRESSION option value (e.g. "ZLIB", "LZ4",
+	// "NONE"), empty when unset. TiDB keeps it in SHOW CREATE TABLE, unlike
+	// ROW_FORMAT or KEY_BLOCK_SIZE, which it reads and drops.
+	Compression  string
+	Partitioning *PartitionInfo
+
+	// GlobalTemporary marks a table CREATE GLOBAL TEMPORARY TABLE made, and
+	// OnCommit the ON COMMIT clause it carries ("DELETE ROWS" or "PRESERVE
+	// ROWS"). TiDB's SHOW CREATE TABLE writes both back, so an ordinary
+	// temporary table and a global one do not report the same.
+	//
+	// Temporary is false for it: only its rows are per-session, and the table
+	// is in the ordinary namespace (see ast.CreateTableStmt.Global).
+	GlobalTemporary bool
+	OnCommit        string
+
+	// droppedByCleanup tracks indexes auto-removed by DROP COLUMN cleanup
+	// during multi-command ALTER TABLE. This allows a subsequent explicit
+	// DROP INDEX in the same ALTER to succeed (matching MySQL 8.0 behavior).
+	droppedByCleanup map[string]bool
+
+	// maxForeignKeyID is the largest number a foreign key of the table has
+	// taken, which names the next unnamed one fk_<N+1> (see maxForeignKeyID).
+	maxForeignKeyID int
+
+	// TiDB-specific table metadata.
+	ShardRowIDBits        int
+	PreSplitRegions       int
+	AutoIDCache           int64
+	AutoRandomBase        int64
+	PlacementPolicy       string
+	TTLColumn             string // column referenced in TTL expression (e.g., "created_at")
+	TTLInterval           string // interval portion (e.g., "INTERVAL 1 YEAR")
+	TTLEnable             bool
+	TTLJobInterval        string   // e.g., "1h"
+	TiFlashReplica        int      // number of TiFlash replicas (0 = none)
+	TiFlashLocationLabels []string // optional label list for replica placement
+}
+
+// PartitionInfo holds partition metadata for a table.
+type PartitionInfo struct {
+	Type        string   // RANGE, LIST, HASH, KEY
+	Linear      bool     // LINEAR HASH or LINEAR KEY
+	Expr        string   // partition expression (for RANGE/LIST/HASH)
+	Columns     []string // partition columns (for RANGE COLUMNS/LIST COLUMNS/KEY)
+	Algorithm   int      // ALGORITHM={1|2} for KEY partitioning
+	NumParts    int      // PARTITIONS num
+	Partitions  []*PartitionDefInfo
+	SubType     string   // subpartition type (HASH or KEY, "" if none)
+	SubLinear   bool     // LINEAR for subpartition
+	SubExpr     string   // subpartition expression
+	SubColumns  []string // subpartition columns
+	SubAlgo     int      // subpartition ALGORITHM
+	NumSubParts int      // SUBPARTITIONS num
+	// IntervalText is an INTERVAL clause the catalog could not expand into Partitions, as DDL
+	// (partition_interval.go). It is empty otherwise.
+	IntervalText string
+	// keyColumns are the columns the partitioning function reads, which every unique
+	// key must include (partition_key_coverage.go). Empty when the catalog cannot tell
+	// them, which skips the check.
+	keyColumns []string
+}
+
+// PartitionDefInfo holds a single partition definition.
+type PartitionDefInfo struct {
+	Name          string
+	ValueExpr     string // "LESS THAN (...)" or "IN (...)" or ""
+	Engine        string // ENGINE option for this partition
+	Comment       string // COMMENT option for this partition
+	SubPartitions []*SubPartitionDefInfo
+}
+
+// SubPartitionDefInfo holds a single subpartition definition.
+type SubPartitionDefInfo struct {
+	Name    string
+	Engine  string
+	Comment string
+}
+
+type Column struct {
+	Position          int
+	Name              string
+	DataType          string // normalized (int, varchar, etc.)
+	ColumnType        string // full type string (varchar(100), int unsigned)
+	Nullable          bool
+	Default           *string
+	DefaultDropped    bool // true when ALTER COLUMN DROP DEFAULT was used
+	AutoIncrement     bool
+	Charset           string
+	Collation         string
+	Comment           string
+	OnUpdate          string
+	Generated         *GeneratedColumnInfo
+	Invisible         bool
+	SRID              int          // Spatial Reference ID (0 = not set)
+	DefaultAnalyzed   AnalyzedExpr // Phase 3: analyzed DEFAULT expression
+	GeneratedAnalyzed AnalyzedExpr // Phase 3: analyzed GENERATED ALWAYS AS expression
+
+	// TiDB-specific column metadata.
+	AutoRandom          bool
+	AutoRandomShardBits int
+	AutoRandomRangeBits int
+}
+
+type GeneratedColumnInfo struct {
+	Expr   string
+	Stored bool
+}
+
+type View struct {
+	Name            string
+	Database        *Database
+	Definition      string
+	Algorithm       string
+	Definer         string
+	SqlSecurity     string
+	CheckOption     string
+	Columns         []string // All column names (explicit or derived from SELECT)
+	ExplicitColumns bool     // true if the user specified a column list in CREATE VIEW
+	AnalyzedQuery   *Query   // analyzed view body (populated on CREATE VIEW); nil if analysis failed
+	// ColumnMetadata holds one entry per column, in Columns order, with the
+	// charset and collation TiDB derives for it: what SELECT CHARSET(c),
+	// COLLATION(c) answers over the view (information_schema.COLUMNS has
+	// NULL for both). Both are empty for a column that is not a string or
+	// whose derivation the catalog does not model (see view_collation.go).
+	ColumnMetadata []ViewColumn
+}
+
+// ViewColumn is what the catalog derives for one column of a view.
+type ViewColumn struct {
+	Name      string
+	Charset   string
+	Collation string
+}
+
+// Routine represents a stored function or procedure in the catalog.
+type Routine struct {
+	Name            string
+	Database        *Database
+	IsProcedure     bool
+	Definer         string
+	Params          []*RoutineParam
+	Returns         string // return type string for functions (empty for procedures)
+	Body            string
+	Characteristics map[string]string // name -> value (DETERMINISTIC, COMMENT, etc.)
+}
+
+// RoutineParam represents a parameter of a stored routine.
+type RoutineParam struct {
+	Direction string // IN, OUT, INOUT (empty for functions)
+	Name      string
+	TypeName  string // full type string
+}
+
+// Trigger represents a trigger in the catalog.
+type Trigger struct {
+	Name     string
+	Database *Database
+	Table    string // table name the trigger is on
+	Timing   string // BEFORE, AFTER
+	Event    string // INSERT, UPDATE, DELETE
+	Definer  string
+	Body     string
+	Order    *TriggerOrderInfo
+}
+
+// TriggerOrderInfo represents FOLLOWS/PRECEDES ordering.
+type TriggerOrderInfo struct {
+	Follows     bool
+	TriggerName string
+}
+
+// Event represents a scheduled event in the catalog.
+type Event struct {
+	Name         string
+	Database     *Database
+	Definer      string
+	Schedule     string // raw schedule text (e.g. "EVERY 1 HOUR", "AT '2024-01-01 00:00:00'")
+	OnCompletion string // PRESERVE, NOT PRESERVE, or "" (default NOT PRESERVE)
+	Enable       string // ENABLE, DISABLE, DISABLE ON SLAVE, or "" (default ENABLE)
+	Comment      string
+	Body         string
+}
+
+// cloneTable returns a deep copy of the table's mutable state.
+// The returned Table shares the same Name, Database pointer, and scalar fields,
+// but has independent slices and maps so that mutations do not affect the original.
+func cloneTable(src *Table) Table {
+	dst := *src // shallow copy of all scalar fields
+
+	// Deep-copy slice-valued scalar fields so the shallow-copy header
+	// shares no backing array with src. Pattern-matched to the
+	// Constraint/Column handling below — future append-through-pointer
+	// mutations on one side can't leak into the other during rollback.
+	dst.TiFlashLocationLabels = append([]string(nil), src.TiFlashLocationLabels...)
+
+	// Deep copy columns.
+	dst.Columns = make([]*Column, len(src.Columns))
+	for i, sc := range src.Columns {
+		col := *sc
+		if sc.Default != nil {
+			def := *sc.Default
+			col.Default = &def
+		}
+		if sc.Generated != nil {
+			gen := *sc.Generated
+			col.Generated = &gen
+		}
+		dst.Columns[i] = &col
+	}
+
+	// Deep copy colByName.
+	dst.colByName = make(map[string]int, len(src.colByName))
+	for k, v := range src.colByName {
+		dst.colByName[k] = v
+	}
+
+	// Deep copy indexes.
+	dst.Indexes = make([]*Index, len(src.Indexes))
+	for i, si := range src.Indexes {
+		idx := *si
+		idx.Table = src // keep pointing to the original table pointer
+		cols := make([]*IndexColumn, len(si.Columns))
+		for j, sc := range si.Columns {
+			ic := *sc
+			cols[j] = &ic
+		}
+		idx.Columns = cols
+		dst.Indexes[i] = &idx
+	}
+
+	// Deep copy constraints.
+	dst.Constraints = make([]*Constraint, len(src.Constraints))
+	for i, sc := range src.Constraints {
+		con := *sc
+		con.Table = src
+		con.Columns = append([]string{}, sc.Columns...)
+		con.RefColumns = append([]string{}, sc.RefColumns...)
+		// TiDB: deep-copy Clustered *bool so a future write-through-pointer
+		// mutation on one copy cannot leak into the other. Pattern-matched
+		// to the Column.Default / Column.Generated handling above.
+		if sc.Clustered != nil {
+			v := *sc.Clustered
+			con.Clustered = &v
+		}
+		dst.Constraints[i] = &con
+	}
+
+	// Deep copy partitioning.
+	if src.Partitioning != nil {
+		pi := *src.Partitioning
+		pi.Columns = append([]string{}, src.Partitioning.Columns...)
+		pi.SubColumns = append([]string{}, src.Partitioning.SubColumns...)
+		pi.keyColumns = append([]string(nil), src.Partitioning.keyColumns...)
+		pi.Partitions = make([]*PartitionDefInfo, len(src.Partitioning.Partitions))
+		for i, sp := range src.Partitioning.Partitions {
+			pd := *sp
+			pd.SubPartitions = make([]*SubPartitionDefInfo, len(sp.SubPartitions))
+			for j, ss := range sp.SubPartitions {
+				sd := *ss
+				pd.SubPartitions[j] = &sd
+			}
+			pi.Partitions[i] = &pd
+		}
+		dst.Partitioning = &pi
+	}
+
+	return dst
+}
+
+func (t *Table) GetColumn(name string) *Column {
+	idx, ok := t.colByName[toLower(name)]
+	if !ok {
+		return nil
+	}
+	return t.Columns[idx]
+}

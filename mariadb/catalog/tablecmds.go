@@ -1,0 +1,3577 @@
+package catalog
+
+import (
+	"fmt"
+	"math"
+	"strings"
+
+	nodes "github.com/Dxlxz/orrery-sql/mariadb/ast"
+	"github.com/Dxlxz/orrery-sql/mariadb/deparse"
+)
+
+func (c *Catalog) createTable(stmt *nodes.CreateTableStmt) error {
+	// Resolve database.
+	dbName := ""
+	if stmt.Table != nil {
+		dbName = stmt.Table.Schema
+	}
+	db, err := c.resolveDatabase(dbName)
+	if err != nil {
+		return err
+	}
+
+	tableName := stmt.Table.Name
+	key := toLower(tableName)
+
+	// A LIKE source that names the target itself is rejected as a repeated
+	// table (1066) before anything is looked up: CREATE [OR REPLACE] TABLE
+	// t LIKE t fails whether t exists or not, IF NOT EXISTS included.
+	// Verified on mariadb:11.8.8.
+	if stmt.Like != nil && c.refNamesTable(stmt.Like, db.Name, key) {
+		return errNonUniqTable(stmt.Like.Name)
+	}
+
+	// replaced is the table CREATE OR REPLACE drops; srcTbl is the source
+	// of CREATE TABLE ... LIKE.
+	var replaced, srcTbl *Table
+	if stmt.OrReplace {
+		replaced, srcTbl, err = c.checkCreateOrReplace(db, tableName, key, stmt)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Check for duplicate table or view with the same name.
+		if db.Tables[key] != nil {
+			if stmt.IfNotExists {
+				return nil
+			}
+			return errDupTable(tableName)
+		}
+		if db.Views[key] != nil {
+			return errDupTable(tableName)
+		}
+		if stmt.Like != nil {
+			if srcTbl, err = c.likeSource(stmt.Like); err != nil {
+				return err
+			}
+		}
+	}
+
+	// CREATE TABLE ... LIKE
+	if stmt.Like != nil {
+		c.dropReplacedTable(db, replaced)
+		return c.createTableLike(db, tableName, key, srcTbl, stmt)
+	}
+
+	// CREATE TABLE ... AS SELECT (CTAS) is not modeled: the catalog cannot
+	// derive the columns of the SELECT, so it creates no table. OR REPLACE
+	// still drops the table it replaces, so the catalog holds no table of
+	// the name after either form, rather than a definition MariaDB no
+	// longer has.
+	if stmt.Select != nil && len(stmt.Columns) == 0 {
+		c.dropReplacedTable(db, replaced)
+		return nil
+	}
+
+	tbl := &Table{
+		Name:        tableName,
+		Database:    db,
+		Columns:     make([]*Column, 0, len(stmt.Columns)),
+		colByName:   make(map[string]int),
+		Indexes:     make([]*Index, 0),
+		Constraints: make([]*Constraint, 0),
+		Charset:     db.Charset,
+		Collation:   db.Collation,
+		Engine:      "",
+		Temporary:   stmt.Temporary,
+	}
+
+	// Apply table options.
+	tblCharsetExplicit := false
+	tblCollationExplicit := false
+	tableOptionVersioned := false
+	sawExplicitColumnWith := false // an explicit column-level WITH appeared (even if a later WITHOUT overrode it)
+	for _, opt := range stmt.Options {
+		switch toLower(opt.Name) {
+		case "system versioning":
+			tbl.SystemVersioned = true
+			tableOptionVersioned = true
+		case "engine":
+			tbl.Engine = opt.Value
+		case "charset", "character set", "default charset", "default character set":
+			tbl.Charset = normalizeCharsetName(opt.Value)
+			tblCharsetExplicit = true
+		case "collate", "default collate":
+			tbl.Collation = opt.Value
+			tblCollationExplicit = true
+		case "comment":
+			tbl.Comment = opt.Value
+		case "auto_increment":
+			fmt.Sscanf(opt.Value, "%d", &tbl.AutoIncrement)
+		case "row_format":
+			tbl.RowFormat = opt.Value
+		case "key_block_size":
+			fmt.Sscanf(opt.Value, "%d", &tbl.KeyBlockSize)
+		case "compression":
+			tbl.Compression = opt.Value
+		case "encryption":
+			tbl.Encryption = opt.Value
+		case "stats_persistent":
+			tbl.StatsPersistent = opt.Value
+		case "stats_auto_recalc":
+			tbl.StatsAutoRecalc = opt.Value
+		case "stats_sample_pages":
+			tbl.StatsSamplePages = opt.Value
+		case "min_rows":
+			tbl.MinRows = opt.Value
+		case "max_rows":
+			tbl.MaxRows = opt.Value
+		case "avg_row_length":
+			tbl.AvgRowLength = opt.Value
+		case "tablespace":
+			tbl.Tablespace = opt.Value
+		case "pack_keys":
+			tbl.PackKeys = opt.Value
+		case "checksum", "table_checksum":
+			tbl.Checksum = normalizedChecksum(opt.Value)
+		case "delay_key_write":
+			tbl.DelayKeyWrite = opt.Value
+		}
+	}
+	// When charset is specified without explicit collation, derive the default collation.
+	if tblCharsetExplicit && !tblCollationExplicit {
+		if dc, ok := defaultCollationForCharset[toLower(tbl.Charset)]; ok {
+			tbl.Collation = dc
+		}
+	}
+	// When collation is specified without explicit charset, derive the charset from collation.
+	if tblCollationExplicit && !tblCharsetExplicit {
+		if cs := charsetForCollation(tbl.Collation); cs != "" {
+			tbl.Charset = normalizeCharsetName(cs)
+		}
+	}
+	if tblCharsetExplicit && tblCollationExplicit && !charsetMatchesCollation(tbl.Charset, tbl.Collation) {
+		return &Error{Code: 1253, SQLState: "42000", Message: "COLLATION is not valid for CHARACTER SET"}
+	}
+	if replaced != nil {
+		// What validateColumnDefSemantics checks and MariaDB also rejects (a
+		// precision out of range, M < D, NOT NULL DEFAULT NULL, ON UPDATE on
+		// a non-temporal column) MariaDB rejects while parsing, and the old
+		// table survives. What fails once the definition is put together (no
+		// column, a duplicate column or key, a second primary key, a foreign
+		// key) fails after the old table is dropped, and so it does here.
+		// MariaDB also rejects a malformed literal default ('not-a-date',
+		// 1067) after the drop; the catalog does not check those.
+		for _, colDef := range stmt.Columns {
+			if err := validateColumnDefSemantics(colDef, tableLevelIndexedColumns(stmt)); err != nil {
+				return err
+			}
+		}
+		c.dropReplacedTable(db, replaced)
+	}
+	// A definition without columns, CREATE TABLE r or one of only keys or
+	// checks, is 1113 in MariaDB, after OR REPLACE has dropped the old table.
+	if len(stmt.Columns) == 0 {
+		return errTableMustHaveColumns()
+	}
+	// Track whether we have a primary key (to detect multiple PKs).
+	hasPK := false
+	autoIncrementColumn := ""
+
+	// Defer FK backing index creation until after all explicit indexes are added,
+	// so that explicit indexes can satisfy FK requirements without creating duplicates.
+	type pendingFK struct {
+		conName  string
+		cols     []string
+		idxCols  []*IndexColumn
+		position int // the place among the table's indexes its clause had
+	}
+	var pendingFKs []pendingFK
+
+	// unnamedFKCount counts FKs that received an auto-generated name in this
+	// CREATE TABLE statement. Matches MySQL 8.0's generate_fk_name() counter,
+	// which is initialized to 0 for CREATE TABLE and incremented per unnamed FK,
+	// IGNORING user-named FKs. See sql/sql_table.cc:9252 (create_table_impl
+	// is called with fk_max_generated_name_number = 0) and sql/sql_table.cc:5912
+	// (generate_fk_name uses ++counter).
+	//
+	// Example: CREATE TABLE t (a INT, CONSTRAINT t_ibfk_5 FK, b INT, FK)
+	//   → first unnamed FK gets t_ibfk_1 (not t_ibfk_2 or t_ibfk_6).
+	// This differs from ALTER TABLE ADD FK, where the counter starts at
+	// max(existing) — see altercmds.go.
+	var unnamedFKCount int
+
+	// The names this statement's table-level CHECK constraints give
+	// explicitly, which allocCheckName reserves while it fills in the rest.
+	// MariaDB names an unnamed one CONSTRAINT_<n> and a column's CHECK after
+	// the column. Measured on mariadb:11.8.8 through
+	// information_schema.CHECK_CONSTRAINTS:
+	//
+	//	CREATE TABLE ck1 (a INT CHECK (a > 0), b INT CHECK (b > 0),
+	//	  CHECK (a < b), CONSTRAINT named CHECK (a <> 5), CHECK (b < 100))
+	//
+	// holds checks `a`, `b`, CONSTRAINT_1, named and CONSTRAINT_2. MySQL 8.0
+	// names every one <table>_chk_<n>.
+	checkNames := &checkNamer{reserved: declaredCheckNames(stmt.Constraints)}
+
+	// PERIOD FOR SYSTEM_TIME columns. Whether this makes a valid system-versioned
+	// table is validated after columns are processed (it requires an explicit
+	// WITH SYSTEM VERSIONING).
+	tbl.PeriodStartCol = stmt.PeriodStartCol
+	tbl.PeriodEndCol = stmt.PeriodEndCol
+	tbl.AppPeriodName = stmt.AppPeriodName
+	tbl.AppPeriodStartCol = stmt.AppPeriodStartCol
+	tbl.AppPeriodEndCol = stmt.AppPeriodEndCol
+
+	// Process columns. The table-level keys are read first, so a generated
+	// column can be checked against the indexes that will cover it.
+	indexedCols := tableLevelIndexedColumns(stmt)
+	for i, colDef := range stmt.Columns {
+		if err := validateColumnDefSemantics(colDef, indexedCols); err != nil {
+			return err
+		}
+		colKey := toLower(colDef.Name)
+		if _, exists := tbl.colByName[colKey]; exists {
+			return errDupColumn(colDef.Name)
+		}
+
+		col := &Column{
+			Position: i + 1,
+			Name:     colDef.Name,
+			Nullable: true, // default nullable
+		}
+
+		// Type info.
+		isSerial := false
+		if colDef.TypeName != nil {
+			typeName := normalizedColumnDataType(colDef.TypeName)
+			// Handle SERIAL: expands to BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE
+			if strings.EqualFold(colDef.TypeName.Name, "serial") {
+				isSerial = true
+				col.DataType = "bigint"
+				col.ColumnType = "bigint(20) unsigned"
+				col.AutoIncrement = true
+				col.Nullable = false
+			} else if typeName == "json" {
+				applyJSONColumn(col)
+			} else if typeName == "boolean" || typeName == "bool" {
+				col.DataType = "tinyint"
+				col.ColumnType = formatColumnType(colDef.TypeName)
+			} else {
+				col.DataType = typeName
+				col.ColumnType = formatColumnType(colDef.TypeName)
+			}
+			if isNationalStringType(colDef.TypeName.Name) {
+				col.Charset = "utf8mb3"
+			}
+			if colDef.TypeName.Charset != "" {
+				col.Charset = normalizeCharsetName(colDef.TypeName.Charset)
+			}
+			if colDef.TypeName.Collate != "" {
+				col.Collation = colDef.TypeName.Collate
+				if col.Charset == "" {
+					col.Charset = normalizeCharsetName(charsetForCollation(col.Collation))
+				}
+			}
+
+			// MySQL converts string types with CHARACTER SET binary to binary types.
+			// ENUM and SET are not converted — they keep CHARACTER SET binary annotation.
+			if strings.EqualFold(col.Charset, "binary") && isStringType(col.DataType) && !isEnumSetType(col.DataType) {
+				col = convertToBinaryType(col, colDef.TypeName)
+			}
+		}
+
+		// Default charset/collation for string types.
+		if isStringType(col.DataType) {
+			if col.Charset == "" {
+				col.Charset = tbl.Charset
+			}
+			if col.Collation == "" {
+				// If column charset differs from table charset, use the default
+				// collation for the column's charset, not the table's collation.
+				if !strings.EqualFold(col.Charset, tbl.Charset) {
+					if dc, ok := defaultCollationForCharset[toLower(col.Charset)]; ok {
+						col.Collation = dc
+					}
+				} else {
+					col.Collation = tbl.Collation
+				}
+			}
+			applyBinaryModifierCollation(col, colDef.TypeName)
+		}
+
+		// Top-level column properties.
+		if colDef.TypeName != nil && colDef.TypeName.SRID != 0 {
+			col.SRID = colDef.TypeName.SRID
+		}
+		if colDef.AutoIncrement {
+			col.AutoIncrement = true
+			col.Nullable = false
+		}
+		if colDef.Comment != "" {
+			col.Comment = colDef.Comment
+		}
+		if colDef.DefaultValue != nil {
+			setColumnDefaultFromExpr(col, colDef.DefaultValue)
+		}
+		if colDef.OnUpdate != nil {
+			setColumnOnUpdateFromExpr(col, colDef.OnUpdate)
+		}
+		if colDef.Generated != nil {
+			col.Generated = &GeneratedColumnInfo{
+				Expr:             nodeToSQLGenerated(colDef.Generated.Expr, tbl.Charset),
+				Stored:           colDef.Generated.Stored,
+				RowBound:         rowBoundSQL(colDef.Generated.RowBound),
+				Nondeterministic: nondeterministicFuncIn(colDef.Generated.Expr),
+				Refs:             generatedColumnRefs(colDef.Generated.Expr),
+			}
+		}
+		col.SystemVersioning = colVersioningSQL(colDef.SystemVersioning)
+		if col.SystemVersioning == "WITH" || colDef.SystemVersioningWithSeen {
+			// A column-level WITH marks the table system-versioned AND excludes the
+			// unmarked columns, even if a later WITHOUT on the same column reset its
+			// own attribute to WITHOUT — which then leaves it excluded, so a lone
+			// such column yields no versioned column (4123 in validateSystemVersioning).
+			tbl.SystemVersioned = true
+			sawExplicitColumnWith = true
+		}
+		if col.AutoIncrement {
+			if autoIncrementColumn != "" {
+				return errIncorrectAutoIncrementDefinition()
+			}
+			autoIncrementColumn = colDef.Name
+		}
+
+		// Process column-level constraints.
+		for _, cc := range colDef.Constraints {
+			switch cc.Type {
+			case nodes.ColConstrNotNull:
+				col.Nullable = false
+			case nodes.ColConstrNull:
+				col.Nullable = true
+			case nodes.ColConstrDefault:
+				if cc.Expr != nil {
+					setColumnDefaultFromExpr(col, cc.Expr)
+				}
+			case nodes.ColConstrPrimaryKey:
+				if hasPK {
+					return errMultiplePriKey()
+				}
+				hasPK = true
+				col.Nullable = false
+				// Add PK index and constraint after all columns are processed.
+				// We'll defer this—record it for now.
+			case nodes.ColConstrUnique:
+				// Handled after columns are added.
+			case nodes.ColConstrAutoIncrement:
+				col.AutoIncrement = true
+				col.Nullable = false
+			case nodes.ColConstrCheck:
+				// Add check constraint. An unnamed one on a column takes the
+				// column's name, which is also how SHOW CREATE TABLE knows to
+				// write it on the column.
+				conName := cc.Name
+				if conName == "" {
+					conName = colDef.Name
+				}
+				// No duplicate-name test here: a check declared on a column
+				// takes no name of its own, so it collides with none.
+				// Measured on mariadb:11.8.8,
+				// `CREATE TABLE t (a INT, b INT CHECK (b > 0),
+				// CONSTRAINT b CHECK (a > 0))` is accepted in either order and
+				// the table holds both. See checkConstraintNameExists.
+				if err := validateColumnCheckReferences(colDef.Name, conName, cc.Expr); err != nil {
+					return err
+				}
+				tbl.Constraints = append(tbl.Constraints, &Constraint{
+					Name:        conName,
+					Type:        ConCheck,
+					Table:       tbl,
+					Column:      colDef.Name,
+					CheckExpr:   nodeToSQL(cc.Expr),
+					NotEnforced: cc.NotEnforced,
+				})
+			case nodes.ColConstrReferences:
+				// MariaDB makes a real foreign key of a column-level
+				// REFERENCES, named like any other unnamed one. MySQL parses
+				// and ignores it for non-NDB tables. Measured on
+				// mariadb:11.8.8: `CREATE TABLE t2 (pid INT REFERENCES p(id))`
+				// reports CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`pid`)
+				// REFERENCES `p` (`id`).
+				conName := cc.Name
+				if conName == "" {
+					unnamedFKCount++
+					conName = fmt.Sprintf("%s_ibfk_%d", tableName, unnamedFKCount)
+				}
+				if foreignKeyConstraintNameExists(db, tbl, conName) {
+					return errFKDupName(conName)
+				}
+				refDB, refTable := "", ""
+				if cc.RefTable != nil {
+					refDB = cc.RefTable.Schema
+					refTable = cc.RefTable.Name
+				}
+				fkCols := []string{colDef.Name}
+				tbl.Constraints = append(tbl.Constraints, &Constraint{
+					Name:        conName,
+					Type:        ConForeignKey,
+					Table:       tbl,
+					Columns:     fkCols,
+					RefDatabase: refDB,
+					RefTable:    refTable,
+					RefColumns:  cc.RefColumns,
+					OnDelete:    refActionToString(cc.OnDelete),
+					OnUpdate:    refActionToString(cc.OnUpdate),
+				})
+				// The backing index is named after the constraint only where
+				// the statement named one; the symbol generated for an
+				// unnamed reference is not a name the index takes. Measured
+				// on mariadb:11.8.8: `a INT REFERENCES p(id)` makes
+				// KEY `a` (`a`) beside CONSTRAINT `t_ibfk_1`, where
+				// `a INT CONSTRAINT fk1 REFERENCES p(id)` makes KEY `fk1`.
+				// Passing the generated symbol made a second index of that
+				// name where the statement had one of its own, which
+				// SHOW CREATE TABLE then could not replay.
+				pendingFKs = append(pendingFKs, pendingFK{
+					conName:  cc.Name,
+					cols:     fkCols,
+					idxCols:  []*IndexColumn{{Name: colDef.Name}},
+					position: len(tbl.Indexes),
+				})
+			case nodes.ColConstrInvisible:
+				col.Invisible = true
+			case nodes.ColConstrCollate:
+				// Collation specified via constraint.
+				if cc.Expr != nil {
+					if s, ok := cc.Expr.(*nodes.StringLit); ok {
+						col.Collation = s.Value
+					}
+				}
+			}
+		}
+
+		// SERIAL implies UNIQUE KEY — add after the column is fully configured.
+		if isSerial {
+			idxName := allocIndexName(tbl, colDef.Name)
+			tbl.Indexes = append(tbl.Indexes, &Index{
+				Name:      idxName,
+				Table:     tbl,
+				Columns:   []*IndexColumn{{Name: colDef.Name}},
+				Unique:    true,
+				IndexType: "",
+				Visible:   true,
+			})
+			tbl.Constraints = append(tbl.Constraints, &Constraint{
+				Name:      idxName,
+				Type:      ConUniqueKey,
+				Table:     tbl,
+				Columns:   []string{colDef.Name},
+				IndexName: idxName,
+			})
+		}
+
+		tbl.Columns = append(tbl.Columns, col)
+		tbl.colByName[colKey] = i
+	}
+
+	if !tbl.SystemVersioned {
+		// A column-level WITHOUT SYSTEM VERSIONING is a no-op on a non-versioned
+		// table — MariaDB discards it (SHOW CREATE omits it).
+		hasWithout := false
+		for _, col := range tbl.Columns {
+			if col.SystemVersioning == "WITHOUT" {
+				hasWithout = true
+			}
+			col.SystemVersioning = ""
+		}
+		// A WITHOUT column makes MariaDB normalize the rest of the (otherwise
+		// invalid) versioning metadata away: ROW START/END columns become ordinary
+		// NOT NULL columns and the PERIOD is dropped. Without such a column,
+		// row/period metadata on a non-versioned table is an error (4125).
+		if hasWithout {
+			// Duplicate ROW START/END is still rejected before normalizing away.
+			if err := checkDuplicateRowColumns(tbl); err != nil {
+				return err
+			}
+			for _, col := range tbl.Columns {
+				if col.Generated != nil && col.Generated.RowBound != "" {
+					col.Generated = nil
+					col.Nullable = false
+				}
+			}
+			tbl.PeriodStartCol = ""
+			tbl.PeriodEndCol = ""
+		}
+	} else if !tableOptionVersioned && sawExplicitColumnWith {
+		// When versioning comes from an explicit column-level WITH (no table-level
+		// WITH SYSTEM VERSIONING), the unmarked data columns are excluded —
+		// MariaDB renders them WITHOUT. A table-level option leaves them unmarked.
+		for _, col := range tbl.Columns {
+			isRowCol := col.Generated != nil && col.Generated.RowBound != ""
+			if col.SystemVersioning == "" && !isRowCol {
+				col.SystemVersioning = "WITHOUT"
+			}
+		}
+	}
+	if err := validateApplicationTimePeriod(tbl, stmt); err != nil {
+		return err
+	}
+	// Application-time period columns are implicitly NOT NULL.
+	if tbl.AppPeriodName != "" {
+		for _, col := range tbl.Columns {
+			if strings.EqualFold(col.Name, tbl.AppPeriodStartCol) ||
+				strings.EqualFold(col.Name, tbl.AppPeriodEndCol) {
+				normalizeAppPeriodColumn(col)
+			}
+		}
+	}
+
+	if err := validateSystemVersioning(tbl); err != nil {
+		return err
+	}
+
+	c.applyTimestampSessionDefaults(tbl.Columns, stmt.Columns)
+
+	// Second pass: add column-level PK and UNIQUE indexes/constraints.
+	for _, colDef := range stmt.Columns {
+		for _, cc := range colDef.Constraints {
+			switch cc.Type {
+			case nodes.ColConstrPrimaryKey:
+				if err := validatePrimaryKeyColumns(tbl, []string{colDef.Name}); err != nil {
+					return err
+				}
+				tbl.Indexes = append(tbl.Indexes, &Index{
+					Name:      "PRIMARY",
+					Table:     tbl,
+					Columns:   []*IndexColumn{{Name: colDef.Name}},
+					Unique:    true,
+					Primary:   true,
+					IndexType: "",
+					Visible:   true,
+				})
+				tbl.Constraints = append(tbl.Constraints, &Constraint{
+					Name:      "PRIMARY",
+					Type:      ConPrimaryKey,
+					Table:     tbl,
+					Columns:   []string{colDef.Name},
+					IndexName: "PRIMARY",
+				})
+			case nodes.ColConstrUnique:
+				idxName := allocIndexName(tbl, colDef.Name)
+				tbl.Indexes = append(tbl.Indexes, &Index{
+					Name:      idxName,
+					Table:     tbl,
+					Columns:   []*IndexColumn{{Name: colDef.Name}},
+					Unique:    true,
+					IndexType: "",
+					Visible:   true,
+				})
+				tbl.Constraints = append(tbl.Constraints, &Constraint{
+					Name:      idxName,
+					Type:      ConUniqueKey,
+					Table:     tbl,
+					Columns:   []string{colDef.Name},
+					IndexName: idxName,
+				})
+			}
+		}
+	}
+
+	// A JSON column carries the json_valid check MariaDB gives it, which the
+	// server holds under the column's own name — unless the column declares a
+	// check of its own, which it carries in place of json_valid rather than
+	// beside it. See columnOwnsCheck.
+	for _, col := range tbl.Columns {
+		if col.IsJSON && !columnOwnsCheck(tbl, col.Name) {
+			tbl.Constraints = append(tbl.Constraints, jsonValidConstraint(col))
+		}
+	}
+
+	// Process table-level constraints.
+	for _, con := range stmt.Constraints {
+		cols := extractColumnNames(con)
+		if err := validateKeyPartPrefixes(con.IndexColumns, con.Type == nodes.ConstrSpatialIndex); err != nil {
+			return err
+		}
+
+		switch con.Type {
+		case nodes.ConstrPrimaryKey:
+			if hasPK {
+				return errMultiplePriKey()
+			}
+			if err := validatePrimaryKeyColumns(tbl, cols); err != nil {
+				return err
+			}
+			hasPK = true
+			// Mark PK columns as NOT NULL.
+			for _, colName := range cols {
+				c := tbl.GetColumn(colName)
+				if c != nil {
+					c.Nullable = false
+				}
+			}
+			idxCols := buildIndexColumns(con)
+			pkIdx := &Index{
+				Name:      "PRIMARY",
+				Table:     tbl,
+				Columns:   idxCols,
+				Unique:    true,
+				Primary:   true,
+				IndexType: "",
+				Visible:   true,
+			}
+			applyIndexOptions(pkIdx, con.IndexOptions)
+			if !pkIdx.Visible {
+				return errPKIndexCantBeIgnored()
+			}
+			tbl.Indexes = append(tbl.Indexes, pkIdx)
+			tbl.Constraints = append(tbl.Constraints, &Constraint{
+				Name:      "PRIMARY",
+				Type:      ConPrimaryKey,
+				Table:     tbl,
+				Columns:   cols,
+				IndexName: "PRIMARY",
+			})
+
+		case nodes.ConstrUnique:
+			idxCols := buildIndexColumns(con)
+			idxName := con.Name
+			if idxName == "" {
+				idxName = defaultIndexName(tbl, cols, idxCols)
+			} else if idxName != "" {
+				if err := validateNonPrimaryIndexName(idxName); err != nil {
+					return err
+				}
+				if indexNameExists(tbl, idxName) {
+					return errDupKeyName(idxName)
+				}
+			}
+			if err := validateIndexColumns(tbl, idxCols, false, false); err != nil {
+				return err
+			}
+			uqIdx := &Index{
+				Name:      idxName,
+				Table:     tbl,
+				Columns:   idxCols,
+				Unique:    true,
+				IndexType: resolveConstraintIndexType(con),
+				Visible:   true,
+			}
+			applyIndexOptions(uqIdx, con.IndexOptions)
+			if err := synthesizeFunctionalIndexColumns(tbl, uqIdx); err != nil {
+				return err
+			}
+			tbl.Indexes = append(tbl.Indexes, uqIdx)
+			tbl.Constraints = append(tbl.Constraints, &Constraint{
+				Name:      idxName,
+				Type:      ConUniqueKey,
+				Table:     tbl,
+				Columns:   cols,
+				IndexName: idxName,
+			})
+
+		case nodes.ConstrForeignKey:
+			conName := fkName(con)
+			if conName == "" {
+				unnamedFKCount++
+				conName = fmt.Sprintf("%s_ibfk_%d", tableName, unnamedFKCount)
+			}
+			if foreignKeyConstraintNameExists(db, tbl, conName) {
+				return errFKDupName(conName)
+			}
+			refDB := ""
+			refTable := ""
+			if con.RefTable != nil {
+				refDB = con.RefTable.Schema
+				refTable = con.RefTable.Name
+			}
+			tbl.Constraints = append(tbl.Constraints, &Constraint{
+				Name:        conName,
+				Type:        ConForeignKey,
+				Table:       tbl,
+				Columns:     cols,
+				RefDatabase: refDB,
+				RefTable:    refTable,
+				RefColumns:  con.RefColumns,
+				OnDelete:    refActionToString(con.OnDelete),
+				OnUpdate:    refActionToString(con.OnUpdate),
+			})
+			// Defer implicit backing index for FK until after all explicit indexes are added.
+			pendingFKs = append(pendingFKs, pendingFK{
+				conName:  fkName(con),
+				cols:     cols,
+				idxCols:  buildIndexColumns(con),
+				position: len(tbl.Indexes),
+			})
+
+		case nodes.ConstrCheck:
+			conName := con.Name
+			if conName == "" {
+				conName = checkNames.alloc(db, tbl)
+			}
+			if checkConstraintNameExists(db, tbl, conName) {
+				return errCheckConstraintDupName(conName)
+			}
+			if err := validateCheckExpr(conName, con.Expr); err != nil {
+				return err
+			}
+			tbl.Constraints = append(tbl.Constraints, &Constraint{
+				Name:        conName,
+				Type:        ConCheck,
+				Table:       tbl,
+				CheckExpr:   nodeToSQL(con.Expr),
+				NotEnforced: con.NotEnforced,
+			})
+
+		case nodes.ConstrIndex:
+			idxCols := buildIndexColumns(con)
+			idxName := con.Name
+			if idxName == "" {
+				idxName = defaultIndexName(tbl, cols, idxCols)
+			} else if idxName != "" {
+				if err := validateNonPrimaryIndexName(idxName); err != nil {
+					return err
+				}
+				if indexNameExists(tbl, idxName) {
+					return errDupKeyName(idxName)
+				}
+			}
+			if err := validateIndexColumns(tbl, idxCols, false, false); err != nil {
+				return err
+			}
+			keyIdx := &Index{
+				Name:      idxName,
+				Table:     tbl,
+				Columns:   idxCols,
+				IndexType: resolveConstraintIndexType(con),
+				Visible:   true,
+			}
+			applyIndexOptions(keyIdx, con.IndexOptions)
+			coerceInnoDBHashIndex(tbl, keyIdx)
+			if err := synthesizeFunctionalIndexColumns(tbl, keyIdx); err != nil {
+				return err
+			}
+			tbl.Indexes = append(tbl.Indexes, keyIdx)
+
+		case nodes.ConstrFulltextIndex:
+			idxName := con.Name
+			if idxName == "" && len(cols) > 0 {
+				idxName = allocIndexName(tbl, cols[0])
+			} else if idxName != "" {
+				if err := validateNonPrimaryIndexName(idxName); err != nil {
+					return err
+				}
+				if indexNameExists(tbl, idxName) {
+					return errDupKeyName(idxName)
+				}
+			}
+			idxCols := buildIndexColumns(con)
+			ftIdx := &Index{
+				Name:      idxName,
+				Table:     tbl,
+				Columns:   idxCols,
+				Fulltext:  true,
+				IndexType: "FULLTEXT",
+				Visible:   true,
+			}
+			applyIndexOptions(ftIdx, con.IndexOptions)
+			tbl.Indexes = append(tbl.Indexes, ftIdx)
+
+		case nodes.ConstrVector:
+			idxName := con.Name
+			if idxName == "" && len(cols) > 0 {
+				idxName = allocIndexName(tbl, cols[0])
+			} else if idxName != "" {
+				if err := validateNonPrimaryIndexName(idxName); err != nil {
+					return err
+				}
+				if indexNameExists(tbl, idxName) {
+					return errDupKeyName(idxName)
+				}
+			}
+			idxCols := buildIndexColumns(con)
+			if err := validateVectorIndex(tbl, idxCols); err != nil {
+				return err
+			}
+			vecIdx := &Index{
+				Name:      idxName,
+				Table:     tbl,
+				Columns:   idxCols,
+				Vector:    true,
+				IndexType: "VECTOR",
+				Visible:   true,
+			}
+			applyIndexOptions(vecIdx, con.IndexOptions)
+			tbl.Indexes = append(tbl.Indexes, vecIdx)
+
+		case nodes.ConstrSpatialIndex:
+			idxName := con.Name
+			if idxName == "" && len(cols) > 0 {
+				idxName = allocIndexName(tbl, cols[0])
+			} else if idxName != "" {
+				if err := validateNonPrimaryIndexName(idxName); err != nil {
+					return err
+				}
+				if indexNameExists(tbl, idxName) {
+					return errDupKeyName(idxName)
+				}
+			}
+			idxCols := buildIndexColumns(con)
+			if err := validateIndexColumns(tbl, idxCols, false, true); err != nil {
+				return err
+			}
+			if strings.EqualFold(resolveConstraintIndexType(con), "BTREE") {
+				return &Error{Code: 3500, SQLState: "HY000", Message: "Index type not supported for spatial index"}
+			}
+			spIdx := &Index{
+				Name:      idxName,
+				Table:     tbl,
+				Columns:   idxCols,
+				Spatial:   true,
+				IndexType: "SPATIAL",
+				Visible:   true,
+			}
+			applyIndexOptions(spIdx, con.IndexOptions)
+			if strings.EqualFold(spIdx.IndexType, "BTREE") {
+				return &Error{Code: 3500, SQLState: "HY000", Message: "Index type not supported for spatial index"}
+			}
+			tbl.Indexes = append(tbl.Indexes, spIdx)
+		}
+	}
+
+	// Process deferred FK backing indexes now that all explicit indexes are in
+	// place. The index a foreign key brings with it materializes a VIRTUAL
+	// generated column as any other key does, so the column is held to the
+	// same rule: measured on mariadb:11.8.8, a table declaring both
+	// `a DOUBLE AS (RAND()) VIRTUAL` and a foreign key over a answers 1901.
+	// Each index still takes the place its own clause had, which is where the
+	// server builds it; every one made shifts the places recorded after it.
+	made := 0
+	for _, fk := range pendingFKs {
+		if err := validateIndexColumns(tbl, fk.idxCols, false, false); err != nil {
+			return err
+		}
+		if insertFKBackingIndex(tbl, fk.conName, fk.cols, fk.idxCols, fk.position+made) {
+			made++
+		}
+	}
+
+	// Validate foreign key constraints (unless foreign_key_checks=0).
+	if c.foreignKeyChecks {
+		if err := c.validateForeignKeys(db, tbl); err != nil {
+			return err
+		}
+	}
+
+	// Process partition clause.
+	if stmt.Partitions != nil {
+		if err := validatePartitionClause(tbl, stmt.Partitions); err != nil {
+			return err
+		}
+		tbl.Partitioning = buildPartitionInfo(tbl, stmt.Partitions)
+	}
+
+	// Phase 3: analyze DEFAULT, GENERATED, and CHECK expressions now that all
+	// columns are present in the table.
+	c.analyzeTableExpressions(tbl, stmt)
+
+	if err := validateWithoutOverlaps(tbl); err != nil {
+		return err
+	}
+	if err := validateIgnoredPrimaryKey(tbl, true); err != nil {
+		return err
+	}
+	// Once every column is in, a materialized generated column can be asked
+	// about the ones it reads: measured on mariadb:11.8.8,
+	// `CREATE TABLE t (a DOUBLE AS (RAND()) VIRTUAL, b DOUBLE AS (a) STORED)`
+	// answers 1901, where the same table without the STORED column is
+	// accepted.
+	if err := validateMaterializedGeneratedColumns(tbl, indexedColumnsOf(tbl)); err != nil {
+		return err
+	}
+
+	db.Tables[key] = tbl
+	return nil
+}
+
+// validateWithoutOverlaps enforces that every WITHOUT OVERLAPS key part names
+// the table's application-time period (else 4156). Grounded vs 11.8.8.
+func validateWithoutOverlaps(tbl *Table) error {
+	for _, idx := range tbl.Indexes {
+		if err := validateColsWithoutOverlaps(tbl, idx.Name, idx.Columns); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// normalizeAppPeriodColumn coerces an application-time period column to NOT NULL
+// and drops an explicit DEFAULT NULL — MariaDB strips a NULL default when the
+// column becomes NOT NULL, while keeping a non-null default.
+func normalizeAppPeriodColumn(col *Column) {
+	col.Nullable = false
+	if col.Default != nil && strings.EqualFold(*col.Default, "NULL") {
+		col.Default = nil
+	}
+}
+
+// validateApplicationTimeFinalState validates the application-time period and its
+// WITHOUT OVERLAPS keys against the FINAL table state after an ALTER, so a
+// multi-command statement (ADD PERIOD then MODIFY a column, DROP KEY then DROP
+// PERIOD, or a reversed ADD UNIQUE … WITHOUT OVERLAPS / ADD PERIOD) is judged on
+// its end result like MariaDB. When an application-time period remains, its
+// columns are re-normalized to NOT NULL. Grounded vs 11.8.8.
+func validateApplicationTimeFinalState(tbl *Table) error {
+	if tbl.AppPeriodName != "" {
+		if err := validateAppPeriodColumns(tbl, tbl.AppPeriodName, tbl.AppPeriodStartCol, tbl.AppPeriodEndCol); err != nil {
+			return err
+		}
+		for _, colName := range []string{tbl.AppPeriodStartCol, tbl.AppPeriodEndCol} {
+			if col := tbl.GetColumn(colName); col != nil {
+				normalizeAppPeriodColumn(col)
+			}
+		}
+	}
+	return validateWithoutOverlaps(tbl)
+}
+
+// validateColsWithoutOverlaps validates a WITHOUT OVERLAPS key. Used by CREATE
+// TABLE, CREATE INDEX, and ALTER ADD — every path that builds a key. For a key
+// that carries a WO part: the flagged part must name the application-time period
+// (else 4156), and every ordinary (non-WO) column part must be a real column
+// (else 1072) that is not an application-time period column (else 4170). A
+// system-time period column is allowed as an ordinary part. Keys without a WO
+// part are not validated here. Grounded vs 11.8.8.
+func validateColsWithoutOverlaps(tbl *Table, keyName string, cols []*IndexColumn) error {
+	hasOverlaps := false
+	for _, ic := range cols {
+		if ic.WithoutOverlaps {
+			hasOverlaps = true
+			break
+		}
+	}
+	if !hasOverlaps {
+		return nil
+	}
+	for _, ic := range cols {
+		if ic.WithoutOverlaps {
+			if !strings.EqualFold(ic.Name, tbl.AppPeriodName) {
+				return errPeriodNotFound(ic.Name)
+			}
+			continue
+		}
+		if ic.Expr != "" {
+			continue // functional key part — not a simple column reference
+		}
+		if tbl.GetColumn(ic.Name) == nil {
+			return errKeyColumnDoesNotExist(ic.Name)
+		}
+		if isAppPeriodColumn(tbl, ic.Name) {
+			return errKeyIncludesPeriodColumn(keyName, ic.Name)
+		}
+	}
+	return nil
+}
+
+// isAppPeriodColumn reports whether colName is the start or end column of the
+// table's application-time period. System-time period columns are excluded —
+// MariaDB allows those as ordinary key parts.
+func isAppPeriodColumn(tbl *Table, colName string) bool {
+	return tbl.AppPeriodName != "" &&
+		(strings.EqualFold(colName, tbl.AppPeriodStartCol) || strings.EqualFold(colName, tbl.AppPeriodEndCol))
+}
+
+func rebuildColByNamePreservePositions(tbl *Table) {
+	tbl.colByName = make(map[string]int, len(tbl.Columns))
+	for i, col := range tbl.Columns {
+		tbl.colByName[toLower(col.Name)] = i
+	}
+}
+
+// analyzeTableExpressions performs best-effort semantic analysis on DEFAULT,
+// GENERATED, and CHECK expressions after all columns have been added to the table.
+func (c *Catalog) analyzeTableExpressions(tbl *Table, stmt *nodes.CreateTableStmt) {
+	// Analyze DEFAULT and GENERATED expressions from column definitions.
+	for _, colDef := range stmt.Columns {
+		col := tbl.GetColumn(colDef.Name)
+		if col == nil {
+			continue
+		}
+
+		// Top-level DEFAULT.
+		if colDef.DefaultValue != nil {
+			if analyzed, err := c.AnalyzeStandaloneExpr(colDef.DefaultValue, tbl); err == nil {
+				col.DefaultAnalyzed = analyzed
+			}
+		}
+
+		// Column-constraint DEFAULT (may override top-level).
+		for _, cc := range colDef.Constraints {
+			if cc.Type == nodes.ColConstrDefault && cc.Expr != nil {
+				if analyzed, err := c.AnalyzeStandaloneExpr(cc.Expr, tbl); err == nil {
+					col.DefaultAnalyzed = analyzed
+				}
+			}
+		}
+
+		// GENERATED ALWAYS AS.
+		if colDef.Generated != nil {
+			if analyzed, err := c.AnalyzeStandaloneExpr(colDef.Generated.Expr, tbl); err == nil {
+				col.GeneratedAnalyzed = analyzed
+			}
+		}
+	}
+
+	// Analyze CHECK expressions on constraints.
+	// We iterate constraints and match CHECK ones; the AST sources are both
+	// column-level and table-level constraint nodes.
+	// The statement's CHECK clauses are matched to the table's CHECK
+	// constraints in order. A JSON column's implicit json_valid check is not
+	// one of the statement's clauses, so nextCheck passes it over: counting it
+	// would hand the following clause's analyzed expression to the wrong
+	// constraint, and leave that clause's own constraint without one.
+	checkIdx := 0
+	nextCheck := func() *Constraint {
+		for checkIdx < len(tbl.Constraints) {
+			con := tbl.Constraints[checkIdx]
+			checkIdx++
+			if con.Type == ConCheck && !isImplicitJSONCheck(con) {
+				return con
+			}
+		}
+		return nil
+	}
+	analyze := func(expr nodes.ExprNode) {
+		con := nextCheck()
+		if con == nil {
+			return
+		}
+		if analyzed, err := c.AnalyzeStandaloneExpr(expr, tbl); err == nil {
+			con.CheckAnalyzed = analyzed
+		}
+	}
+	for _, colDef := range stmt.Columns {
+		for _, cc := range colDef.Constraints {
+			if cc.Type == nodes.ColConstrCheck && cc.Expr != nil {
+				analyze(cc.Expr)
+			}
+		}
+	}
+	for _, con := range stmt.Constraints {
+		if con.Type == nodes.ConstrCheck && con.Expr != nil {
+			analyze(con.Expr)
+		}
+	}
+}
+
+// buildPartitionInfo converts an AST PartitionClause to a catalog PartitionInfo.
+func buildPartitionInfo(tbl *Table, pc *nodes.PartitionClause) *PartitionInfo {
+	pi := &PartitionInfo{
+		Linear:     pc.Linear,
+		NumParts:   pc.NumParts,
+		keyColumns: partitionKeyColumns(tbl, pc),
+	}
+	if pi.NumParts == 0 && len(pc.Partitions) == 0 && (pc.Type == nodes.PartitionHash || pc.Type == nodes.PartitionKey) {
+		pi.NumParts = 1
+	}
+
+	switch pc.Type {
+	case nodes.PartitionRange:
+		if len(pc.Columns) > 0 {
+			pi.Type = "RANGE COLUMNS"
+			pi.Columns = pc.Columns
+		} else {
+			pi.Type = "RANGE"
+			pi.Expr = nodeToSQL(pc.Expr)
+		}
+	case nodes.PartitionList:
+		if len(pc.Columns) > 0 {
+			pi.Type = "LIST COLUMNS"
+			pi.Columns = pc.Columns
+		} else {
+			pi.Type = "LIST"
+			pi.Expr = nodeToSQL(pc.Expr)
+		}
+	case nodes.PartitionHash:
+		pi.Type = "HASH"
+		pi.Expr = nodeToSQL(pc.Expr)
+	case nodes.PartitionKey:
+		pi.Type = "KEY"
+		pi.Columns = pc.Columns
+		if len(pi.Columns) == 0 {
+			pi.Columns = primaryKeyColumns(tbl)
+		}
+		pi.Algorithm = pc.Algorithm
+	case nodes.PartitionSystemTime:
+		pi.Type = "SYSTEM_TIME"
+		pi.IntervalValue = nodeToSQL(pc.IntervalValue)
+		pi.IntervalUnit = pc.IntervalUnit
+		pi.Limit = pc.Limit
+		pi.Starts = nodeToSQL(pc.Starts)
+		pi.Auto = pc.Auto
+	}
+
+	// Subpartition info.
+	if pc.SubPartType != 0 || pc.SubPartExpr != nil || len(pc.SubPartColumns) > 0 {
+		pi.UseDefaultSubpartitions = true
+		pi.UseDefaultNumSubpartitions = true
+		switch pc.SubPartType {
+		case nodes.PartitionHash:
+			pi.SubType = "HASH"
+			pi.SubExpr = nodeToSQL(pc.SubPartExpr)
+		case nodes.PartitionKey:
+			pi.SubType = "KEY"
+			pi.SubColumns = pc.SubPartColumns
+			pi.SubAlgo = pc.SubPartAlgo
+		}
+		pi.SubLinear = false // TODO: track linear for subpartitions if parser supports it
+		if pc.NumSubParts > 0 {
+			pi.NumSubParts = pc.NumSubParts
+			pi.UseDefaultNumSubpartitions = false
+		} else {
+			pi.NumSubParts = 1
+		}
+	}
+
+	// Partition definitions.
+	explicitSubpartitions := false
+	explicitSubpartitionCount := 0
+	for _, pd := range pc.Partitions {
+		pdi := &PartitionDefInfo{
+			Name:       pd.Name,
+			SystemTime: pd.SystemTime,
+		}
+		// Values.
+		if pd.Values != nil {
+			pdi.ValueExpr = partitionValueToString(pd.Values, pc.Type)
+		}
+		// Options.
+		for _, opt := range pd.Options {
+			switch toLower(opt.Name) {
+			case "engine":
+				pdi.Engine = opt.Value
+			case "comment":
+				pdi.Comment = opt.Value
+			}
+		}
+		// Subpartitions.
+		if len(pd.SubPartitions) > 0 {
+			if !explicitSubpartitions {
+				explicitSubpartitions = true
+				explicitSubpartitionCount = len(pd.SubPartitions)
+			}
+		}
+		for _, spd := range pd.SubPartitions {
+			spdi := &SubPartitionDefInfo{
+				Name:    spd.Name,
+				Engine:  pdi.Engine,
+				Comment: pdi.Comment,
+			}
+			for _, opt := range spd.Options {
+				switch toLower(opt.Name) {
+				case "engine":
+					spdi.Engine = opt.Value
+				case "comment":
+					spdi.Comment = opt.Value
+				}
+			}
+			pdi.SubPartitions = append(pdi.SubPartitions, spdi)
+		}
+		pi.Partitions = append(pi.Partitions, pdi)
+	}
+	if explicitSubpartitions {
+		pi.UseDefaultSubpartitions = false
+		pi.UseDefaultNumSubpartitions = false
+		pi.NumSubParts = explicitSubpartitionCount
+	}
+
+	// Auto-generate partition definitions for HASH/KEY/LINEAR HASH/LINEAR KEY
+	// when PARTITIONS N is specified without explicit partition definitions.
+	// MySQL naming convention: p0, p1, p2, ... (SYSTEM_TIME keeps PARTITIONS N).
+	if len(pi.Partitions) == 0 && pi.NumParts > 0 && pi.Type != "SYSTEM_TIME" {
+		for i := 0; i < pi.NumParts; i++ {
+			pi.Partitions = append(pi.Partitions, &PartitionDefInfo{
+				Name: fmt.Sprintf("p%d", i),
+			})
+		}
+	}
+
+	// Auto-generate subpartition definitions when SUBPARTITIONS N is specified
+	// without explicit subpartition definitions.
+	// MySQL naming convention: <partition_name>sp0, <partition_name>sp1, ...
+	if pi.SubType != "" && pi.UseDefaultSubpartitions && pi.NumSubParts > 0 {
+		for _, part := range pi.Partitions {
+			if len(part.SubPartitions) == 0 {
+				for j := 0; j < pi.NumSubParts; j++ {
+					part.SubPartitions = append(part.SubPartitions, &SubPartitionDefInfo{
+						Name: fmt.Sprintf("%ssp%d", part.Name, j),
+					})
+				}
+			}
+		}
+	}
+
+	return pi
+}
+
+func (c *Catalog) applyTimestampSessionDefaults(cols []*Column, defs []*nodes.ColumnDef) {
+	if c.session.ExplicitDefaultsForTimestamp {
+		return
+	}
+	promotedFirst := false
+	for i, col := range cols {
+		if col == nil || !strings.EqualFold(col.DataType, "timestamp") || i >= len(defs) {
+			continue
+		}
+		def := defs[i]
+		if def.Generated != nil {
+			// Generated columns — including ROW START/END row-bound columns, even
+			// after WITHOUT-normalization nulls the catalog column's Generated —
+			// never take the legacy timestamp DEFAULT/ON UPDATE promotion.
+			continue
+		}
+		if hasExplicitNull(def) {
+			continue
+		}
+		col.Nullable = false
+
+		hasDefault := hasExplicitDefault(def)
+		hasOnUpdate := hasExplicitOnUpdate(def)
+		if !promotedFirst && !hasDefault && !hasOnUpdate {
+			current := timestampCurrentExpr(timestampFsp(def))
+			col.Default = &current
+			col.DefaultKind = ColumnDefaultCurrentTimestamp
+			col.OnUpdate = current
+			col.OnUpdateKind = ColumnDefaultCurrentTimestamp
+			promotedFirst = true
+			continue
+		}
+		if !hasDefault && col.Default == nil {
+			zero := timestampZeroDefault(timestampFsp(def))
+			col.Default = &zero
+			col.DefaultKind = ColumnDefaultConstant
+		}
+	}
+}
+
+func hasExplicitNull(def *nodes.ColumnDef) bool {
+	if def == nil {
+		return false
+	}
+	for _, cc := range def.Constraints {
+		if cc.Type == nodes.ColConstrNull {
+			return true
+		}
+	}
+	return false
+}
+
+func hasExplicitDefault(def *nodes.ColumnDef) bool {
+	if def == nil {
+		return false
+	}
+	if def.DefaultValue != nil {
+		return true
+	}
+	for _, cc := range def.Constraints {
+		if cc.Type == nodes.ColConstrDefault {
+			return true
+		}
+	}
+	return false
+}
+
+func hasExplicitOnUpdate(def *nodes.ColumnDef) bool {
+	return def != nil && def.OnUpdate != nil
+}
+
+func timestampFsp(def *nodes.ColumnDef) int {
+	if def == nil || def.TypeName == nil {
+		return 0
+	}
+	return def.TypeName.Length
+}
+
+func timestampCurrentExpr(fsp int) string {
+	if fsp > 0 {
+		return fmt.Sprintf("CURRENT_TIMESTAMP(%d)", fsp)
+	}
+	return "CURRENT_TIMESTAMP"
+}
+
+func timestampZeroDefault(fsp int) string {
+	if fsp > 0 {
+		return "0000-00-00 00:00:00." + strings.Repeat("0", fsp)
+	}
+	return "0000-00-00 00:00:00"
+}
+
+func setColumnDefaultFromExpr(col *Column, expr nodes.ExprNode) {
+	val, kind := columnDefaultValue(expr)
+	col.Default = &val
+	col.DefaultKind = kind
+	col.DefaultDropped = false
+}
+
+func setColumnOnUpdateFromExpr(col *Column, expr nodes.ExprNode) {
+	val, kind := columnDefaultValue(expr)
+	col.OnUpdate = val
+	col.OnUpdateKind = kind
+}
+
+func columnDefaultValue(expr nodes.ExprNode) (string, ColumnDefaultKind) {
+	switch e := expr.(type) {
+	case *nodes.ParenExpr:
+		if ts, ok := currentTimestampExpr(e.Expr); ok {
+			return ts, ColumnDefaultCurrentTimestamp
+		}
+		return nodeToSQL(e.Expr), ColumnDefaultExpression
+	case *nodes.BoolLit:
+		if e.Value {
+			return "1", ColumnDefaultConstant
+		}
+		return "0", ColumnDefaultConstant
+	case *nodes.BitLit:
+		return canonicalBitLiteral(e.Value), ColumnDefaultConstant
+	default:
+		if ts, ok := currentTimestampExpr(expr); ok {
+			return ts, ColumnDefaultCurrentTimestamp
+		}
+		return nodeToSQL(expr), ColumnDefaultConstant
+	}
+}
+
+func currentTimestampExpr(expr nodes.ExprNode) (string, bool) {
+	fn, ok := expr.(*nodes.FuncCallExpr)
+	if !ok {
+		return "", false
+	}
+	name := strings.ToLower(fn.Name)
+	if name != "current_timestamp" && name != "now" {
+		return "", false
+	}
+	if len(fn.Args) == 0 {
+		return "CURRENT_TIMESTAMP", true
+	}
+	if len(fn.Args) == 1 {
+		if lit, ok := fn.Args[0].(*nodes.IntLit); ok {
+			return fmt.Sprintf("CURRENT_TIMESTAMP(%d)", lit.Value), true
+		}
+	}
+	if ts, ok := currentTimestampSQL(nodeToSQL(expr)); ok {
+		return ts, true
+	}
+	return "CURRENT_TIMESTAMP", true
+}
+
+func canonicalBitLiteral(bits string) string {
+	bits = strings.TrimSpace(bits)
+	bits = strings.TrimPrefix(bits, "0b")
+	bits = strings.TrimPrefix(bits, "0B")
+	if len(bits) >= 3 && (strings.HasPrefix(bits, "b'") || strings.HasPrefix(bits, "B'")) && strings.HasSuffix(bits, "'") {
+		bits = bits[2 : len(bits)-1]
+	}
+	bits = strings.TrimLeft(bits, "0")
+	if bits == "" {
+		bits = "0"
+	}
+	return "b'" + bits + "'"
+}
+
+// partitionTypeName maps a partition type to its SQL keyword.
+func partitionTypeName(t nodes.PartitionType) string {
+	switch t {
+	case nodes.PartitionRange:
+		return "RANGE"
+	case nodes.PartitionList:
+		return "LIST"
+	case nodes.PartitionHash:
+		return "HASH"
+	case nodes.PartitionKey:
+		return "KEY"
+	case nodes.PartitionSystemTime:
+		return "SYSTEM_TIME"
+	default:
+		return ""
+	}
+}
+
+// validateSystemTimePartitioning enforces MariaDB's SYSTEM_TIME partitioning
+// rules (grounded vs 11.8.8) and rejects HISTORY/CURRENT tags under other
+// partition types:
+//   - HISTORY/CURRENT only under SYSTEM_TIME            -> 4113
+//   - SYSTEM_TIME requires a system-versioned table     -> 4124
+//   - no VALUES under SYSTEM_TIME                        -> 1480
+//   - an explicit list needs >=1 HISTORY + one final CURRENT -> 4128
+func validateSystemTimePartitioning(tbl *Table, pc *nodes.PartitionClause) error {
+	if pc.Type != nodes.PartitionSystemTime {
+		for _, pd := range pc.Partitions {
+			if pd.SystemTime != "" {
+				return errWrongPartitionType(partitionTypeName(pc.Type))
+			}
+		}
+		return nil
+	}
+	if !tbl.SystemVersioned {
+		return errNotSystemVersioned(tbl.Name)
+	}
+	historyCount, currentCount := 0, 0
+	for i, pd := range pc.Partitions {
+		if pd.Values != nil {
+			return errValuesOnlyForRange()
+		}
+		switch pd.SystemTime {
+		case "HISTORY":
+			historyCount++
+		case "CURRENT":
+			currentCount++
+			if i != len(pc.Partitions)-1 {
+				return errWrongSystemTimePartitions(tbl.Name)
+			}
+		}
+	}
+	if len(pc.Partitions) > 0 && (historyCount == 0 || currentCount != 1) {
+		return errWrongSystemTimePartitions(tbl.Name)
+	}
+	return nil
+}
+
+func validatePartitionClause(tbl *Table, pc *nodes.PartitionClause) error {
+	if err := validateSystemTimePartitioning(tbl, pc); err != nil {
+		return err
+	}
+	if (pc.Type == nodes.PartitionRange || pc.Type == nodes.PartitionList) && len(pc.Partitions) == 0 {
+		return &Error{Code: 1492, SQLState: "HY000", Message: "Partitions must be defined for RANGE/LIST partitioning"}
+	}
+	if pc.Type == nodes.PartitionRange && len(pc.Columns) > 0 {
+		// RANGE COLUMNS takes MAXVALUE in any partition: what it requires is
+		// bounds that strictly increase, compared column by column, and it
+		// answers 1493 otherwise. Holding it to RANGE's 1481 refused
+		// "(5, MAXVALUE), (6, 1)", which the engine runs.
+		kinds := rangeColumnsBoundKinds(tbl, pc.Columns)
+		for i := 1; i < len(pc.Partitions); i++ {
+			prev, cur := pc.Partitions[i-1].Values, pc.Partitions[i].Values
+			if prev != nil && cur != nil && rangeColumnsNotIncreasing(prev, cur, kinds) {
+				return &Error{Code: 1493, SQLState: "HY000", Message: "VALUES LESS THAN value must be strictly increasing for each partition"}
+			}
+		}
+	} else if pc.Type == nodes.PartitionRange {
+		for i, pd := range pc.Partitions {
+			if pd.Values != nil && strings.Contains(strings.ToUpper(partitionValueToString(pd.Values, pc.Type)), "MAXVALUE") && i != len(pc.Partitions)-1 {
+				return &Error{Code: 1481, SQLState: "HY000", Message: "MAXVALUE can only be used in last partition definition"}
+			}
+		}
+	}
+	if pc.Type == nodes.PartitionList {
+		for _, pd := range pc.Partitions {
+			if containsPartitionDefaultExpr(pd.Values) {
+				return &Error{Code: 1064, SQLState: "42000", Message: "DEFAULT is not valid in LIST partition values"}
+			}
+		}
+	}
+	if err := validateSubpartitionDefinitions(pc); err != nil {
+		return err
+	}
+	expr := strings.ToLower(nodeToSQL(pc.Expr))
+	if strings.Contains(expr, "concat(") {
+		return &Error{Code: 1491, SQLState: "HY000", Message: "The PARTITION function returns the wrong type"}
+	}
+	if pc.Type == nodes.PartitionRange {
+		if cr, ok := pc.Expr.(*nodes.ColumnRef); ok {
+			if col := tbl.GetColumn(cr.Column); col != nil && strings.EqualFold(col.DataType, "timestamp") {
+				return &Error{Code: 1491, SQLState: "HY000", Message: "A PRIMARY KEY must include all columns in the table's partitioning function"}
+			}
+		}
+	}
+	return validateUniqueKeysCoverPartitionColumns(tbl, partitionKeyColumns(tbl, pc))
+}
+
+// rangeColumnsNotIncreasing reports whether the RANGE COLUMNS bound cur is
+// certainly not greater than prev, which the engine refuses with 1493. It
+// compares column by column, as MySQL and MariaDB do: MAXVALUE is greater than
+// any value, and a MAXVALUE in both ends the comparison as equal, so
+// "(MAXVALUE, 5), (MAXVALUE, 10)" is refused. Below MAXVALUE, two bounds are
+// compared only where their column's type settles the order (kinds); any other
+// pair leaves the answer open, and nothing is reported.
+func rangeColumnsNotIncreasing(prev, cur nodes.Node, kinds []rangeBoundKind) bool {
+	ps, cs := partitionBoundItems(prev), partitionBoundItems(cur)
+	if len(ps) != len(cs) || len(ps) != len(kinds) {
+		return false
+	}
+	for i := range ps {
+		pm, cm := isPartitionMaxvalue(ps[i]), isPartitionMaxvalue(cs[i])
+		switch {
+		case pm:
+			return true
+		case cm:
+			return false
+		}
+		order, known := comparePartitionBounds(ps[i], cs[i], kinds[i])
+		if !known {
+			return false
+		}
+		if order != 0 {
+			return order > 0
+		}
+	}
+	return true
+}
+
+// rangeBoundKind is how a RANGE COLUMNS column's literal bounds compare where
+// the order is certain.
+type rangeBoundKind int
+
+const (
+	rangeBoundOpen     rangeBoundKind = iota // nothing is decided
+	rangeBoundInteger                        // integer literals, by value
+	rangeBoundString                         // string literals, by byte where the collation keeps it
+	rangeBoundTemporal                       // date and time literals of one fixed, zero-padded shape
+)
+
+// rangeColumnsBoundKinds reads each partitioning column's kind off the table.
+// A string column compares only under a collation with no tailoring of ASCII
+// letters and digits: a language collation such as utf8mb4_spanish2_ci sorts
+// "ch" after "cz", which byte order cannot see.
+func rangeColumnsBoundKinds(tbl *Table, cols []string) []rangeBoundKind {
+	kinds := make([]rangeBoundKind, len(cols))
+	for i, name := range cols {
+		col := tbl.GetColumn(name)
+		if col == nil {
+			continue
+		}
+		switch strings.ToLower(col.DataType) {
+		case "tinyint", "smallint", "mediumint", "int", "integer", "bigint":
+			kinds[i] = rangeBoundInteger
+		case "binary", "varbinary":
+			kinds[i] = rangeBoundString
+		case "char", "varchar":
+			if plainCollation(col.Collation) {
+				kinds[i] = rangeBoundString
+			}
+		case "date", "datetime":
+			kinds[i] = rangeBoundTemporal
+		}
+	}
+	return kinds
+}
+
+// plainCollation reports whether a collation orders ASCII digits and lowercase
+// letters as their bytes do: binary ones and the untailored defaults.
+func plainCollation(c string) bool {
+	c = strings.ToLower(c)
+	if c == "" || c == "binary" || strings.HasSuffix(c, "_bin") {
+		return true
+	}
+	switch c {
+	case "utf8mb4_0900_ai_ci", "utf8mb4_0900_as_ci", "utf8mb4_0900_as_cs", "utf8mb4_general_ci",
+		"utf8mb4_unicode_ci", "utf8mb4_unicode_520_ci", "utf8mb3_general_ci", "utf8mb3_unicode_ci",
+		"utf8_general_ci", "utf8_unicode_ci", "latin1_swedish_ci", "latin1_general_ci", "latin1_general_cs",
+		"ascii_general_ci", "utf8mb4_uca1400_ai_ci", "utf8mb4_uca1400_as_ci", "utf8mb4_uca1400_as_cs", "utf8mb4_uca1400_ai_cs", "utf8mb3_uca1400_ai_ci":
+		return true
+	}
+	return false
+}
+
+func partitionBoundItems(n nodes.Node) []nodes.Node {
+	if l, ok := n.(*nodes.List); ok {
+		return l.Items
+	}
+	return []nodes.Node{n}
+}
+
+func isPartitionMaxvalue(n nodes.Node) bool {
+	s, ok := n.(*nodes.String)
+	return ok && strings.EqualFold(s.Str, "MAXVALUE")
+}
+
+// comparePartitionBounds orders two bounds of a column of the given kind, a
+// against b, when the order is certain: -1, 0 or 1, and whether it is known.
+func comparePartitionBounds(a, b nodes.Node, kind rangeBoundKind) (int, bool) {
+	switch kind {
+	case rangeBoundInteger:
+		x, ok1 := partitionBoundInt(a)
+		y, ok2 := partitionBoundInt(b)
+		if !ok1 || !ok2 {
+			return 0, false
+		}
+		switch {
+		case x < y:
+			return -1, true
+		case x > y:
+			return 1, true
+		}
+		return 0, true
+	case rangeBoundString, rangeBoundTemporal:
+		x, ok1 := a.(*nodes.StringLit)
+		y, ok2 := b.(*nodes.StringLit)
+		if !ok1 || !ok2 {
+			return 0, false
+		}
+		if x.Value == y.Value {
+			return 0, true
+		}
+		if kind == rangeBoundTemporal {
+			return compareTemporalLiterals(x.Value, y.Value)
+		}
+		for i := 0; i < len(x.Value) && i < len(y.Value); i++ {
+			c, d := x.Value[i], y.Value[i]
+			if c == d {
+				continue
+			}
+			digits := c >= '0' && c <= '9' && d >= '0' && d <= '9'
+			lower := c >= 'a' && c <= 'z' && d >= 'a' && d <= 'z'
+			if !digits && !lower {
+				return 0, false
+			}
+			if c < d {
+				return -1, true
+			}
+			return 1, true
+		}
+	}
+	return 0, false
+}
+
+// compareTemporalLiterals orders two date or time literals written in one
+// shape: equal length, digits in the same places and the same separators
+// between them, as '2020-01-31' and '2021-12-01' are, and a four-digit year
+// first. Zero-padded fields of one width then sort as their bytes do;
+// '2020-9-1' against '2020-10-01' does not, and neither does a two-digit year,
+// which reads 70-99 as 1970-1999 and 00-69 as 2000-2069, so both are left
+// open.
+func compareTemporalLiterals(x, y string) (int, bool) {
+	if len(x) != len(y) || !fourDigitYear(x) {
+		return 0, false
+	}
+	for i := 0; i < len(x); i++ {
+		xd, yd := x[i] >= '0' && x[i] <= '9', y[i] >= '0' && y[i] <= '9'
+		if xd != yd || (!xd && x[i] != y[i]) {
+			return 0, false
+		}
+	}
+	if x < y {
+		return -1, true
+	}
+	return 1, true
+}
+
+// fourDigitYear reports whether a date literal leads with a four-digit year
+// and a separator after it.
+func fourDigitYear(s string) bool {
+	if len(s) < 5 {
+		return false
+	}
+	for i := 0; i < 4; i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return s[4] < '0' || s[4] > '9'
+}
+
+func partitionBoundInt(n nodes.Node) (int64, bool) {
+	if lit, ok := n.(*nodes.IntLit); ok {
+		// The lexer clamps a literal past int64, so either end may not be
+		// the value written.
+		if lit.Value == math.MaxInt64 || lit.Value == math.MinInt64 {
+			return 0, false
+		}
+		return lit.Value, true
+	}
+	return 0, false
+}
+
+func validateSubpartitionDefinitions(pc *nodes.PartitionClause) error {
+	if pc.SubPartType == 0 && pc.SubPartExpr == nil && len(pc.SubPartColumns) == 0 {
+		return nil
+	}
+	explicitCount := 0
+	seenExplicit := false
+	for i, pd := range pc.Partitions {
+		count := len(pd.SubPartitions)
+		if count == 0 {
+			if seenExplicit {
+				return errWrongNumberOfSubpartitions()
+			}
+			continue
+		}
+		if !seenExplicit {
+			if i > 0 {
+				return errWrongNumberOfSubpartitions()
+			}
+			seenExplicit = true
+			explicitCount = count
+		}
+		if count != explicitCount {
+			return errWrongNumberOfSubpartitions()
+		}
+		if pc.NumSubParts > 0 && count != pc.NumSubParts {
+			return errWrongNumberOfSubpartitions()
+		}
+	}
+	return nil
+}
+
+func errWrongNumberOfSubpartitions() error {
+	return &Error{
+		Code:     1064,
+		SQLState: "42000",
+		Message:  "Wrong number of subpartitions defined, mismatch with previous setting",
+	}
+}
+
+func containsPartitionDefaultExpr(n nodes.Node) bool {
+	switch v := n.(type) {
+	case nil:
+		return false
+	case *nodes.DefaultExpr:
+		return true
+	case *nodes.List:
+		for _, item := range v.Items {
+			if containsPartitionDefaultExpr(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func primaryKeyColumns(tbl *Table) []string {
+	for _, con := range tbl.Constraints {
+		if con.Type == ConPrimaryKey {
+			return append([]string{}, con.Columns...)
+		}
+	}
+	for _, idx := range tbl.Indexes {
+		if idx.Primary {
+			cols := make([]string, 0, len(idx.Columns))
+			for _, ic := range idx.Columns {
+				cols = append(cols, ic.Name)
+			}
+			return cols
+		}
+	}
+	return nil
+}
+
+// partitionValueToString converts a partition value node to SQL string.
+func partitionValueToString(v nodes.Node, ptype nodes.PartitionType) string {
+	switch n := v.(type) {
+	case *nodes.String:
+		if n.Str == "MAXVALUE" {
+			return "MAXVALUE"
+		}
+		return n.Str
+	case *nodes.List:
+		parts := make([]string, len(n.Items))
+		for i, item := range n.Items {
+			if subList, ok := item.(*nodes.List); ok {
+				// Tuple: (val1, val2) for multi-column LIST COLUMNS
+				subParts := make([]string, len(subList.Items))
+				for j, sub := range subList.Items {
+					subParts[j] = partitionBoundSQL(sub)
+				}
+				parts[i] = "(" + strings.Join(subParts, ",") + ")"
+			} else {
+				parts[i] = partitionBoundSQL(item)
+			}
+		}
+		return strings.Join(parts, ",")
+	case nodes.ExprNode:
+		return nodeToSQL(n)
+	default:
+		return ""
+	}
+}
+
+// partitionBoundSQL renders one bound in a partition's value list. MAXVALUE
+// reaches it as a String beside the expressions, as in RANGE COLUMNS
+// VALUES LESS THAN (5, MAXVALUE); asserting every item to an expression
+// panicked Exec on that statement.
+func partitionBoundSQL(n nodes.Node) string {
+	switch n := n.(type) {
+	case *nodes.String:
+		return n.Str
+	case nodes.ExprNode:
+		return nodeToSQL(n)
+	}
+	return ""
+}
+
+// validateForeignKeys checks all FK constraints on a table against the referenced tables.
+// It validates: (1) referenced table exists, (2) referenced columns have an index,
+// (3) column types are compatible.
+func (c *Catalog) validateForeignKeys(db *Database, tbl *Table) error {
+	for _, con := range tbl.Constraints {
+		if con.Type != ConForeignKey {
+			continue
+		}
+		if err := c.validateSingleFK(db, tbl, con); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateSingleFK validates a single FK constraint against its referenced table.
+func (c *Catalog) validateSingleFK(db *Database, tbl *Table, con *Constraint) error {
+	// Resolve the referenced table.
+	refDBName := con.RefDatabase
+	var refDB *Database
+	if refDBName != "" {
+		refDB = c.GetDatabase(refDBName)
+	} else {
+		refDB = db
+	}
+
+	var refTbl *Table
+	if refDB != nil {
+		// Self-referencing FK: the table being created references itself.
+		if toLower(con.RefTable) == toLower(tbl.Name) && refDB == db {
+			refTbl = tbl
+		} else {
+			refTbl = refDB.GetTable(con.RefTable)
+		}
+	}
+
+	if refTbl == nil {
+		return errFKIncorrectlyFormed(db.Name, tbl.Name)
+	}
+
+	// Check that referenced columns have an index (PK or UNIQUE or KEY)
+	// that starts with the referenced columns in order.
+	if !hasIndexOnColumns(refTbl, con.RefColumns) {
+		return errFKIncorrectlyFormed(db.Name, tbl.Name)
+	}
+
+	// Check column type compatibility.
+	for i, colName := range con.Columns {
+		if i >= len(con.RefColumns) {
+			break
+		}
+		col := tbl.GetColumn(colName)
+		refCol := refTbl.GetColumn(con.RefColumns[i])
+		if col == nil || refCol == nil {
+			continue
+		}
+		if (strings.EqualFold(con.OnDelete, "SET NULL") || strings.EqualFold(con.OnUpdate, "SET NULL")) && !col.Nullable {
+			return &Error{Code: 1830, SQLState: "HY000", Message: "Column cannot be NOT NULL: needed in a foreign key constraint"}
+		}
+		// MariaDB takes a foreign key over a generated column, virtual or
+		// stored, on either side. MySQL 8.0 answers
+		// ER_FK_CANNOT_USE_VIRTUAL_COLUMN (3104) for a virtual one. Measured on
+		// mariadb:11.8.8.
+		if !fkTypesCompatible(col, refCol) {
+			return errFKIncorrectlyFormed(db.Name, tbl.Name)
+		}
+	}
+
+	return nil
+}
+
+// hasIndexOnColumns checks whether a table has an index (PK, UNIQUE, or regular KEY)
+// whose leading columns match the given columns.
+func hasIndexOnColumns(tbl *Table, cols []string) bool {
+	for _, idx := range tbl.Indexes {
+		if len(idx.Columns) < len(cols) {
+			continue
+		}
+		match := true
+		for i, col := range cols {
+			if toLower(idx.Columns[i].Name) != toLower(col) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// fkTypesCompatible checks whether two columns have compatible types for FK relationships.
+// MySQL requires that FK and referenced columns have the same storage type.
+func fkTypesCompatible(col, refCol *Column) bool {
+	// Compare base data types.
+	if col.DataType != refCol.DataType {
+		return false
+	}
+
+	// For integer types, check signedness (unsigned must match).
+	colUnsigned := strings.Contains(strings.ToLower(col.ColumnType), "unsigned")
+	refUnsigned := strings.Contains(strings.ToLower(refCol.ColumnType), "unsigned")
+	if colUnsigned != refUnsigned {
+		return false
+	}
+
+	// For string types, check charset compatibility.
+	if isStringType(col.DataType) {
+		colCharset := col.Charset
+		refCharset := refCol.Charset
+		if colCharset != "" && refCharset != "" && toLower(colCharset) != toLower(refCharset) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// extractColumnNames returns column names from an AST constraint.
+func extractColumnNames(con *nodes.Constraint) []string {
+	if len(con.IndexColumns) > 0 {
+		names := make([]string, 0, len(con.IndexColumns))
+		for _, ic := range con.IndexColumns {
+			if cr, ok := ic.Expr.(*nodes.ColumnRef); ok && !ic.Functional {
+				names = append(names, cr.Column)
+			}
+		}
+		return names
+	}
+	return con.Columns
+}
+
+// buildIndexColumns converts AST IndexColumn list to catalog IndexColumn list.
+func buildIndexColumns(con *nodes.Constraint) []*IndexColumn {
+	if len(con.IndexColumns) > 0 {
+		result := make([]*IndexColumn, 0, len(con.IndexColumns))
+		for _, ic := range con.IndexColumns {
+			idxCol := &IndexColumn{
+				Length:          ic.Length,
+				Descending:      ic.Desc,
+				WithoutOverlaps: ic.WithoutOverlaps,
+			}
+			if cr, ok := ic.Expr.(*nodes.ColumnRef); ok && !ic.Functional {
+				idxCol.Name = cr.Column
+			} else {
+				idxCol.Expr = nodeToSQL(ic.Expr)
+				idxCol.ExprNode = ic.Expr
+			}
+			result = append(result, idxCol)
+		}
+		return result
+	}
+	// Fallback to simple column names.
+	result := make([]*IndexColumn, 0, len(con.Columns))
+	for _, name := range con.Columns {
+		result = append(result, &IndexColumn{Name: name})
+	}
+	return result
+}
+
+// allocIndexName generates a unique index name based on the first column,
+// appending _2, _3, etc. on collision.
+func allocIndexName(tbl *Table, baseName string) string {
+	candidate := baseName
+	suffix := 2
+	if strings.EqualFold(candidate, "PRIMARY") {
+		candidate = fmt.Sprintf("%s_%d", baseName, suffix)
+		suffix++
+	}
+	for indexNameExists(tbl, candidate) {
+		candidate = fmt.Sprintf("%s_%d", baseName, suffix)
+		suffix++
+	}
+	return candidate
+}
+
+func validateNonPrimaryIndexName(name string) error {
+	if strings.EqualFold(name, "PRIMARY") {
+		return errWrongNameForIndex(name)
+	}
+	return nil
+}
+
+// hasIndexCoveringColumns returns true if the table already has an index whose
+// leading columns match the given FK columns (left-prefix match). MySQL 8.0
+// reuses such an index instead of creating an implicit backing index for the FK.
+func hasIndexCoveringColumns(tbl *Table, fkCols []string) bool {
+	for _, idx := range tbl.Indexes {
+		if len(idx.Columns) < len(fkCols) {
+			continue
+		}
+		match := true
+		for i, col := range fkCols {
+			if !strings.EqualFold(idx.Columns[i].Name, col) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// fkName returns the name a foreign key takes, and the index it adds when
+// none serves it: the CONSTRAINT symbol, else the name after FOREIGN KEY,
+// else "" for a generated one (verified on 11.8.9).
+func fkName(con *nodes.Constraint) string {
+	if con.Name != "" {
+		return con.Name
+	}
+	return con.IndexName
+}
+
+// ensureFKBackingIndex creates an implicit backing index for FK columns
+// if no existing index already covers them (MySQL 8.0 behavior).
+// MySQL uses the constraint name as the index name when provided;
+// otherwise falls back to the first column name via allocIndexName.
+func ensureFKBackingIndex(tbl *Table, conName string, cols []string, idxCols []*IndexColumn) {
+	insertFKBackingIndex(tbl, conName, cols, idxCols, len(tbl.Indexes))
+}
+
+// insertFKBackingIndex is ensureFKBackingIndex with the place the index takes
+// among the table's own. The server builds a backing index where its clause
+// stands, so one stays before a key the statement declares later: measured on
+// mariadb:11.8.8, `FOREIGN KEY (a) REFERENCES p(id), KEY z(b)` shows
+// KEY `a` then KEY `z`, and `KEY z(b), FOREIGN KEY (a)` the other way round.
+// A column-level REFERENCES counts from its column: `a INT REFERENCES p(id),
+// b INT, KEY z(b)` shows KEY `a` first.
+//
+// It reports whether an index was made.
+func insertFKBackingIndex(tbl *Table, conName string, cols []string, idxCols []*IndexColumn, at int) bool {
+	if hasIndexCoveringColumns(tbl, cols) {
+		return false
+	}
+	idxName := conName
+	if idxName == "" {
+		idxName = allocIndexName(tbl, cols[0])
+	}
+	idx := &Index{
+		Name:    idxName,
+		Table:   tbl,
+		Columns: idxCols,
+		Visible: true,
+	}
+	if at < 0 || at > len(tbl.Indexes) {
+		at = len(tbl.Indexes)
+	}
+	tbl.Indexes = append(tbl.Indexes, nil)
+	copy(tbl.Indexes[at+1:], tbl.Indexes[at:])
+	tbl.Indexes[at] = idx
+	return true
+}
+
+func indexNameExists(tbl *Table, name string) bool {
+	key := toLower(name)
+	for _, idx := range tbl.Indexes {
+		if toLower(idx.Name) == key {
+			return true
+		}
+	}
+	return false
+}
+
+// validateKeyPartPrefixes rejects a key part with an explicit zero-length prefix
+// (e.g. `c(0)`), which MariaDB reports as 1391 on the CREATE TABLE, CREATE INDEX
+// and ALTER ADD key paths, across every column type and key kind including
+// FULLTEXT. The parser records whether a prefix was written (HasPrefix), so
+// `c(0)` (invalid) is distinct from a bare `c` (no prefix, valid). Runs before
+// validateIndexColumns so a BLOB/TEXT `b(0)` is reported as 1391 rather than the
+// 1170 missing-key-length error.
+//
+// SPATIAL keys are excluded: MariaDB forbids a prefix on a SPATIAL key part at
+// parse time (1064 for any length, not 1391), and orrery's shared key-part parser
+// currently accepts such prefixes regardless of length — a pre-existing
+// parser-level gap independent of this zero-length check. Reporting a SPATIAL
+// `g(0)` as 1391 here would diverge from MariaDB's 1064, so leave it untouched.
+func validateKeyPartPrefixes(cols []*nodes.IndexColumn, spatial bool) error {
+	if spatial {
+		return nil
+	}
+	for _, ic := range cols {
+		if !ic.HasPrefix || ic.Length > 0 {
+			continue
+		}
+		name := ""
+		if cr, ok := ic.Expr.(*nodes.ColumnRef); ok {
+			name = cr.Column
+		}
+		return errKeyPartZeroLength(name)
+	}
+	return nil
+}
+
+func validateIndexColumns(tbl *Table, idxCols []*IndexColumn, fulltext, spatial bool) error {
+	for _, ic := range idxCols {
+		if ic.Name == "" {
+			continue
+		}
+		col := tbl.GetColumn(ic.Name)
+		if col == nil {
+			continue
+		}
+		// A key over a VIRTUAL generated column materializes its value, and
+		// the server then refuses a non-deterministic expression for it —
+		// when the key arrives later as much as when the column is declared
+		// with one. Measured on mariadb:11.8.8 against
+		// `CREATE TABLE t (a DOUBLE AS (RAND()) VIRTUAL)`: 1901 for
+		// `CREATE INDEX idx ON t(a)`, `ALTER TABLE t ADD INDEX idx(a)`,
+		// `ADD UNIQUE idx(a)` and for an index that covers the column
+		// second, and 1901 before the key-length 1170 where both apply.
+		if col.Generated != nil && col.Generated.Nondeterministic != "" {
+			return errNondeterministicGeneratedColumn(col.Generated.Nondeterministic, col.Name)
+		}
+		// The value may also come from another generated column, which
+		// carries its nondeterminism here. See nondeterministicDependency.
+		if dep := nondeterministicDependency(tbl, col, nil); dep != "" {
+			return errUnusableInGeneratedColumn(dep, col.Name)
+		}
+		if spatial {
+			if col.Nullable {
+				return &Error{Code: 1252, SQLState: "42000", Message: "All parts of a SPATIAL index must be NOT NULL"}
+			}
+			continue
+		}
+		if !fulltext && isTextBlobType(col.DataType) && ic.Length == 0 {
+			return &Error{Code: 1170, SQLState: "42000", Message: "BLOB/TEXT column used in key specification without a key length"}
+		}
+		if ic.Length > 0 {
+			if maxLen, ok := fixedLengthStringColumnLimit(col); ok && ic.Length > maxLen {
+				return &Error{Code: 1089, SQLState: "HY000", Message: "Incorrect prefix key; the used key part isn't a string, the used length is longer than the key part, or the storage engine doesn't support unique prefix keys"}
+			}
+		}
+	}
+	return nil
+}
+
+func fixedLengthStringColumnLimit(col *Column) (int, bool) {
+	switch strings.ToLower(col.DataType) {
+	case "char", "varchar", "binary", "varbinary":
+	default:
+		return 0, false
+	}
+	open := strings.IndexByte(col.ColumnType, '(')
+	close := strings.IndexByte(col.ColumnType, ')')
+	if open < 0 || close <= open+1 {
+		return 0, false
+	}
+	n := 0
+	for _, ch := range col.ColumnType[open+1 : close] {
+		if ch < '0' || ch > '9' {
+			return 0, false
+		}
+		n = n*10 + int(ch-'0')
+	}
+	return n, n > 0
+}
+
+func coerceInnoDBHashIndex(tbl *Table, idx *Index) {
+	if strings.EqualFold(tbl.Engine, "InnoDB") && strings.EqualFold(idx.IndexType, "HASH") {
+		idx.IndexType = "BTREE"
+	}
+}
+
+func constraintNameExistsInTable(tbl *Table, typ ConstraintType, name string) bool {
+	key := toLower(name)
+	for _, con := range tbl.Constraints {
+		if con.Type == typ && toLower(con.Name) == key {
+			return true
+		}
+	}
+	return false
+}
+
+// checkConstraintNameExists reports whether the table already holds a CHECK of
+// that name. MariaDB scopes a CHECK constraint's name to its table: two tables
+// in one schema may each hold a `my_rule`. MySQL 8.0 scopes the name to the
+// schema and answers ER_CHECK_CONSTRAINT_DUP_NAME (3822) for the second.
+// Measured on mariadb:11.8.8. The db argument is kept for the call sites that
+// have no pending table yet.
+//
+// A check that belongs to a column is not one of those names: measured,
+// `CREATE TABLE t (j JSON, a INT, CONSTRAINT j CHECK (a > 0))` is accepted
+// beside the json_valid check column j carries, and the table then holds two
+// checks named j. Two checks the statements named collide as before.
+func checkConstraintNameExists(db *Database, pending *Table, name string) bool {
+	if pending == nil {
+		return false
+	}
+	key := toLower(name)
+	for _, con := range pending.Constraints {
+		if con.Type == ConCheck && !isColumnCheck(con) && toLower(con.Name) == key {
+			return true
+		}
+	}
+	return false
+}
+
+func foreignKeyConstraintNameExists(db *Database, pending *Table, name string) bool {
+	if pending != nil && constraintNameExistsInTable(pending, ConForeignKey, name) {
+		return true
+	}
+	key := toLower(name)
+	for _, tbl := range db.Tables {
+		for _, con := range tbl.Constraints {
+			if con.Type == ConForeignKey && toLower(con.Name) == key {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func indexTypeOrDefault(indexType, defaultType string) string {
+	if indexType != "" {
+		return indexType
+	}
+	return defaultType
+}
+
+// resolveIndexUsingType returns the index type a statement declares, from the two
+// positions the grammar lets an index_type clause stand in: before the key parts
+// (the dedicated indexType slot) and among the index_option list after them.
+//
+// A statement may fill both, and the one written last stands, which is why the
+// options are scanned after the leading slot rather than before it. Read against
+// mysql:8.0 on 2026-11-04 through SHOW CREATE TABLE, which echoes the type it kept:
+// `CREATE INDEX i ON t (a) TYPE BTREE` comes back as `USING BTREE`, while
+// `CREATE INDEX i TYPE BTREE ON t (a) TYPE HASH` and
+// `KEY k USING BTREE (a) USING HASH` come back with no index type at all, the HASH
+// each of them kept having become a BTREE index by itself.
+//
+// Either spelling of the clause, USING or TYPE, reaches here as an option named
+// USING. "" means the statement named no index type.
+func resolveIndexUsingType(indexType string, opts []*nodes.IndexOption) string {
+	declared := strings.ToUpper(indexType)
+	for _, opt := range opts {
+		if strings.EqualFold(opt.Name, "USING") {
+			if s, ok := opt.Value.(*nodes.StringLit); ok {
+				declared = strings.ToUpper(s.Value)
+			}
+		}
+	}
+	return declared
+}
+
+// resolveConstraintIndexType returns the index type from a constraint, from either
+// of the positions resolveIndexUsingType reads.
+func resolveConstraintIndexType(con *nodes.Constraint) string {
+	return resolveIndexUsingType(con.IndexType, con.IndexOptions)
+}
+
+// applyIndexOptions extracts COMMENT, [NOT] IGNORED, and KEY_BLOCK_SIZE
+// from AST IndexOptions and applies them to the given Index.
+//
+// Index.Visible is false for a MariaDB IGNORED index. The last ignorability
+// written wins. VISIBLE changes nothing: MariaDB takes it for MySQL 8.0
+// compatibility only, so `IGNORED VISIBLE` stays ignored. Neither does an
+// INVISIBLE, which the parser lets through only inside a comment MariaDB skips
+// by its MySQL version, so MariaDB never reads it (verified on 11.8.8).
+func applyIndexOptions(idx *Index, opts []*nodes.IndexOption) {
+	for _, opt := range opts {
+		// An engine-defined option's name is the engine's, so a quoted `comment`=1 is
+		// not a COMMENT.
+		if opt.Engine {
+			idx.EngineOptions = setEngineOption(idx.EngineOptions, opt)
+			continue
+		}
+		switch strings.ToUpper(opt.Name) {
+		case "COMMENT":
+			if s, ok := opt.Value.(*nodes.StringLit); ok {
+				idx.Comment = s.Value
+			}
+		case "IGNORED":
+			idx.Visible = false
+		case "NOT IGNORED":
+			idx.Visible = true
+		case "KEY_BLOCK_SIZE":
+			switch n := opt.Value.(type) {
+			case *nodes.Integer:
+				idx.KeyBlockSize = int(n.Ival)
+			case *nodes.IntLit:
+				idx.KeyBlockSize = int(n.Value)
+			}
+		}
+	}
+}
+
+// engineOptionText writes an engine-defined option as MariaDB 11.8.8's SHOW CREATE
+// TABLE does: the name quoted as written, a word or a number bare, a string quoted.
+// VECTOR KEY `i` (`v`) COMMENT 'c' `M`=6 `DISTANCE`=cosine
+func engineOptionText(opt *nodes.IndexOption) string {
+	// DEFAULT has no value, so it prints nothing.
+	switch v := opt.Value.(type) {
+	case *nodes.StringLit:
+		if opt.ValueIsWord {
+			return fmt.Sprintf("`%s`=%s", opt.Name, v.Value)
+		}
+		return fmt.Sprintf("`%s`='%s'", opt.Name, escapeComment(v.Value))
+	case *nodes.IntLit:
+		return fmt.Sprintf("`%s`=%d", opt.Name, v.Value)
+	}
+	return ""
+}
+
+// setEngineOption applies one engine-defined option to the list SHOW CREATE TABLE prints. The
+// last setting of a name wins whatever its case, and moves to where it was written: 11.8.8 prints
+// `DISTANCE`=cosine `M`=7 for M=6 DISTANCE=cosine M=7. DEFAULT clears it: M=6 M=DEFAULT prints
+// nothing, and m=6 M=DEFAULT does too.
+func setEngineOption(options []string, opt *nodes.IndexOption) []string {
+	prefix := toLower("`" + opt.Name + "`=")
+	kept := options[:0:0]
+	for _, text := range options {
+		if !strings.HasPrefix(toLower(text), prefix) {
+			kept = append(kept, text)
+		}
+	}
+	if text := engineOptionText(opt); text != "" {
+		kept = append(kept, text)
+	}
+	return kept
+}
+
+// validateVectorIndex holds a VECTOR key to what MariaDB 11.8.8 refuses when the
+// statement runs: a column that is no vector (1210), a column that may be NULL (1252),
+// and a second vector index on the table (1235).
+func validateVectorIndex(tbl *Table, idxCols []*IndexColumn) error {
+	for _, idx := range tbl.Indexes {
+		if idx.Vector {
+			return &Error{Code: 1235, SQLState: "42000", Message: "This version of MariaDB doesn't yet support 'multiple VECTOR indexes'"}
+		}
+	}
+	for _, ic := range idxCols {
+		col := tbl.GetColumn(ic.Name)
+		if col == nil {
+			return errKeyColumnDoesNotExist(ic.Name)
+		}
+		if !strings.EqualFold(col.DataType, "vector") {
+			return &Error{Code: 1210, SQLState: "HY000", Message: "Incorrect arguments to VECTOR INDEX"}
+		}
+		if col.Nullable {
+			return &Error{Code: 1252, SQLState: "42000", Message: "All parts of a VECTOR index must be NOT NULL"}
+		}
+	}
+	return nil
+}
+
+// nextFKGeneratedNumber returns the next available counter for an auto-generated
+// InnoDB FK constraint name of the form "<tableName>_ibfk_<N>".
+//
+// This matches MySQL 8.0's behavior in sql/sql_table.cc:5843
+// (get_fk_max_generated_name_number): it scans existing FK constraints on the
+// table, parses any name that looks like "<tableName>_ibfk_<digits>" as a
+// generated name, and returns max(N)+1 (or 1 if no such names exist).
+//
+// Bytebase orrery catalog is case-insensitive on table names (we lowercase the
+// prefix before comparison). MySQL's own comparison is case-sensitive on
+// already-lowered names, so this is equivalent for typical use.
+//
+// As in MySQL, pre-4.0.18-style names ("<tableName>_ibfk_0<digits>") are
+// ignored — we skip anything whose counter substring starts with '0'.
+func nextFKGeneratedNumber(tbl *Table, tableName string) int {
+	prefix := toLower(tableName) + "_ibfk_"
+	max := 0
+	for _, con := range tbl.Constraints {
+		if con.Type != ConForeignKey {
+			continue
+		}
+		name := toLower(con.Name)
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		rest := name[len(prefix):]
+		if rest == "" || rest[0] == '0' {
+			continue
+		}
+		n := 0
+		ok := true
+		for _, ch := range rest {
+			if ch < '0' || ch > '9' {
+				ok = false
+				break
+			}
+			n = n*10 + int(ch-'0')
+		}
+		if !ok {
+			continue
+		}
+		if n > max {
+			max = n
+		}
+	}
+	return max + 1
+}
+
+// allocCheckName names a table-level CHECK the statement left unnamed. The
+// server takes the lowest CONSTRAINT_<n> that is free, counting both the names
+// the table already holds and the ones the same statement gives explicitly —
+// so a name declared further along is reserved before the unnamed ones are
+// filled in. declared holds those, lowered; nil where there are none.
+//
+// Measured on mariadb:11.8.8:
+//
+//	CREATE TABLE t (a INT, CHECK (a > 0), CONSTRAINT CONSTRAINT_1 CHECK (a < 9))
+//
+// holds CONSTRAINT_2 and CONSTRAINT_1, and with a third unnamed check after
+// them that one is CONSTRAINT_3; over an explicit CONSTRAINT_2 two unnamed
+// checks are CONSTRAINT_1 and CONSTRAINT_3. It is the lowest free number
+// rather than one past the highest: a table holding CONSTRAINT_5 takes
+// CONSTRAINT_1 for the next unnamed check, on CREATE and on ALTER alike.
+// Only an explicit table-level CHECK reserves a name — a column's check,
+// named after the column, and a foreign key of that name do not, and the
+// server will write two constraints of one name rather than skip it.
+func allocCheckName(db *Database, tbl *Table, declared map[string]bool) string {
+	return (&checkNamer{reserved: declared}).alloc(db, tbl)
+}
+
+// checkNamer hands out those names over a run of constraints, carrying the
+// number it has reached from one to the next. Starting again at 1 for each of
+// them, with a scan of the table's constraints for every candidate, made a
+// statement holding many unnamed checks cubic in their number: 1,200 of them
+// took 27 seconds.
+//
+// The number only rises while a statement adds constraints, which is what lets
+// it carry. A statement that drops one frees a lower number again — measured,
+// `ALTER TABLE t DROP CONSTRAINT CONSTRAINT_1, ADD CHECK (a < 9)` names the
+// new check CONSTRAINT_1 — so each ALTER command starts a namer of its own,
+// adding at most one check, while a CREATE TABLE's run shares one.
+type checkNamer struct {
+	reserved map[string]bool // the names this statement gives explicitly
+	next     int             // the lowest number not yet handed out or ruled out
+}
+
+func (n *checkNamer) alloc(db *Database, tbl *Table) string {
+	if n.next < 1 {
+		n.next = 1
+	}
+	for {
+		name := fmt.Sprintf("CONSTRAINT_%d", n.next)
+		n.next++
+		if n.reserved[toLower(name)] {
+			continue
+		}
+		if !checkConstraintNameExists(db, tbl, name) {
+			return name
+		}
+	}
+}
+
+// declaredCheckNames collects the names a statement's table-level CHECK
+// constraints give explicitly, lowered, which allocCheckName reserves.
+func declaredCheckNames(cons []*nodes.Constraint) map[string]bool {
+	var declared map[string]bool
+	for _, con := range cons {
+		if con == nil || con.Type != nodes.ConstrCheck || con.Name == "" {
+			continue
+		}
+		if declared == nil {
+			declared = map[string]bool{}
+		}
+		declared[toLower(con.Name)] = true
+	}
+	return declared
+}
+
+func isStringType(dt string) bool {
+	switch dt {
+	case "char", "varchar", "tinytext", "text", "mediumtext", "longtext",
+		"enum", "set":
+		return true
+	}
+	return false
+}
+
+// convertToBinaryType converts a string-type column with CHARACTER SET binary
+// to the equivalent binary type (char->binary, varchar->varbinary, text->blob, etc.).
+func convertToBinaryType(col *Column, dt *nodes.DataType) *Column {
+	switch col.DataType {
+	case "char":
+		col.DataType = "binary"
+		length := dt.Length
+		if length == 0 {
+			length = 1
+		}
+		col.ColumnType = fmt.Sprintf("binary(%d)", length)
+	case "varchar":
+		col.DataType = "varbinary"
+		col.ColumnType = fmt.Sprintf("varbinary(%d)", dt.Length)
+	case "tinytext":
+		col.DataType = "tinyblob"
+		col.ColumnType = "tinyblob"
+	case "text":
+		col.DataType = "blob"
+		col.ColumnType = "blob"
+	case "mediumtext":
+		col.DataType = "mediumblob"
+		col.ColumnType = "mediumblob"
+	case "longtext":
+		col.DataType = "longblob"
+		col.ColumnType = "longblob"
+	}
+	// Binary types don't have charset/collation in SHOW CREATE TABLE.
+	col.Charset = ""
+	col.Collation = ""
+	return col
+}
+
+func applyBinaryModifierCollation(col *Column, dt *nodes.DataType) {
+	if col == nil || dt == nil || !dt.Binary || col.Charset == "" {
+		return
+	}
+	col.Collation = fmt.Sprintf("%s_bin", normalizeCharsetName(col.Charset))
+}
+
+// nodeToSQLGenerated converts an AST expression to SQL for use in a generated
+// column definition.
+
+// isRowColumnType reports whether a column has a type valid for a
+// system-versioning ROW START/END column: TIMESTAMP(6) for timestamp-precise
+// versioning, or BIGINT UNSIGNED for transaction-precise versioning.
+func isRowColumnType(col *Column) bool {
+	return strings.EqualFold(col.ColumnType, "timestamp(6)") ||
+		strings.EqualFold(col.ColumnType, "bigint(20) unsigned")
+}
+
+// checkDuplicateRowColumns rejects a second ROW START or ROW END column (4134).
+// It is independent of versioning — MariaDB rejects duplicates even when a
+// WITHOUT column would otherwise normalize the table to plain.
+func checkDuplicateRowColumns(tbl *Table) error {
+	var rowStart, rowEnd bool
+	for _, col := range tbl.Columns {
+		if col.Generated == nil {
+			continue
+		}
+		switch col.Generated.RowBound {
+		case "ROW START":
+			if rowStart {
+				return errDuplicateRowColumn("ROW START", col.Name)
+			}
+			rowStart = true
+		case "ROW END":
+			if rowEnd {
+				return errDuplicateRowColumn("ROW END", col.Name)
+			}
+			rowEnd = true
+		}
+	}
+	return nil
+}
+
+// validateApplicationTimePeriod enforces MariaDB's rules for a named
+// (application-time) PERIOD FOR <name> (start, end), grounded vs 11.8.8.
+func validateApplicationTimePeriod(tbl *Table, stmt *nodes.CreateTableStmt) error {
+	if tbl.AppPeriodName == "" {
+		return nil
+	}
+	if stmt.AppPeriodDuplicate {
+		return errMultipleAppPeriods() // 4154
+	}
+	return validateAppPeriodColumns(tbl, tbl.AppPeriodName, tbl.AppPeriodStartCol, tbl.AppPeriodEndCol)
+}
+
+// validateAppPeriodColumns enforces the column-level rules for an application-
+// time period: distinct start/end (1110), the period name not colliding with a
+// column (1060), and both columns existing (1054) with a temporal type (1063).
+// Shared by CREATE TABLE and ALTER TABLE ... ADD PERIOD. Grounded vs 11.8.8.
+func validateAppPeriodColumns(tbl *Table, name, startCol, endCol string) error {
+	if strings.EqualFold(startCol, endCol) {
+		return errColumnSpecifiedTwice(startCol) // 1110
+	}
+	if tbl.GetColumn(name) != nil {
+		return errDupColumn(name) // 1060: period name collides with a column
+	}
+	for _, colName := range []string{startCol, endCol} {
+		col := tbl.GetColumn(colName)
+		if col == nil {
+			return errNoSuchColumn(colName, name) // 1054
+		}
+		if !isTemporalPeriodType(col.DataType) {
+			return errIncorrectColumnSpecifier(colName) // 1063
+		}
+	}
+	// Both columns must have the same type, including precision (e.g. date vs
+	// datetime, or datetime(3) vs datetime(6), is rejected).
+	if s, e := tbl.GetColumn(startCol), tbl.GetColumn(endCol); !strings.EqualFold(s.ColumnType, e.ColumnType) {
+		return errPeriodFieldsDifferentTypes(name) // 4153
+	}
+	return nil
+}
+
+// isTemporalPeriodType reports whether a type is valid for a period column.
+func isTemporalPeriodType(dataType string) bool {
+	switch toLower(dataType) {
+	case "date", "datetime", "timestamp":
+		return true
+	}
+	return false
+}
+
+// validateSystemVersioning enforces MariaDB's structural rules for
+// system-versioned tables. It is applied after CREATE and after an ALTER (so a
+// multi-command "ADD COLUMN ... ROW START, ADD PERIOD, ADD SYSTEM VERSIONING"
+// validates as a whole):
+//   - PERIOD FOR SYSTEM_TIME, ROW START/END columns, and a column-level WITH
+//     SYSTEM VERSIONING are only valid on a system-versioned table (else 4125).
+//   - On a system-versioned table, explicit PERIOD and ROW START/END columns
+//     must be present together and reference each other (else 4123) — this
+//     rejects row columns without a period, a period on ordinary columns, and a
+//     period that names columns other than the ROW START/END pair.
+func validateSystemVersioning(tbl *Table) error {
+	var rowStart, rowEnd string
+	var rowStartCol, rowEndCol *Column
+	versionedCols := 0 // columns that are neither row-bound nor WITHOUT
+	for _, col := range tbl.Columns {
+		if col.Generated != nil && col.Generated.RowBound != "" {
+			// Detect duplicate bounds here (4134); the column TYPE is validated
+			// last — MariaDB reports structural errors before the row-column type.
+			switch col.Generated.RowBound {
+			case "ROW START":
+				if rowStart != "" {
+					return errDuplicateRowColumn("ROW START", col.Name)
+				}
+				rowStart, rowStartCol = col.Name, col
+			case "ROW END":
+				if rowEnd != "" {
+					return errDuplicateRowColumn("ROW END", col.Name)
+				}
+				rowEnd, rowEndCol = col.Name, col
+			}
+			continue
+		}
+		if col.SystemVersioning != "WITHOUT" {
+			versionedCols++
+		}
+	}
+	hasPeriod := tbl.PeriodStartCol != ""
+	hasRowCols := rowStart != "" || rowEnd != ""
+
+	if !tbl.SystemVersioned {
+		// PERIOD / ROW START/END columns are invalid on a non-versioned table
+		// (4125). A column-level WITH/WITHOUT is allowed to remain (e.g. after
+		// DROP SYSTEM VERSIONING) — adding one to a plain table is already
+		// rejected up front by the ALTER pre-check.
+		if hasPeriod || hasRowCols {
+			return errMissingSystemVersioning(tbl.Name)
+		}
+		return nil
+	}
+
+	// Structural rules first — MariaDB checks these before the ROW column type.
+	// Explicit PERIOD and ROW START/END columns must be present together and
+	// reference each other; MariaDB distinguishes the malformed shapes by code.
+	if err := periodRowColumnError(tbl, rowStart, rowEnd, hasPeriod); err != nil {
+		return err
+	}
+	// A system-versioned table must have at least one versioned column.
+	if versionedCols == 0 {
+		return errNoVersionedColumn(tbl.Name)
+	}
+	// ROW START/END column type is validated last (4110).
+	return validateRowColumnTypes(tbl, rowStartCol, rowEndCol)
+}
+
+// validateRowColumnTypes enforces that the ROW START/END columns are a valid
+// version type (TIMESTAMP(6) or BIGINT UNSIGNED) and share the same precision
+// mode. It runs only after the structural checks pass, so MariaDB's precedence
+// (structural errors before 4110) is preserved.
+func validateRowColumnTypes(tbl *Table, rowStartCol, rowEndCol *Column) error {
+	for _, col := range []*Column{rowStartCol, rowEndCol} {
+		if col != nil && !isRowColumnType(col) {
+			return errWrongRowColumnType(tbl.Name, col.Name)
+		}
+	}
+	if rowStartCol != nil && rowEndCol != nil &&
+		!strings.EqualFold(rowStartCol.ColumnType, rowEndCol.ColumnType) {
+		return errWrongRowColumnType(tbl.Name, rowEndCol.Name)
+	}
+	return nil
+}
+
+// periodRowColumnError checks the structural relationship between the PERIOD
+// FOR SYSTEM_TIME clause and the ROW START/END columns on a system-versioned
+// table, returning the MariaDB-faithful error (or nil). Grounded vs 11.8.8:
+//   - both row cols present, period names other columns -> 4126
+//   - both row cols present, no period                  -> 4125 (missing PERIOD)
+//   - period present, no row cols at all                -> 4125 (missing AS ROW START)
+//   - an incomplete ROW START/END pair (only one bound) -> 4123
+func periodRowColumnError(tbl *Table, rowStart, rowEnd string, hasPeriod bool) error {
+	hasBothRowCols := rowStart != "" && rowEnd != ""
+	switch {
+	case hasBothRowCols && hasPeriod:
+		if !strings.EqualFold(tbl.PeriodStartCol, rowStart) ||
+			!strings.EqualFold(tbl.PeriodEndCol, rowEnd) {
+			return errPeriodWrongColumns(rowStart, rowEnd)
+		}
+		return nil
+	case hasBothRowCols:
+		return errMissingPeriod(tbl.Name)
+	case hasPeriod && rowStart == "" && rowEnd == "":
+		return errMissingRowStart(tbl.Name)
+	case hasPeriod || rowStart != "" || rowEnd != "":
+		return errNoVersionedColumn(tbl.Name)
+	}
+	return nil
+}
+
+// rowBoundSQL maps a parsed ROW START/END bound to its SHOW CREATE text.
+func rowBoundSQL(rb nodes.RowBoundKind) string {
+	switch rb {
+	case nodes.RowBoundStart:
+		return "ROW START"
+	case nodes.RowBoundEnd:
+		return "ROW END"
+	default:
+		return ""
+	}
+}
+
+// colVersioningSQL maps a parsed column WITH/WITHOUT SYSTEM VERSIONING to text.
+func colVersioningSQL(v nodes.ColVersioning) string {
+	switch v {
+	case nodes.ColVersioningWith:
+		return "WITH"
+	case nodes.ColVersioningWithout:
+		return "WITHOUT"
+	default:
+		return ""
+	}
+}
+
+func nodeToSQLGenerated(node nodes.ExprNode, charset string) string {
+	if node == nil {
+		return ""
+	}
+	switch n := node.(type) {
+	case *nodes.ColumnRef:
+		if n.Table != "" {
+			return backtickIDQ(n.Table) + "." + backtickIDQ(n.Column)
+		}
+		return backtickIDQ(n.Column)
+	case *nodes.IntLit:
+		return fmt.Sprintf("%d", n.Value)
+	case *nodes.StringLit:
+		// MariaDB writes a string literal plainly in a generated column's
+		// expression: concat(`a`,' ',`b`). MySQL 8.0 prefixes it with a charset
+		// introducer, _utf8mb4' '. Measured on mariadb:11.8.8.
+		return "'" + n.Value + "'"
+	case *nodes.FuncCallExpr:
+		funcName := strings.ToLower(n.Name)
+		if n.Star {
+			return funcName + "(*)"
+		}
+		var args []string
+		for _, a := range n.Args {
+			args = append(args, nodeToSQLGenerated(a, charset))
+		}
+		return funcName + "(" + strings.Join(args, ",") + ")"
+	case *nodes.NullLit:
+		return "NULL"
+	case *nodes.BoolLit:
+		if n.Value {
+			return "1"
+		}
+		return "0"
+	case *nodes.FloatLit:
+		return n.Value
+	case *nodes.BitLit:
+		val := strings.TrimLeft(n.Value, "0")
+		if val == "" {
+			val = "0"
+		}
+		return "b'" + val + "'"
+	case *nodes.ParenExpr:
+		return "(" + nodeToSQLGenerated(n.Expr, charset) + ")"
+	case *nodes.KeywordArg:
+		// Bare keyword argument (timestampdiff unit, get_format type) —
+		// stored unquoted in generated-column bodies exactly like view bodies.
+		return n.Keyword
+	case *nodes.ExtractExpr:
+		// Oracle mariadb:11.8.8 stored form: extract(day_hour from `a`).
+		return "extract(" + strings.ToLower(n.Unit) + " from " + nodeToSQLGenerated(n.Expr, charset) + ")"
+	case *nodes.PositionExpr:
+		// Oracle mariadb:11.8.8 stored form: locate('x',`s`) — the engine
+		// keeps the function under its other name.
+		return "locate(" + nodeToSQLGenerated(n.Substr, charset) + "," + nodeToSQLGenerated(n.Str, charset) + ")"
+	case *nodes.BinaryExpr:
+		left := nodeToSQLGenerated(n.Left, charset)
+		right := nodeToSQLGenerated(n.Right, charset)
+		// MySQL rewrites JSON operators to function calls in generated column expressions.
+		switch n.Op {
+		case nodes.BinOpJsonExtract:
+			return "json_extract(" + left + "," + right + ")"
+		case nodes.BinOpJsonUnquote:
+			return "json_unquote(json_extract(" + left + "," + right + "))"
+		}
+		op := binaryOpToString(n.Op)
+		return "(" + left + " " + op + " " + right + ")"
+	case *nodes.UnaryExpr:
+		operand := nodeToSQLGenerated(n.Operand, charset)
+		switch n.Op {
+		case nodes.UnaryMinus:
+			return "-" + operand
+		case nodes.UnaryNot:
+			return "NOT " + operand
+		case nodes.UnaryBitNot:
+			return "~" + operand
+		case nodes.UnaryBinary:
+			// The server stores the cast the operator stands for, with no
+			// parentheses of its own around the argument: measured on
+			// mariadb:11.8.8, `b INT AS (BINARY (1 + 2))` comes back
+			// cast(1 + 2 as char charset binary), where writing the operand
+			// bare dropped the operator and left the grouping behind.
+			// This writer parenthesizes every binary expression, and the
+			// argument of a cast carries none, so the pair around it goes.
+			return "cast(" +
+				stripOuterParens(nodeToSQLGenerated(unwrapParens(n.Operand), charset)) +
+				" as char charset binary)"
+		default:
+			return operand
+		}
+	default:
+		return "(?)"
+	}
+}
+
+// unwrapParens strips the parentheses around an expression, which a position
+// that brings its own does not need.
+func unwrapParens(node nodes.ExprNode) nodes.ExprNode {
+	for {
+		p, ok := node.(*nodes.ParenExpr)
+		if !ok {
+			return node
+		}
+		node = p.Expr
+	}
+}
+
+// nodeToSQL writes an expression the way the server stores it. The resolver
+// rewrites are not a view's own: measured on mariadb:11.8.8, a CHECK, a DEFAULT
+// and a generated column all come back with the same ones a view body gets —
+// `(2=1) SOUNDS LIKE '0'` is soundex(2 = 1) = soundex('0'), `NOT (a = 1)` is
+// `a` <> 1, `NOT (a BETWEEN 1 AND 2)` is `a` not between 1 and 2, and
+// `a AND b` over integer columns is `a` <> 0 and `b` <> 0, while
+// `DEFAULT (1 AND 2)` keeps its literals and a bare column in a CHECK stays
+// bare.
+func nodeToSQL(node nodes.ExprNode) string {
+	return deparse.Deparse(deparse.RewriteExpr(node))
+}
+
+func binaryOpToString(op nodes.BinaryOp) string {
+	switch op {
+	case nodes.BinOpAdd:
+		return "+"
+	case nodes.BinOpSub:
+		return "-"
+	case nodes.BinOpMul:
+		return "*"
+	case nodes.BinOpDiv:
+		return "/"
+	case nodes.BinOpMod:
+		return "%"
+	case nodes.BinOpEq:
+		return "="
+	case nodes.BinOpNe:
+		return "!="
+	case nodes.BinOpLt:
+		return "<"
+	case nodes.BinOpGt:
+		return ">"
+	case nodes.BinOpLe:
+		return "<="
+	case nodes.BinOpGe:
+		return ">="
+	case nodes.BinOpAnd:
+		return "and"
+	case nodes.BinOpOr:
+		return "or"
+	case nodes.BinOpBitAnd:
+		return "&"
+	case nodes.BinOpBitOr:
+		return "|"
+	case nodes.BinOpBitXor:
+		return "^"
+	case nodes.BinOpShiftLeft:
+		return "<<"
+	case nodes.BinOpShiftRight:
+		return ">>"
+	case nodes.BinOpDivInt:
+		return "DIV"
+	case nodes.BinOpXor:
+		return "XOR"
+	case nodes.BinOpRegexp:
+		return "REGEXP"
+	case nodes.BinOpLikeEscape:
+		return "LIKE"
+	case nodes.BinOpNullSafeEq:
+		return "<=>"
+	case nodes.BinOpJsonExtract:
+		return "->"
+	case nodes.BinOpJsonUnquote:
+		return "->>"
+	case nodes.BinOpSoundsLike:
+		return "SOUNDS LIKE"
+	default:
+		return "?"
+	}
+}
+
+func formatColumnType(dt *nodes.DataType) string {
+	name := normalizedTypeName(dt.Name)
+	if name == "float" && dt.Length > 24 && dt.Scale == 0 {
+		name = "double"
+	}
+	if name == "varchar" && dt.Length > 65535 {
+		return "mediumtext"
+	}
+	if name == "text" && dt.Length > 0 {
+		name = promoteTextType(dt.Length)
+	}
+	if name == "blob" && dt.Length > 0 {
+		name = promoteBlobType(dt.Length)
+	}
+
+	// Type aliases: BOOLEAN/BOOL → tinyint(1), NUMERIC → decimal,
+	// SERIAL → bigint(20) unsigned. Measured on mariadb:11.8.8 through SHOW
+	// CREATE TABLE.
+	switch name {
+	case "boolean", "bool":
+		return "tinyint(1)"
+	case "serial":
+		return "bigint(20) unsigned"
+	}
+
+	var buf strings.Builder
+	buf.WriteString(name)
+
+	// MariaDB always writes an integer type's display width: the width the
+	// column was declared with, or the type's default. MySQL 8.0 deprecated the
+	// width and writes it only under ZEROFILL. Measured on mariadb:11.8.8:
+	// `INT` → int(11), `INT UNSIGNED` → int(10) unsigned, `INT(5)` → int(5),
+	// `INT ZEROFILL` → int(10) unsigned zerofill, so ZEROFILL takes the
+	// unsigned width, which is what it also makes the column.
+	if isIntegerType(name) {
+		width := dt.Length
+		if width == 0 {
+			width = defaultIntDisplayWidth(name, dt.Unsigned || dt.Zerofill)
+		}
+		fmt.Fprintf(&buf, "(%d)", width)
+	} else if name == "decimal" {
+		if dt.Length == 0 && dt.Scale == 0 {
+			// DECIMAL with no precision → MySQL shows decimal(10,0)
+			buf.WriteString("(10,0)")
+		} else {
+			fmt.Fprintf(&buf, "(%d,%d)", dt.Length, dt.Scale)
+		}
+	} else if isTextBlobLengthStripped(name) {
+		// TEXT(n) and BLOB(n) carry a length that picks the type rather than
+		// being written back: the promotion happened above for text, and blob
+		// is promoted here by its length in bytes. Measured on mariadb:11.8.8:
+		// `BLOB(255)` → tinyblob, `BLOB(256)` → blob, `BLOB(65536)` →
+		// mediumblob.
+	} else if name == "year" {
+		// MariaDB still has YEAR(2) and keeps that width; every other
+		// declaration, YEAR and YEAR(4) included, reads back as year(4).
+		// MySQL 8.0 deprecated the width and writes `year`. Measured on
+		// mariadb:11.8.8: YEAR(2) → year(2), YEAR(3) and YEAR(5) → year(4).
+		if dt.Length == 2 {
+			buf.WriteString("(2)")
+		} else {
+			buf.WriteString("(4)")
+		}
+	} else if name == "bit" && dt.Length == 0 {
+		buf.WriteString("(1)")
+	} else if (name == "char" || name == "binary") && dt.Length == 0 {
+		// CHAR/BINARY with no length → MySQL shows char(1)/binary(1)
+		buf.WriteString("(1)")
+	} else if dt.Length > 0 && dt.Scale > 0 {
+		fmt.Fprintf(&buf, "(%d,%d)", dt.Length, dt.Scale)
+	} else if dt.Length > 0 {
+		fmt.Fprintf(&buf, "(%d)", dt.Length)
+	}
+
+	if len(dt.EnumValues) > 0 {
+		buf.WriteString("(")
+		for i, v := range dt.EnumValues {
+			if i > 0 {
+				buf.WriteString(",")
+			}
+			buf.WriteString("'" + escapeEnumValue(v) + "'")
+		}
+		buf.WriteString(")")
+	}
+	// YEAR takes UNSIGNED and ZEROFILL and keeps neither: every engine's SHOW
+	// CREATE TABLE writes `year` for `year unsigned zerofill`, so a column that
+	// was declared with them is not one that reports them.
+	if name != "year" {
+		if dt.Unsigned || dt.Zerofill {
+			buf.WriteString(" unsigned")
+		}
+		if dt.Zerofill {
+			buf.WriteString(" zerofill")
+		}
+	}
+	return buf.String()
+}
+
+// applyJSONColumn gives a column declared JSON the shape MariaDB keeps it in.
+// MariaDB has no JSON type: JSON is longtext with the binary utf8mb4 collation
+// plus a json_valid check named after the column, which is what
+// information_schema.COLUMNS and SHOW CREATE TABLE both report. Measured on
+// mariadb:11.8.8:
+//
+//	`j` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL
+//	    CHECK (json_valid(`j`))
+//
+// MySQL 8.0 has a JSON type of its own and reports it as one. The check lands
+// through jsonValidConstraint, so that a table built in either order holds it.
+func applyJSONColumn(col *Column) {
+	col.DataType = "longtext"
+	col.ColumnType = "longtext"
+	col.Charset = "utf8mb4"
+	col.Collation = "utf8mb4_bin"
+	col.IsJSON = true
+}
+
+// jsonValidConstraint returns the check MariaDB attaches to a JSON column.
+func jsonValidConstraint(col *Column) *Constraint {
+	return &Constraint{
+		Name:      col.Name,
+		Type:      ConCheck,
+		Column:    col.Name,
+		CheckExpr: "json_valid(" + backtickIDQ(col.Name) + ")",
+		Implicit:  true,
+	}
+}
+
+// tableLevelIndexedColumns returns the lowercased names of the columns the
+// statement's table-level keys cover.
+func tableLevelIndexedColumns(stmt *nodes.CreateTableStmt) map[string]bool {
+	out := make(map[string]bool)
+	for _, con := range stmt.Constraints {
+		for _, name := range extractColumnNames(con) {
+			out[toLower(name)] = true
+		}
+	}
+	return out
+}
+
+func normalizedColumnDataType(dt *nodes.DataType) string {
+	name := normalizedTypeName(dt.Name)
+	if name == "float" && dt.Length > 24 && dt.Scale == 0 {
+		return "double"
+	}
+	if name == "varchar" && dt.Length > 65535 {
+		return "mediumtext"
+	}
+	if name == "text" && dt.Length > 0 {
+		return promoteTextType(dt.Length)
+	}
+	if name == "blob" && dt.Length > 0 {
+		return promoteBlobType(dt.Length)
+	}
+	return name
+}
+
+func normalizedTypeName(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "bool", "boolean":
+		return "boolean"
+	case "integer", "int4":
+		return "int"
+	case "int1":
+		return "tinyint"
+	case "int2":
+		return "smallint"
+	case "int3", "middleint":
+		return "mediumint"
+	case "int8":
+		return "bigint"
+	case "real", "float8", "double precision":
+		return "double"
+	case "float4":
+		return "float"
+	case "numeric", "dec", "fixed":
+		return "decimal"
+	case "character":
+		return "char"
+	case "character varying", "varcharacter", "nvarchar", "national varchar",
+		"nchar varchar", "national char varying", "nchar varying":
+		return "varchar"
+	case "national char", "nchar":
+		return "char"
+	default:
+		return strings.ToLower(strings.TrimSpace(name))
+	}
+}
+
+func isNationalStringType(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "nvarchar", "national varchar", "nchar varchar", "national char varying",
+		"nchar varying", "national char", "nchar":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeCharsetName(name string) string {
+	if strings.EqualFold(name, "utf8") {
+		return "utf8mb3"
+	}
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func charsetMatchesCollation(charset, collation string) bool {
+	derived := normalizeCharsetName(charsetForCollation(collation))
+	return derived == "" || strings.EqualFold(normalizeCharsetName(charset), derived)
+}
+
+func promoteTextType(chars int) string {
+	bytes := chars * 4
+	switch {
+	case bytes <= 255:
+		return "tinytext"
+	case bytes <= 65535:
+		return "text"
+	case bytes <= 16777215:
+		return "mediumtext"
+	default:
+		return "longtext"
+	}
+}
+
+// promoteBlobType returns the blob type MariaDB keeps for BLOB(n), which holds
+// n bytes rather than n characters. Measured on mariadb:11.8.8.
+func promoteBlobType(bytes int) string {
+	switch {
+	case bytes <= 255:
+		return "tinyblob"
+	case bytes <= 65535:
+		return "blob"
+	case bytes <= 16777215:
+		return "mediumblob"
+	default:
+		return "longblob"
+	}
+}
+
+// isIntegerType returns true for the integer types.
+func isIntegerType(dt string) bool {
+	switch dt {
+	case "tinyint", "smallint", "mediumint", "int", "integer", "bigint":
+		return true
+	}
+	return false
+}
+
+// defaultIntDisplayWidth returns the display width MariaDB writes for an
+// integer type the column did not declare one for. Measured on
+// mariadb:11.8.8 through SHOW CREATE TABLE.
+func defaultIntDisplayWidth(typeName string, unsigned bool) int {
+	switch typeName {
+	case "tinyint":
+		if unsigned {
+			return 3
+		}
+		return 4
+	case "smallint":
+		if unsigned {
+			return 5
+		}
+		return 6
+	case "mediumint":
+		if unsigned {
+			return 8
+		}
+		return 9
+	case "int", "integer":
+		if unsigned {
+			return 10
+		}
+		return 11
+	case "bigint":
+		if unsigned {
+			return 20
+		}
+		return 20
+	}
+	return 11
+}
+
+// isTextBlobLengthStripped returns true for types where MySQL strips the length
+// in SHOW CREATE TABLE output (TEXT(n) → text, BLOB(n) → blob).
+func isTextBlobLengthStripped(dt string) bool {
+	switch dt {
+	case "text", "blob":
+		return true
+	}
+	return false
+}
+
+// escapeEnumValue escapes single quotes in ENUM/SET values for SHOW CREATE TABLE.
+// MySQL escapes a single quote in enum values by doubling it.
+func escapeEnumValue(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// likeSource resolves the source table of CREATE TABLE ... LIKE. MariaDB
+// reports a source in an unknown database as a missing table (1146), and a
+// view as not a base table (1347).
+func (c *Catalog) likeSource(ref *nodes.TableRef) (*Table, error) {
+	dbName := ref.Schema
+	if dbName == "" {
+		dbName = c.currentDB
+	}
+	if dbName == "" {
+		return nil, errNoDatabaseSelected()
+	}
+	srcDB := c.GetDatabase(dbName)
+	if srcDB == nil {
+		return nil, errNoSuchTable(dbName, ref.Name)
+	}
+	if tbl := srcDB.GetTable(ref.Name); tbl != nil {
+		return tbl, nil
+	}
+	if srcDB.Views[toLower(ref.Name)] != nil {
+		return nil, errWrongObject(srcDB.Name, ref.Name, "BASE TABLE")
+	}
+	return nil, errNoSuchTable(srcDB.Name, ref.Name)
+}
+
+// refNamesTable reports whether ref, resolved against the current
+// database, names table key of database dbName.
+func (c *Catalog) refNamesTable(ref *nodes.TableRef, dbName, key string) bool {
+	schema := ref.Schema
+	if schema == "" {
+		schema = c.currentDB
+	}
+	return schema != "" && toLower(schema) == toLower(dbName) && toLower(ref.Name) == key
+}
+
+// checkCreateOrReplace runs the checks MariaDB makes before CREATE OR
+// REPLACE [TEMPORARY] TABLE drops anything, in its order, and returns the
+// table to drop (nil when none of the name exists) and, for LIKE, the
+// source table. A failure here leaves the existing table in place.
+// Verified against mariadb:11.8.8; see
+// https://mariadb.com/kb/en/create-table/#create-or-replace.
+//
+// OR REPLACE replaces only a table of its own kind: OR REPLACE TABLE a base
+// table, OR REPLACE TEMPORARY TABLE a temporary one. MariaDB lets a
+// temporary table shadow a base table or view of the same name, but the
+// catalog keeps one table per name, so where the other kind holds the name
+// it reports a duplicate, as plain CREATE [TEMPORARY] TABLE does.
+func (c *Catalog) checkCreateOrReplace(db *Database, tableName, key string, stmt *nodes.CreateTableStmt) (replaced, srcTbl *Table, err error) {
+	// The LIKE source is opened before the target is looked at.
+	if stmt.Like != nil {
+		if srcTbl, err = c.likeSource(stmt.Like); err != nil {
+			return nil, nil, err
+		}
+	}
+	existing := db.Tables[key]
+	if stmt.Temporary {
+		if db.Views[key] != nil || (existing != nil && !existing.Temporary) {
+			return nil, nil, errDupTable(tableName)
+		}
+		if existing == nil {
+			return nil, srcTbl, nil
+		}
+		// The SELECT cannot read the temporary table it replaces.
+		if ref := c.selectTableRef(stmt.Select, db.Name, key); ref != nil {
+			alias := ref.Alias
+			if alias == "" {
+				alias = ref.Name
+			}
+			return nil, nil, errCantReopenTable(alias)
+		}
+		return existing, srcTbl, nil
+	}
+	if db.Views[key] != nil {
+		return nil, nil, errIsAView(db.Name, tableName)
+	}
+	if existing == nil {
+		return nil, srcTbl, nil
+	}
+	if existing.Temporary {
+		return nil, nil, errDupTable(tableName)
+	}
+	// The SELECT cannot read the table it replaces (1093). MariaDB checks
+	// this only when the table exists; otherwise the SELECT fails on the
+	// missing table, which the catalog, not modeling the SELECT, does not
+	// report.
+	if c.selectTableRef(stmt.Select, db.Name, key) != nil {
+		return nil, nil, errUpdateTableUsed(tableName, "CREATE")
+	}
+	// As with DROP TABLE, a table another table's foreign key references
+	// cannot be dropped while foreign_key_checks is on: 1451.
+	if c.foreignKeyChecks {
+		if child, _ := c.findFKReference(db.Name, existing.Name); child != nil {
+			return nil, nil, errRowIsReferenced()
+		}
+	}
+	return existing, srcTbl, nil
+}
+
+// selectTableRef returns the first table reference in sel, at any depth
+// (FROM, joins, derived tables, subqueries, set operations, CTE bodies),
+// that names table key of database dbName; nil when there is none or sel
+// is nil. An unqualified name that matches a CTE visible where it stands
+// reads the CTE, and is skipped. Views are not expanded: MariaDB also
+// refuses a SELECT that reads the table through a view (1443), the catalog
+// does not.
+func (c *Catalog) selectTableRef(sel *nodes.SelectStmt, dbName, key string) *nodes.TableRef {
+	if sel == nil {
+		return nil
+	}
+	return c.queryTableRef(sel, dbName, key, nil)
+}
+
+// queryTableRef is selectTableRef for one query, given the CTE names visible
+// around it. The CTEs of a query's WITH clause are visible in its body, set
+// operations and subqueries included. A body of a WITH RECURSIVE clause sees
+// every CTE of the clause; a body of a plain WITH sees only the CTEs before
+// it, so WITH t AS (SELECT * FROM t) reads table t. Verified on
+// mariadb:11.8.8.
+func (c *Catalog) queryTableRef(sel *nodes.SelectStmt, dbName, key string, outer map[string]bool) *nodes.TableRef {
+	scope := outer
+	if len(sel.CTEs) > 0 {
+		scope = make(map[string]bool, len(outer)+len(sel.CTEs))
+		for name := range outer {
+			scope[name] = true
+		}
+		recursive := sel.CTEs[0].Recursive
+		if recursive {
+			for _, cte := range sel.CTEs {
+				scope[toLower(cte.Name)] = true
+			}
+		}
+		for _, cte := range sel.CTEs {
+			if cte.Select != nil {
+				if ref := c.queryTableRef(cte.Select, dbName, key, scope); ref != nil {
+					return ref
+				}
+			}
+			if !recursive {
+				scope[toLower(cte.Name)] = true
+			}
+		}
+	}
+	var found *nodes.TableRef
+	nodes.Inspect(sel, func(n nodes.Node) bool {
+		if found != nil {
+			return false
+		}
+		switch n := n.(type) {
+		case *nodes.SelectStmt:
+			if n == sel {
+				return true
+			}
+			found = c.queryTableRef(n, dbName, key, scope)
+			return false
+		case *nodes.CommonTableExpr:
+			// Walked above, each with the names its body sees.
+			return false
+		case *nodes.ForUpdate:
+			// Lock targets name FROM entries; they read nothing themselves.
+			return false
+		case *nodes.TableRef:
+			if n.Schema == "" && scope[toLower(n.Name)] {
+				return true
+			}
+			if c.refNamesTable(n, dbName, key) {
+				found = n
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// dropReplacedTable drops the table CREATE OR REPLACE replaces, with its
+// triggers, as DROP TABLE does in MariaDB. A nil table is a no-op.
+func (c *Catalog) dropReplacedTable(db *Database, tbl *Table) {
+	if tbl == nil {
+		return
+	}
+	key := toLower(tbl.Name)
+	delete(db.Tables, key)
+	for name, trg := range db.Triggers {
+		if toLower(trg.Table) == key {
+			delete(db.Triggers, name)
+		}
+	}
+}
+
+// createTableLike implements CREATE TABLE t2 LIKE t1.
+// It copies the structure (columns, indexes, constraints) from the source table.
+func (c *Catalog) createTableLike(db *Database, tableName, key string, srcTbl *Table, stmt *nodes.CreateTableStmt) error {
+	tbl := &Table{
+		Name:              tableName,
+		Database:          db,
+		Columns:           make([]*Column, 0, len(srcTbl.Columns)),
+		colByName:         make(map[string]int),
+		Indexes:           make([]*Index, 0, len(srcTbl.Indexes)),
+		Constraints:       make([]*Constraint, 0, len(srcTbl.Constraints)),
+		Engine:            srcTbl.Engine,
+		Charset:           srcTbl.Charset,
+		Collation:         srcTbl.Collation,
+		Comment:           srcTbl.Comment,
+		RowFormat:         srcTbl.RowFormat,
+		KeyBlockSize:      srcTbl.KeyBlockSize,
+		Compression:       srcTbl.Compression,
+		Encryption:        srcTbl.Encryption,
+		StatsPersistent:   srcTbl.StatsPersistent,
+		StatsAutoRecalc:   srcTbl.StatsAutoRecalc,
+		StatsSamplePages:  srcTbl.StatsSamplePages,
+		MinRows:           srcTbl.MinRows,
+		MaxRows:           srcTbl.MaxRows,
+		AvgRowLength:      srcTbl.AvgRowLength,
+		Tablespace:        srcTbl.Tablespace,
+		PackKeys:          srcTbl.PackKeys,
+		Checksum:          srcTbl.Checksum,
+		DelayKeyWrite:     srcTbl.DelayKeyWrite,
+		Temporary:         stmt.Temporary,
+		SystemVersioned:   srcTbl.SystemVersioned,
+		PeriodStartCol:    srcTbl.PeriodStartCol,
+		PeriodEndCol:      srcTbl.PeriodEndCol,
+		AppPeriodName:     srcTbl.AppPeriodName,
+		AppPeriodStartCol: srcTbl.AppPeriodStartCol,
+		AppPeriodEndCol:   srcTbl.AppPeriodEndCol,
+	}
+
+	// Copy columns.
+	for i, srcCol := range srcTbl.Columns {
+		col := &Column{
+			Position:         srcCol.Position,
+			Name:             srcCol.Name,
+			DataType:         srcCol.DataType,
+			ColumnType:       srcCol.ColumnType,
+			Nullable:         srcCol.Nullable,
+			AutoIncrement:    srcCol.AutoIncrement,
+			Charset:          srcCol.Charset,
+			Collation:        srcCol.Collation,
+			Comment:          srcCol.Comment,
+			OnUpdate:         srcCol.OnUpdate,
+			OnUpdateKind:     srcCol.OnUpdateKind,
+			Invisible:        srcCol.Invisible,
+			Hidden:           srcCol.Hidden,
+			SystemVersioning: srcCol.SystemVersioning,
+			// The copy is a JSON column too, and its implicit json_valid
+			// check comes with it, so the marker has to come as well: without
+			// it a later ALTER reads the column as newly typed and leaves the
+			// check behind when the type moves away from JSON.
+			IsJSON: srcCol.IsJSON,
+		}
+		if srcCol.Default != nil {
+			def := *srcCol.Default
+			col.Default = &def
+			col.DefaultKind = srcCol.DefaultKind
+		}
+		if srcCol.Generated != nil {
+			col.Generated = &GeneratedColumnInfo{
+				Expr:             srcCol.Generated.Expr,
+				Stored:           srcCol.Generated.Stored,
+				RowBound:         srcCol.Generated.RowBound,
+				Nondeterministic: srcCol.Generated.Nondeterministic,
+				Refs:             append([]string{}, srcCol.Generated.Refs...),
+			}
+		}
+		tbl.Columns = append(tbl.Columns, col)
+		tbl.colByName[toLower(col.Name)] = i
+	}
+
+	// Copy indexes.
+	for _, srcIdx := range srcTbl.Indexes {
+		idx := &Index{
+			Name:          srcIdx.Name,
+			Table:         tbl,
+			Unique:        srcIdx.Unique,
+			Primary:       srcIdx.Primary,
+			Fulltext:      srcIdx.Fulltext,
+			Spatial:       srcIdx.Spatial,
+			Vector:        srcIdx.Vector,
+			EngineOptions: srcIdx.EngineOptions,
+			IndexType:     srcIdx.IndexType,
+			Visible:       srcIdx.Visible,
+			Comment:       srcIdx.Comment,
+			KeyBlockSize:  srcIdx.KeyBlockSize,
+		}
+		cols := make([]*IndexColumn, len(srcIdx.Columns))
+		for i, sc := range srcIdx.Columns {
+			cols[i] = &IndexColumn{
+				Name:            sc.Name,
+				Length:          sc.Length,
+				Descending:      sc.Descending,
+				Expr:            sc.Expr,
+				ExprNode:        sc.ExprNode,
+				WithoutOverlaps: sc.WithoutOverlaps,
+			}
+		}
+		idx.Columns = cols
+		tbl.Indexes = append(tbl.Indexes, idx)
+	}
+
+	// Copy constraints (skip FK — MySQL 8.0 does not copy FKs with LIKE).
+	for _, srcCon := range srcTbl.Constraints {
+		if srcCon.Type == ConForeignKey {
+			continue
+		}
+		con := &Constraint{
+			Name:        srcCon.Name,
+			Type:        srcCon.Type,
+			Table:       tbl,
+			Columns:     append([]string{}, srcCon.Columns...),
+			IndexName:   srcCon.IndexName,
+			CheckExpr:   srcCon.CheckExpr,
+			NotEnforced: srcCon.NotEnforced,
+			RefDatabase: srcCon.RefDatabase,
+			RefTable:    srcCon.RefTable,
+			RefColumns:  append([]string{}, srcCon.RefColumns...),
+			OnDelete:    srcCon.OnDelete,
+			OnUpdate:    srcCon.OnUpdate,
+			// A copied json_valid check is still the catalog's own, so the
+			// copy belongs to its column the same way the original does, and
+			// a copied column-level check belongs to the copy's column.
+			Implicit: srcCon.Implicit,
+			Column:   srcCon.Column,
+		}
+		tbl.Constraints = append(tbl.Constraints, con)
+	}
+
+	db.Tables[key] = tbl
+	return nil
+}
+
+func refActionToString(action nodes.ReferenceAction) string {
+	switch action {
+	case nodes.RefActRestrict:
+		return "RESTRICT"
+	case nodes.RefActCascade:
+		return "CASCADE"
+	case nodes.RefActSetNull:
+		return "SET NULL"
+	case nodes.RefActSetDefault:
+		// InnoDB does not carry SET DEFAULT, so MariaDB keeps the constraint at
+		// RESTRICT and reports that. Measured on mariadb:11.8.8 through
+		// information_schema.REFERENTIAL_CONSTRAINTS.
+		return "RESTRICT"
+	case nodes.RefActNoAction:
+		return "NO ACTION"
+	default:
+		// No action was written, which means RESTRICT: that is what
+		// information_schema reports, and SHOW CREATE TABLE leaves it out
+		// (isFKDefault). An explicit NO ACTION is reported and written as
+		// given, so the two are not the same string here. Measured on
+		// mariadb:11.8.8.
+		return "RESTRICT"
+	}
+}
+
+// normalizedChecksum is the value CHECKSUM reports, which is not the value it
+// was given: the option is a flag, so the server records any non-zero number as
+// 1 and a zero as no option at all. `CHECKSUM=2`, `TABLE_CHECKSUM=1` and
+// `CHECKSUM=1.5` all read back as `CHECKSUM=1`, and `CHECKSUM=0` reads back as
+// nothing (MySQL 8.0 and MariaDB 11.8.8, information_schema.tables.create_options).
+//
+// TABLE_CHECKSUM is CHECKSUM's other name and reports under CHECKSUM, so it
+// comes here too.
+func normalizedChecksum(value string) string {
+	for _, c := range value {
+		if c != '0' && c != '.' && c != '+' && c != '-' {
+			return "1"
+		}
+	}
+	return "0"
+}

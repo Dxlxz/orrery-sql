@@ -1,0 +1,725 @@
+package parser
+
+// Segment represents a portion of SQL text delimited by top-level semicolons.
+type Segment struct {
+	Text      string // the raw text of this segment (without trailing semicolon)
+	ByteStart int    // byte offset of start in original sql
+	ByteEnd   int    // byte offset of end (exclusive) in original sql
+}
+
+// Empty returns true if the segment contains only whitespace and comments.
+func (s Segment) Empty() bool {
+	t := s.Text
+	i := 0
+	for i < len(t) {
+		b := t[i]
+		// Skip whitespace.
+		if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
+			i++
+			continue
+		}
+		// Skip -- line comments (MySQL requires space/tab/newline after --).
+		if isDashComment(t, i) {
+			i = skipDashComment(t, i)
+			continue
+		}
+		// Skip # line comments.
+		if b == '#' {
+			i = skipHashComment(t, i)
+			continue
+		}
+		// Skip block comments, but NOT conditional comments /*!...*/.
+		// Conditional comments contain executable SQL — segment is not empty.
+		if b == '/' && i+1 < len(t) && t[i+1] == '*' {
+			if i+2 < len(t) && t[i+2] == '!' {
+				return false
+			}
+			// TiDB-specific comments also contain executable SQL.
+			if i+3 < len(t) && t[i+2] == 'T' && t[i+3] == '!' {
+				return false
+			}
+			// An unterminated block comment (no closing */ before EOF) is malformed
+			// input, not empty whitespace: keep the segment so the lexer surfaces a
+			// clean "unterminated comment" error instead of Split silently dropping it.
+			if !blockCommentTerminated(t, i) {
+				return false
+			}
+			prev := i
+			i = skipBlockCommentMySQL(t, i)
+			if i == prev {
+				return false
+			}
+			continue
+		}
+		// Found a non-whitespace, non-comment character.
+		return false
+	}
+	return true
+}
+
+// blockCommentTerminated reports whether the block comment starting at i has a
+// closing "*/" before the end of sql.
+func blockCommentTerminated(sql string, i int) bool {
+	i += 2 // skip /*
+	for i < len(sql) {
+		if sql[i] == '*' && i+1 < len(sql) && sql[i+1] == '/' {
+			return true
+		}
+		i++
+	}
+	return false
+}
+
+// isIdentByte returns true if b is a valid identifier byte [a-zA-Z0-9_].
+func isIdentByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+// matchWord performs a case-insensitive keyword match at position i in sql,
+// ensuring word boundaries on both sides. kw must be uppercase.
+func matchWord(sql string, i int, kw string) bool {
+	// Check left boundary: must be start of string or non-ident byte.
+	if i > 0 && isIdentByte(sql[i-1]) {
+		return false
+	}
+	// Check length.
+	if i+len(kw) > len(sql) {
+		return false
+	}
+	// Case-insensitive compare.
+	for j := 0; j < len(kw); j++ {
+		c := sql[i+j]
+		// Uppercase the byte.
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != kw[j] {
+			return false
+		}
+	}
+	// Check right boundary: must be end of string or non-ident byte.
+	if i+len(kw) < len(sql) && isIdentByte(sql[i+len(kw)]) {
+		return false
+	}
+	return true
+}
+
+// skipToEndOfWord advances past identifier bytes starting at position i.
+func skipToEndOfWord(sql string, i int) int {
+	for i < len(sql) && isIdentByte(sql[i]) {
+		i++
+	}
+	return i
+}
+
+// skipWhitespace skips spaces, tabs, and newlines (NOT comments).
+func skipWhitespace(sql string, i int) int {
+	for i < len(sql) {
+		b := sql[i]
+		if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
+			i++
+		} else {
+			break
+		}
+	}
+	return i
+}
+
+// nextWordAfter skips whitespace after pos, reads the next word, and returns it uppercase.
+// Returns "" if no word follows.
+func nextWordAfter(sql string, pos int) string {
+	j := skipWhitespace(sql, pos)
+	if j >= len(sql) || !isIdentByte(sql[j]) {
+		return ""
+	}
+	start := j
+	j = skipToEndOfWord(sql, j)
+	// Uppercase the word.
+	word := make([]byte, j-start)
+	for k := start; k < j; k++ {
+		c := sql[k]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		word[k-start] = c
+	}
+	return string(word)
+}
+
+// prevWord finds the last word before position i (skipping trailing whitespace backwards)
+// and returns it uppercase. Returns "" if no word is found.
+func prevWord(sql string, i int) string {
+	// Skip whitespace backwards.
+	j := i - 1
+	for j >= 0 {
+		b := sql[j]
+		if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
+			j--
+		} else {
+			break
+		}
+	}
+	if j < 0 || !isIdentByte(sql[j]) {
+		return ""
+	}
+	end := j + 1
+	for j >= 0 && isIdentByte(sql[j]) {
+		j--
+	}
+	start := j + 1
+	word := make([]byte, end-start)
+	for k := start; k < end; k++ {
+		c := sql[k]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		word[k-start] = c
+	}
+	return string(word)
+}
+
+// matchDelimiter returns true if sql[i:] starts with the given delimiter string.
+func matchDelimiter(sql string, i int, delim string) bool {
+	if i+len(delim) > len(sql) {
+		return false
+	}
+	return sql[i:i+len(delim)] == delim
+}
+
+// nextNonSpaceChar returns the next non-whitespace character after pos, or 0 if none.
+func nextNonSpaceChar(sql string, pos int) byte {
+	j := skipWhitespace(sql, pos)
+	if j >= len(sql) {
+		return 0
+	}
+	return sql[j]
+}
+
+// Split splits SQL text into segments at top-level semicolons.
+// It is a pure lexical scanner that does not parse SQL, so it works
+// on both valid and invalid SQL. Segments do NOT include the trailing
+// semicolon delimiter. Empty segments (whitespace/comments only) are
+// filtered out. Returns nil for empty input.
+func Split(sql string) []Segment {
+	if len(sql) == 0 {
+		return nil
+	}
+
+	var segments []Segment
+	stmtStart := 0
+	i := 0
+	depth := 0   // compound block nesting depth
+	delim := ";" // active delimiter
+	// atStmtStart tracks whether the next keyword/token would appear at a
+	// statement-start position (after ';', after BEGIN/THEN/ELSE/DO/UNTIL,
+	// after a label ':', at start of input, across whitespace/comments). Used
+	// to disambiguate IF-as-compound from IF-as-function-call / DDL-modifier,
+	// mirroring the parser's grammar-position disambiguation at the text-scan
+	// level (so IF (expr) THEN, SELECT IF(...), DROP TABLE IF EXISTS all read
+	// correctly regardless of comments between the keyword and what follows).
+	atStmtStart := true
+	// routineHeaderParen tracks the parameter list of a CREATE PROCEDURE so its
+	// body position is known: -1 outside a header, 0 after "PROCEDURE" before
+	// the '(' opens, then the open-paren depth. When it returns to 0 the body
+	// begins at a statement-start position, so a bare IF body (IF ... END IF)
+	// reads as a compound opener rather than the IF() function or IF EXISTS.
+	// WHILE/CASE/REPEAT bodies already open unconditionally; only IF needs this.
+	routineHeaderParen := -1
+	// closes keeps the scans for executable comments' closes linear in total:
+	// TiDB reads on past an opener that never closes, so every later opener
+	// would rescan the rest of the input.
+	var closes splitCloses
+
+	for i < len(sql) {
+		// Check for DELIMITER directive (only at statement-start position).
+		// Require DELIMITER followed by whitespace to distinguish from labels
+		// like "delimiter: LOOP".
+		if atStmtStart && matchWord(sql, i, "DELIMITER") {
+			j := skipToEndOfWord(sql, i)
+			if j < len(sql) && (sql[j] == ' ' || sql[j] == '\t') {
+				j = skipWhitespace(sql, j)
+				delimStart := j
+				for j < len(sql) && sql[j] != '\n' && sql[j] != '\r' {
+					j++
+				}
+				delimEnd := j
+				for delimEnd > delimStart && (sql[delimEnd-1] == ' ' || sql[delimEnd-1] == '\t') {
+					delimEnd--
+				}
+				if delimEnd > delimStart {
+					delim = sql[delimStart:delimEnd]
+				}
+				if j < len(sql) && sql[j] == '\r' {
+					j++
+				}
+				if j < len(sql) && sql[j] == '\n' {
+					j++
+				}
+				i = j
+				stmtStart = i
+				atStmtStart = true
+				continue
+			}
+		}
+
+		b := sql[i]
+
+		switch {
+		// Single-quoted string — non-stmt-start after.
+		case b == '\'':
+			i = skipSingleQuoteMySQL(sql, i)
+			atStmtStart = false
+
+		// Double-quoted string (MySQL treats as string literal).
+		case b == '"':
+			i = skipDoubleQuoteMySQL(sql, i)
+			atStmtStart = false
+
+		// Backtick-quoted identifier.
+		case b == '`':
+			i = skipBacktick(sql, i)
+			atStmtStart = false
+
+		// Block comment (including conditional /*!...*/): transparent to atStmtStart.
+		case b == '/' && i+1 < len(sql) && sql[i+1] == '*':
+			i = skipBlockComment(sql, i, &closes)
+
+		// Dash line comment: transparent to atStmtStart.
+		case isDashComment(sql, i):
+			i = skipDashComment(sql, i)
+
+		// Hash line comment: transparent to atStmtStart.
+		case b == '#':
+			i = skipHashComment(sql, i)
+
+		// BEGIN — compound block opener (depth++) unless it's a transaction
+		// (lone BEGIN, BEGIN PESSIMISTIC, BEGIN OPTIMISTIC, XA BEGIN). After a
+		// compound BEGIN the next token is at stmt-start; after a transaction
+		// BEGIN it is not. TiDB has no BEGIN WORK, but a script that writes
+		// one still splits at its ';' rather than running to the end. A word
+		// with a ':' after it is a label on the block's first statement:
+		// TiDB v8.5.5 takes "BEGIN work: WHILE ...", where WORK is no keyword,
+		// and answers 1064 for a label named after a BEGIN mode.
+		case (b == 'b' || b == 'B') && matchWord(sql, i, "BEGIN"):
+			endOfWord := skipToEndOfWord(sql, i)
+			next := nextWordAfter(sql, endOfWord)
+			prev := prevWord(sql, i)
+			isLabel := next != "" && nextNonSpaceChar(sql, skipToEndOfWord(sql, skipWhitespace(sql, endOfWord))) == ':'
+			isTransactionWord := !isLabel && (next == "WORK" || next == "PESSIMISTIC" || next == "OPTIMISTIC")
+			isCompound := !isTransactionWord && prev != "XA" && nextNonSpaceChar(sql, endOfWord) != ';' && nextNonSpaceChar(sql, endOfWord) != 0
+			if isCompound {
+				depth++
+				atStmtStart = true
+			} else {
+				atStmtStart = false
+			}
+			i = endOfWord
+
+		// PROCEDURE after CREATE — enter the routine header so the body position
+		// after the parameter list is known. ALTER/DROP/SHOW PROCEDURE have no
+		// body and are excluded by requiring CREATE immediately before.
+		case (b == 'p' || b == 'P') && matchWord(sql, i, "PROCEDURE"):
+			endOfWord := skipToEndOfWord(sql, i)
+			if prevWord(sql, i) == "CREATE" {
+				routineHeaderParen = 0
+			}
+			atStmtStart = false
+			i = endOfWord
+
+		// IF — compound flow-control iff at stmt-start and not preceded by END.
+		// atStmtStart encodes grammar-position disambiguation: IF in expression
+		// context (after SELECT/SET/'='/',' /'(' or as DROP ... IF EXISTS) is a
+		// function or DDL modifier, not a compound opener.
+		case (b == 'i' || b == 'I') && matchWord(sql, i, "IF"):
+			endOfWord := skipToEndOfWord(sql, i)
+			prev := prevWord(sql, i)
+			if prev != "END" && atStmtStart {
+				depth++
+			}
+			atStmtStart = false
+			i = endOfWord
+
+		// CASE — opener unless preceded by END (expr form ends with END, stmt
+		// form with END CASE).
+		case (b == 'c' || b == 'C') && matchWord(sql, i, "CASE"):
+			endOfWord := skipToEndOfWord(sql, i)
+			if prevWord(sql, i) != "END" {
+				depth++
+			}
+			atStmtStart = false
+			i = endOfWord
+
+		// WHILE — opener unless preceded by END.
+		case (b == 'w' || b == 'W') && matchWord(sql, i, "WHILE"):
+			endOfWord := skipToEndOfWord(sql, i)
+			if prevWord(sql, i) != "END" {
+				depth++
+			}
+			atStmtStart = false
+			i = endOfWord
+
+		// LOOP — opener unless preceded by END or used as a function.
+		case (b == 'l' || b == 'L') && matchWord(sql, i, "LOOP"):
+			endOfWord := skipToEndOfWord(sql, i)
+			if prevWord(sql, i) != "END" {
+				depth++
+			}
+			if prevWord(sql, i) != "END" && nextNonSpaceChar(sql, endOfWord) != '(' {
+				atStmtStart = true
+			} else {
+				atStmtStart = false
+			}
+			i = endOfWord
+
+		// REPEAT — opener unless preceded by END or followed by '(' (function).
+		case (b == 'r' || b == 'R') && matchWord(sql, i, "REPEAT"):
+			endOfWord := skipToEndOfWord(sql, i)
+			prev := prevWord(sql, i)
+			if prev != "END" && nextNonSpaceChar(sql, endOfWord) != '(' {
+				depth++
+				atStmtStart = true
+			} else {
+				atStmtStart = false
+			}
+			i = endOfWord
+
+		// END — close a compound opener.
+		case (b == 'e' || b == 'E') && matchWord(sql, i, "END"):
+			endOfWord := skipToEndOfWord(sql, i)
+			if depth > 0 && prevWord(sql, i) != "XA" {
+				depth--
+			}
+			atStmtStart = false
+			i = endOfWord
+
+		// THEN / ELSE / DO introduce statement lists; UNTIL / ELSEIF introduce
+		// their own predicate/condition expression.
+		case (b == 't' || b == 'T') && matchWord(sql, i, "THEN"):
+			i = skipToEndOfWord(sql, i)
+			atStmtStart = true
+		case (b == 'e' || b == 'E') && matchWord(sql, i, "ELSEIF"):
+			i = skipToEndOfWord(sql, i)
+			atStmtStart = false
+		case (b == 'e' || b == 'E') && matchWord(sql, i, "ELSE"):
+			i = skipToEndOfWord(sql, i)
+			atStmtStart = true
+		case (b == 'd' || b == 'D') && matchWord(sql, i, "DO"):
+			i = skipToEndOfWord(sql, i)
+			// A loop-body DO (WHILE ... DO, inside a compound block) starts a
+			// statement list; a top-level `DO expr` statement starts an
+			// expression (so `DO IF(...)` is the IF() function, not a compound).
+			atStmtStart = depth > 0
+		case (b == 'u' || b == 'U') && matchWord(sql, i, "UNTIL"):
+			i = skipToEndOfWord(sql, i)
+			atStmtStart = false
+
+		default:
+			// Check for delimiter match at current position (only at top level).
+			if depth == 0 && matchDelimiter(sql, i, delim) {
+				seg := Segment{
+					Text:      sql[stmtStart:i],
+					ByteStart: stmtStart,
+					ByteEnd:   i,
+				}
+				if !seg.Empty() {
+					segments = append(segments, seg)
+				}
+				i += len(delim)
+				stmtStart = i
+				atStmtStart = true
+				continue
+			}
+			// Track the CREATE PROCEDURE parameter list. Nested type parens
+			// (DECIMAL(10,2)) balance out; when the header's own '(' closes, the
+			// body follows at a statement-start position.
+			if routineHeaderParen >= 0 {
+				switch b {
+				case '(':
+					routineHeaderParen++
+				case ')':
+					if routineHeaderParen > 0 {
+						routineHeaderParen--
+						if routineHeaderParen == 0 {
+							routineHeaderParen = -1
+							atStmtStart = true
+							i++
+							continue
+						}
+					}
+				}
+			}
+			switch b {
+			case ';', ':':
+				atStmtStart = true
+			case ' ', '\t', '\r', '\n':
+				// whitespace — transparent to atStmtStart.
+			default:
+				atStmtStart = false
+			}
+			i++
+		}
+	}
+
+	// Trailing content after the last delimiter.
+	if stmtStart < len(sql) {
+		seg := Segment{
+			Text:      sql[stmtStart:],
+			ByteStart: stmtStart,
+			ByteEnd:   len(sql),
+		}
+		if !seg.Empty() {
+			segments = append(segments, seg)
+		}
+	}
+
+	if len(segments) == 0 {
+		return nil
+	}
+	return segments
+}
+
+// skipSingleQuoteMySQL skips a single-quoted string starting at position i.
+// Handles a doubled quote and a backslash escape. Returns position after the
+// closing quote (or end of input if unterminated).
+func skipSingleQuoteMySQL(sql string, i int) int {
+	i++ // skip opening '
+	for i < len(sql) {
+		ch := sql[i]
+		if ch == '\\' {
+			i += 2 // skip backslash and escaped char
+			continue
+		}
+		if ch == '\'' {
+			i++
+			if i < len(sql) && sql[i] == '\'' {
+				i++ // escaped ''
+				continue
+			}
+			return i
+		}
+		i++
+	}
+	return i // unterminated
+}
+
+// skipDoubleQuoteMySQL skips a double-quoted string starting at position i.
+// MySQL treats double-quoted strings as string literals (not identifiers).
+// Handles "" escape and \ backslash escape. Returns position after the closing
+// quote (or end of input if unterminated).
+func skipDoubleQuoteMySQL(sql string, i int) int {
+	i++ // skip opening "
+	for i < len(sql) {
+		ch := sql[i]
+		if ch == '\\' {
+			i += 2 // skip backslash and escaped char
+			continue
+		}
+		if ch == '"' {
+			i++
+			if i < len(sql) && sql[i] == '"' {
+				i++ // escaped ""
+				continue
+			}
+			return i
+		}
+		i++
+	}
+	return i // unterminated
+}
+
+// skipBacktick skips a backtick-quoted identifier starting at position i.
+// Only a doubled backtick is an escape. Returns position after the closing
+// backtick (or end of input if unterminated).
+func skipBacktick(sql string, i int) int {
+	i++ // skip opening `
+	for i < len(sql) {
+		if sql[i] == '`' {
+			i++
+			if i < len(sql) && sql[i] == '`' {
+				i++ // escaped ``
+				continue
+			}
+			return i
+		}
+		i++
+	}
+	return i // unterminated
+}
+
+// isDashComment returns true if position i starts a MySQL -- comment.
+// MySQL requires -- to be followed by a space, tab, newline, or end-of-input.
+func isDashComment(sql string, i int) bool {
+	if sql[i] != '-' || i+1 >= len(sql) || sql[i+1] != '-' {
+		return false
+	}
+	// Must be followed by whitespace or end of input.
+	if i+2 >= len(sql) {
+		return true
+	}
+	c := sql[i+2]
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// skipDashComment skips a -- line comment starting at position i.
+// Returns position after the newline (or end of input).
+func skipDashComment(sql string, i int) int {
+	i += 2 // skip --
+	for i < len(sql) && sql[i] != '\n' {
+		i++
+	}
+	if i < len(sql) {
+		i++ // skip the \n
+	}
+	return i
+}
+
+// skipHashComment skips a # line comment starting at position i.
+// Returns position after the newline (or end of input).
+func skipHashComment(sql string, i int) int {
+	i++ // skip #
+	for i < len(sql) && sql[i] != '\n' {
+		i++
+	}
+	if i < len(sql) {
+		i++ // skip the \n
+	}
+	return i
+}
+
+// isExecutableCommentStart reports whether sql[i:] opens an executable
+// comment (/*!...*/, /*T!...*/, or a /*T![feature] gate TiDB supports), as the
+// lexer reads one (execOpener). The lexer searches for THAT comment's own close
+// at the first */ outside every token (lexer.go), so Split must agree on where
+// it ends; an ordinary comment, a gate for a feature TiDB does not support
+// included, closes at the first */ whatever surrounds it.
+func isExecutableCommentStart(sql string, i int) bool {
+	_, ok := execOpener(sql, i)
+	return ok
+}
+
+// skipBlockCommentMySQL skips a block comment starting at position i. An
+// ordinary MySQL, MariaDB, or TiDB block comment ends at the FIRST closing
+// */, even if its content contains further /* sequences; an executable
+// comment (/*!...*/ or /*T!...*/) ends at the first */ outside every token,
+// as the lexer reads it. Returns position after the closing */ (or end of
+// input).
+func skipBlockCommentMySQL(sql string, i int) int {
+	return skipBlockComment(sql, i, nil)
+}
+
+// skipBlockComment is skipBlockCommentMySQL with the memo Split keeps for the
+// closes of its executable comments; closes may be nil.
+func skipBlockComment(sql string, i int, closes *splitCloses) int {
+	if isExecutableCommentStart(sql, i) {
+		end, closed := skipExecutableComment(sql, i, closes)
+		if !closed {
+			// TiDB drops the opener of an executable comment that never closes and
+			// reads the rest as ordinary SQL, so a ';' after it is still a
+			// statement boundary: step over "/*" only and keep scanning.
+			return i + 2
+		}
+		return end
+	}
+	return skipOrdinaryBlockComment(sql, i)
+}
+
+// skipOrdinaryBlockComment skips a non-executable block comment starting at i.
+// Block comments do not nest, so it ends at the FIRST closing */ whatever its
+// content holds. Returns the position after that */, or end of input.
+func skipOrdinaryBlockComment(sql string, i int) int {
+	i += 2 // skip /*
+	for i < len(sql) {
+		if sql[i] == '*' && i+1 < len(sql) && sql[i+1] == '/' {
+			return i + 2
+		}
+		i++
+	}
+	return i
+}
+
+// skipExecutableComment finds the close of an executable comment the way the
+// lexer's execCommentClose does: at the first */ outside every string, quoted
+// identifier and line comment, because a */ the lexer reads as part of a token
+// closes nothing. Returns the position after the closing */ and whether one was
+// found. Split has to agree with the lexer here, or a ';' after such a comment
+// is a statement boundary to one and not to the other.
+func skipExecutableComment(sql string, i int, closes *splitCloses) (int, bool) {
+	if closes == nil {
+		return scanExecutableComment(sql, i, nil)
+	}
+	if closes.memo == nil {
+		if !execMemoAfter(closes.walked, len(sql)) {
+			end, closed := scanExecutableComment(sql, i, nil)
+			closes.walked += end - i
+			return end, closed
+		}
+		closes.memo = newExecCloseMemo(len(sql))
+	}
+	closes.memo.begin()
+	end, closed := scanExecutableComment(sql, i, closes.memo)
+	res := -1
+	if closed {
+		res = end - 2
+	}
+	closes.memo.end(res)
+	return end, closed
+}
+
+// splitCloses is the state that keeps one Split's executable-comment scans
+// linear in total: the bytes they have walked, and the memo built once that
+// passes twice the input's length (exec_close_memo.go).
+type splitCloses struct {
+	walked int
+	memo   *execCloseMemo
+}
+
+// scanExecutableComment is skipExecutableComment's scan. With a memo, it stops
+// at the first offset a recorded scan stood on and returns that scan's result.
+func scanExecutableComment(sql string, i int, m *execCloseMemo) (int, bool) {
+	i += 2 // skip /*
+	for i < len(sql) {
+		if m != nil {
+			if res, ok := m.visit(i); ok {
+				if res < 0 {
+					return len(sql), false
+				}
+				return res + 2, true
+			}
+		}
+		switch {
+		case sql[i] == '*' && i+1 < len(sql) && sql[i+1] == '/':
+			return i + 2, true
+		case sql[i] == '\'':
+			i = skipSingleQuoteMySQL(sql, i)
+		case sql[i] == '"':
+			i = skipDoubleQuoteMySQL(sql, i)
+		case sql[i] == '`':
+			i = skipBacktick(sql, i)
+		case isDashComment(sql, i):
+			i = skipDashComment(sql, i)
+		case sql[i] == '#':
+			i = skipHashComment(sql, i)
+		case sql[i] == '/' && i+1 < len(sql) && sql[i+1] == '*':
+			if body, ok := execOpener(sql, i); ok {
+				// TiDB does not nest executable comments: an opener inside one is
+				// dropped, as the lexer drops it.
+				i = body
+				continue
+			}
+			if m != nil {
+				// Openers nested in one another start their nested comments at
+				// different offsets, each running to the same "*/".
+				if at := m.rawClose(sql, i+2); at >= 0 {
+					i = at + 2
+				} else {
+					i = len(sql)
+				}
+				continue
+			}
+			i = skipOrdinaryBlockComment(sql, i)
+		default:
+			i++
+		}
+	}
+	return i, false
+}

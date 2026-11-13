@@ -1,0 +1,27 @@
+package parser
+
+import "github.com/Dxlxz/orrery-sql/starrocks/ast"
+
+// Diagnostic represents a syntax diagnostic (error or warning) with position.
+type Diagnostic struct {
+	Msg string
+	Loc ast.Loc
+}
+
+// Diagnose parses the input and returns any syntax errors as diagnostics.
+// It calls Parse internally; all ParseErrors (including lex errors promoted
+// during parseSingle) are converted to Diagnostics and returned.
+//
+// Note: while statement-level parsing is stubbed, valid SQL input produces
+// "not yet supported" diagnostics. Those disappear as Tier 1+ nodes implement
+// real parsing. Lexer errors (unterminated strings, unknown characters) are
+// always genuine diagnostics.
+func Diagnose(input string) []Diagnostic {
+	_, err := Parse(input)
+	errs := AllErrors(err)
+	diags := make([]Diagnostic, len(errs))
+	for i, e := range errs {
+		diags[i] = Diagnostic{Msg: e.Message, Loc: ast.Loc{Start: e.Position, End: e.End}}
+	}
+	return diags
+}

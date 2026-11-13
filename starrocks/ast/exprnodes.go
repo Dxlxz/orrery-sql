@@ -1,0 +1,522 @@
+package ast
+
+// This file holds expression AST node types for Doris SQL (T1.3).
+
+// ---------------------------------------------------------------------------
+// Operator types
+// ---------------------------------------------------------------------------
+
+// BinaryOp identifies a binary operator kind.
+type BinaryOp int
+
+const (
+	// Logical operators.
+	BinOr  BinaryOp = iota // OR, ||
+	BinAnd                 // AND, &&
+	BinXor                 // XOR
+
+	// Comparison operators.
+	BinEq         // =
+	BinNe         // <> or !=
+	BinLt         // <
+	BinGt         // >
+	BinLe         // <=
+	BinGe         // >=
+	BinNullSafeEq // <=>
+
+	// Arithmetic operators.
+	BinAdd    // +
+	BinSub    // -
+	BinMul    // *
+	BinDiv    // /
+	BinMod    // % or MOD
+	BinIntDiv // DIV
+
+	// Bitwise operators.
+	BinBitOr      // |
+	BinBitAnd     // &
+	BinBitXor     // ^
+	BinShiftLeft  // <<
+	BinShiftRight // >>
+
+	// JSON path operator. Unlike Doris, which has no `->` at all, StarRocks
+	// extracts a JSON path with it: j->'$.a'.
+	BinJSONArrow // ->
+)
+
+// String returns the SQL text form of the operator.
+func (op BinaryOp) String() string {
+	switch op {
+	case BinOr:
+		return "OR"
+	case BinAnd:
+		return "AND"
+	case BinXor:
+		return "XOR"
+	case BinEq:
+		return "="
+	case BinNe:
+		return "<>"
+	case BinLt:
+		return "<"
+	case BinGt:
+		return ">"
+	case BinLe:
+		return "<="
+	case BinGe:
+		return ">="
+	case BinNullSafeEq:
+		return "<=>"
+	case BinAdd:
+		return "+"
+	case BinSub:
+		return "-"
+	case BinMul:
+		return "*"
+	case BinDiv:
+		return "/"
+	case BinMod:
+		return "%"
+	case BinIntDiv:
+		return "DIV"
+	case BinBitOr:
+		return "|"
+	case BinBitAnd:
+		return "&"
+	case BinBitXor:
+		return "^"
+	case BinShiftLeft:
+		return "<<"
+	case BinShiftRight:
+		return ">>"
+	case BinJSONArrow:
+		return "->"
+	default:
+		return "?"
+	}
+}
+
+// UnaryOp identifies a unary operator kind.
+type UnaryOp int
+
+const (
+	UnaryMinus  UnaryOp = iota // -
+	UnaryPlus                  // +
+	UnaryBitNot                // ~
+	UnaryNot                   // NOT
+	UnaryBinary                // BINARY (cast-to-binary operator)
+)
+
+// String returns the SQL text form of the unary operator.
+func (op UnaryOp) String() string {
+	switch op {
+	case UnaryMinus:
+		return "-"
+	case UnaryPlus:
+		return "+"
+	case UnaryBitNot:
+		return "~"
+	case UnaryNot:
+		return "NOT"
+	case UnaryBinary:
+		return "BINARY"
+	default:
+		return "?"
+	}
+}
+
+// LitKind classifies a literal value.
+type LitKind int
+
+const (
+	LitInt     LitKind = iota // integer literal
+	LitFloat                  // decimal/float literal
+	LitString                 // string literal
+	LitBool                   // TRUE or FALSE
+	LitNull                   // NULL
+	LitKeyword                // keyword used as literal value, e.g. DEFAULT
+	LitHex                    // hex-string literal, e.g. X'4142'
+	LitBit                    // bit-string literal, e.g. B'101'
+)
+
+// CaseKind classifies a CASE expression as simple or searched.
+type CaseKind int
+
+const (
+	CaseSearched CaseKind = iota // CASE WHEN ...
+	CaseSimple                   // CASE operand WHEN ...
+)
+
+// ---------------------------------------------------------------------------
+// Expression nodes
+// ---------------------------------------------------------------------------
+
+// BinaryExpr represents a binary operation: left op right.
+type BinaryExpr struct {
+	Op    BinaryOp
+	Left  Node
+	Right Node
+	Loc   Loc
+}
+
+func (n *BinaryExpr) Tag() NodeTag { return T_BinaryExpr }
+
+var _ Node = (*BinaryExpr)(nil)
+
+// UnaryExpr represents a unary operation: op expr.
+type UnaryExpr struct {
+	Op   UnaryOp
+	Expr Node
+	Loc  Loc
+}
+
+func (n *UnaryExpr) Tag() NodeTag { return T_UnaryExpr }
+
+var _ Node = (*UnaryExpr)(nil)
+
+// IsExpr represents expr IS [NOT] NULL / TRUE / FALSE.
+type IsExpr struct {
+	Expr   Node
+	Not    bool
+	IsWhat string // "NULL", "TRUE", "FALSE"
+	Loc    Loc
+}
+
+func (n *IsExpr) Tag() NodeTag { return T_IsExpr }
+
+var _ Node = (*IsExpr)(nil)
+
+// BetweenExpr represents expr [NOT] BETWEEN low AND high.
+type BetweenExpr struct {
+	Expr Node
+	Low  Node
+	High Node
+	Not  bool
+	Loc  Loc
+}
+
+func (n *BetweenExpr) Tag() NodeTag { return T_BetweenExpr }
+
+var _ Node = (*BetweenExpr)(nil)
+
+// InExpr represents expr [NOT] IN (values...) or expr [NOT] IN (subquery).
+type InExpr struct {
+	Expr   Node
+	Values []Node // list of values; for subquery, contains one SubqueryExpr
+	Not    bool
+	Loc    Loc
+}
+
+func (n *InExpr) Tag() NodeTag { return T_InExpr }
+
+var _ Node = (*InExpr)(nil)
+
+// LikeExpr represents expr [NOT] LIKE pattern [ESCAPE esc].
+type LikeExpr struct {
+	Expr    Node
+	Pattern Node
+	Escape  Node // nil if no ESCAPE clause
+	Not     bool
+	Loc     Loc
+}
+
+func (n *LikeExpr) Tag() NodeTag { return T_LikeExpr }
+
+var _ Node = (*LikeExpr)(nil)
+
+// RegexpExpr represents expr [NOT] REGEXP|RLIKE pattern.
+type RegexpExpr struct {
+	Expr    Node
+	Pattern Node
+	Not     bool
+	Loc     Loc
+}
+
+func (n *RegexpExpr) Tag() NodeTag { return T_RegexpExpr }
+
+var _ Node = (*RegexpExpr)(nil)
+
+// FuncCallExpr represents a function call: name(args...).
+type FuncCallExpr struct {
+	Name        *ObjectName
+	Args        []Node
+	Distinct    bool           // COUNT(DISTINCT x)
+	Star        bool           // COUNT(*)
+	OrderBy     []*OrderByItem // optional ORDER BY in aggregate (GROUP_CONCAT)
+	Separator   string         // optional SEPARATOR value for GROUP_CONCAT
+	IgnoreNulls bool           // IGNORE NULLS null-treatment (FIRST_VALUE/LAST_VALUE/LEAD/LAG)
+	Over        *WindowSpec    // optional OVER (...) window specification
+	Loc         Loc
+}
+
+func (n *FuncCallExpr) Tag() NodeTag { return T_FuncCallExpr }
+
+var _ Node = (*FuncCallExpr)(nil)
+
+// WindowSpec is the OVER (...) specification attached to a window function
+// call: OVER ( [PARTITION BY ...] [ORDER BY ...] [frame] ), or OVER name for a
+// named window reference. It is a plain sub-node of FuncCallExpr (not a
+// standalone Node); the walker descends into its expression children via the
+// FuncCallExpr case.
+type WindowSpec struct {
+	Name        string         // named window reference (empty for the inline form)
+	PartitionBy []Node         // PARTITION BY expressions
+	OrderBy     []*OrderByItem // ORDER BY items
+	Frame       *WindowFrame   // optional frame clause (ROWS/RANGE ...)
+	Loc         Loc
+}
+
+// WindowFrame is a window frame clause inside an OVER spec:
+//
+//	(ROWS | RANGE) frame_bound
+//	(ROWS | RANGE) BETWEEN frame_bound AND frame_bound
+//
+// A bound is one of: UNBOUNDED PRECEDING, UNBOUNDED FOLLOWING, CURRENT ROW,
+// <expr> PRECEDING, <expr> FOLLOWING. StartExpr/EndExpr are non-nil only for
+// the "<expr> PRECEDING/FOLLOWING" forms; EndType is empty for a single-bound
+// frame (no BETWEEN).
+type WindowFrame struct {
+	Unit      string // "ROWS" or "RANGE"
+	StartType string // bound kind for the start/only bound
+	StartExpr Node
+	EndType   string // bound kind for the end bound; empty if no BETWEEN
+	EndExpr   Node
+	Loc       Loc
+}
+
+// CastExpr represents CAST(expr AS type) or TRY_CAST(expr AS type).
+type CastExpr struct {
+	Expr     Node
+	TypeName *TypeName
+	TryCast  bool // true for TRY_CAST
+	Loc      Loc
+}
+
+func (n *CastExpr) Tag() NodeTag { return T_CastExpr }
+
+var _ Node = (*CastExpr)(nil)
+
+// ExtractExpr represents EXTRACT(unit FROM expr).
+//
+// The grammar takes the unit as an identifier
+// (EXTRACT '(' field=identifier FROM source=valueExpression ')'), so Unit holds
+// the upper-cased source text rather than a closed enum.
+type ExtractExpr struct {
+	Expr Node
+	Unit string // e.g., "YEAR", "MONTH", "DAY_HOUR"
+	Loc  Loc
+}
+
+func (n *ExtractExpr) Tag() NodeTag { return T_ExtractExpr }
+
+var _ Node = (*ExtractExpr)(nil)
+
+// VariableRef represents a system variable (@@name, @@session.name,
+// @@global.name) or a user-defined variable (@name). It is deliberately not a
+// ColumnRef so that lineage and masking do not mistake it for a column.
+type VariableRef struct {
+	Name   string // variable name, without the @/@@ prefix and scope qualifier
+	Scope  string // "SESSION" or "GLOBAL"; empty when unqualified
+	System bool   // true for @@ (system) variables, false for @ (user) variables
+	Loc    Loc
+}
+
+func (n *VariableRef) Tag() NodeTag { return T_VariableRef }
+
+var _ Node = (*VariableRef)(nil)
+
+// LambdaExpr represents a lambda passed to a higher-order array function:
+// `x -> x + 1` or `(x, y) -> x + y`.
+type LambdaExpr struct {
+	Params []string
+	Body   Node
+	Loc    Loc
+}
+
+func (n *LambdaExpr) Tag() NodeTag { return T_LambdaExpr }
+
+var _ Node = (*LambdaExpr)(nil)
+
+// CaseExpr represents CASE [operand] WHEN...THEN...ELSE...END.
+type CaseExpr struct {
+	Kind    CaseKind
+	Operand Node // nil for searched CASE
+	Whens   []*WhenClause
+	Else    Node // nil if no ELSE
+	Loc     Loc
+}
+
+func (n *CaseExpr) Tag() NodeTag { return T_CaseExpr }
+
+var _ Node = (*CaseExpr)(nil)
+
+// WhenClause represents one WHEN cond THEN result arm of a CASE expression.
+type WhenClause struct {
+	Cond   Node
+	Result Node
+	Loc    Loc
+}
+
+func (n *WhenClause) Tag() NodeTag { return T_WhenClause }
+
+var _ Node = (*WhenClause)(nil)
+
+// SubqueryExpr is a placeholder for a subquery appearing in expression
+// position. Real subquery parsing comes in T1.4; for now it stores the
+// raw text between parentheses.
+type SubqueryExpr struct {
+	RawText string // raw SQL text of the subquery (without outer parens)
+
+	// TextStart is the byte offset of RawText's first character in the
+	// original input, so errors from re-parsing the raw text can be shifted
+	// back into the outer statement's coordinates.
+	TextStart int
+
+	// Query is the body as the strict parser parsed it in place, with
+	// locations in the parser's input like the rest of the tree. It is nil
+	// from ParseBestEffort, which leaves bodies raw, and for a body the
+	// strict parse scanned raw instead. Walk does not visit it: the node
+	// stays a placeholder leaf. Use it rather than parsing RawText again:
+	// reparsing the body at every level of n nested subqueries costs O(n²).
+	Query Node
+
+	Loc Loc
+}
+
+func (n *SubqueryExpr) Tag() NodeTag { return T_SubqueryExpr }
+
+var _ Node = (*SubqueryExpr)(nil)
+
+// ColumnRef represents a qualified column reference used as an expression.
+// It reuses ObjectName for the multipart identifier.
+type ColumnRef struct {
+	Name *ObjectName
+	Loc  Loc
+}
+
+func (n *ColumnRef) Tag() NodeTag { return T_ColumnRef }
+
+var _ Node = (*ColumnRef)(nil)
+
+// Literal represents a literal value: numeric, string, boolean, or NULL.
+type Literal struct {
+	Kind  LitKind
+	Value string // original source text
+	Loc   Loc
+}
+
+func (n *Literal) Tag() NodeTag { return T_Literal }
+
+var _ Node = (*Literal)(nil)
+
+// MapLiteral represents a map constructor literal:
+//
+//	map<k,v>{ key:val, ... }   (typed)
+//	MAP{ key:val, ... }        (untyped)
+//
+// MapType holds the map<k,v> type for the typed form and is nil for the
+// untyped MAP{...} form. The entries may be empty.
+type MapLiteral struct {
+	MapType *TypeName // map<k,v> type for the typed form; nil for MAP{...}
+	Entries []*MapEntry
+	Loc     Loc
+}
+
+func (n *MapLiteral) Tag() NodeTag { return T_MapLiteral }
+
+var _ Node = (*MapLiteral)(nil)
+
+// MapEntry is one key:value pair inside a MapLiteral.
+type MapEntry struct {
+	Key   Node
+	Value Node
+	Loc   Loc
+}
+
+func (n *MapEntry) Tag() NodeTag { return T_MapEntry }
+
+var _ Node = (*MapEntry)(nil)
+
+// ElementAtExpr represents collection element access: value[index]
+// (grammar: elementAt). Applies to array, map and struct values alike.
+type ElementAtExpr struct {
+	Value Node
+	Index Node
+	Loc   Loc
+}
+
+func (n *ElementAtExpr) Tag() NodeTag { return T_ElementAtExpr }
+
+var _ Node = (*ElementAtExpr)(nil)
+
+// GroupingSetsExpr represents GROUP BY GROUPING SETS ((a, b), (a), ()).
+// Each set is one parenthesized expression list; the empty set () is a nil
+// entry. Like CUBE, GROUPING SETS is the entire grouping specification.
+type GroupingSetsExpr struct {
+	Sets [][]Node
+	Loc  Loc
+}
+
+func (n *GroupingSetsExpr) Tag() NodeTag { return T_GroupingSetsExpr }
+
+var _ Node = (*GroupingSetsExpr)(nil)
+
+// ArrayLiteral represents an array constructor literal:
+//
+//	array<t>[ e, ... ]   (typed)
+//	[ e, ... ]           (untyped)
+//
+// ElemType holds the array<t> element type for the typed form and is nil for
+// the untyped [...] form. The elements may be empty.
+type ArrayLiteral struct {
+	ElemType *TypeName // array<t> element type for the typed form; nil for [...]
+	Elements []Node
+	Loc      Loc
+}
+
+func (n *ArrayLiteral) Tag() NodeTag { return T_ArrayLiteral }
+
+var _ Node = (*ArrayLiteral)(nil)
+
+// ParenExpr represents a parenthesized expression: (expr).
+type ParenExpr struct {
+	Expr Node
+	Loc  Loc
+}
+
+func (n *ParenExpr) Tag() NodeTag { return T_ParenExpr }
+
+var _ Node = (*ParenExpr)(nil)
+
+// ExistsExpr represents EXISTS (subquery).
+type ExistsExpr struct {
+	Subquery *SubqueryExpr
+	Loc      Loc
+}
+
+func (n *ExistsExpr) Tag() NodeTag { return T_ExistsExpr }
+
+var _ Node = (*ExistsExpr)(nil)
+
+// IntervalExpr represents INTERVAL expr unit.
+type IntervalExpr struct {
+	Value Node
+	Unit  string // e.g., "DAY", "HOUR", "MINUTE", "SECOND", "MONTH", "YEAR"
+	Loc   Loc
+}
+
+func (n *IntervalExpr) Tag() NodeTag { return T_IntervalExpr }
+
+var _ Node = (*IntervalExpr)(nil)
+
+// OrderByItem represents an expression with optional ASC/DESC and NULLS FIRST/LAST.
+type OrderByItem struct {
+	Expr       Node
+	Desc       bool  // true for DESC, false for ASC (default)
+	NullsFirst *bool // nil if not specified; true for NULLS FIRST, false for NULLS LAST
+	Loc        Loc
+}
+
+func (n *OrderByItem) Tag() NodeTag { return T_OrderByItem }
+
+var _ Node = (*OrderByItem)(nil)

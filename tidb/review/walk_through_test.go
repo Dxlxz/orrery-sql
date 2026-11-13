@@ -1,0 +1,484 @@
+package review
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/Dxlxz/orrery-sql/metadata"
+	"github.com/Dxlxz/orrery-sql/review"
+	"github.com/Dxlxz/orrery-sql/review/walk"
+	"github.com/Dxlxz/orrery-sql/review/walk/walktest"
+)
+
+// walkSchema is the synced shop database the unit tests walk on.
+func walkSchema() *metadata.DatabaseSchemaMetadata {
+	cols := func(names ...string) []*metadata.ColumnMetadata {
+		var out []*metadata.ColumnMetadata
+		for _, n := range names {
+			out = append(out, &metadata.ColumnMetadata{Name: n})
+		}
+		return out
+	}
+	return &metadata.DatabaseSchemaMetadata{
+		Name: "shop",
+		Schemas: []*metadata.SchemaMetadata{{
+			Tables: []*metadata.TableMetadata{
+				{
+					Name:        "t",
+					Columns:     cols("id", "a", "b"),
+					Indexes:     []*metadata.IndexMetadata{{Name: "PRIMARY", Primary: true, Unique: true}, {Name: "i"}},
+					ForeignKeys: []*metadata.ForeignKeyMetadata{{Name: "fk1", ReferencedTable: "r"}},
+				},
+				{Name: "r", Columns: cols("id"), Indexes: []*metadata.IndexMetadata{{Name: "PRIMARY", Primary: true, Unique: true}}},
+				{Name: "nokey", Columns: cols("a")},
+			},
+			Views:     []*metadata.ViewMetadata{{Name: "v"}},
+			Sequences: []*metadata.SequenceMetadata{{Name: "sq"}},
+		}},
+	}
+}
+
+func walkFindings(t *testing.T, sql string, targets ...review.Target) []review.Finding {
+	t.Helper()
+	result, err := Review(context.Background(), sql, review.Options{Rules: []review.Rule{review.WalkThrough}}, targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range result.Findings {
+		if err := review.CheckCodes(f); err != nil {
+			t.Error(err)
+		}
+	}
+	return result.Findings
+}
+
+// oneFinding asserts the change's one WALK_THROUGH finding.
+func oneFinding(t *testing.T, sql string, statement int, message string, target review.Target) {
+	t.Helper()
+	got := walkFindings(t, sql, target)
+	if len(got) != 1 || got[0].Statement != statement || got[0].Message != message {
+		t.Errorf("%s\nfindings = %+v, want statement %d: %q", sql, got, statement, message)
+	}
+}
+
+func noFinding(t *testing.T, sql string, target review.Target) {
+	t.Helper()
+	if got := walkFindings(t, sql, target); len(got) != 0 {
+		t.Errorf("%s\nfindings = %+v, want none", sql, got)
+	}
+}
+
+func TestWalkThroughTiDB(t *testing.T) {
+	shop := review.Target{Schema: walkSchema()}
+	oneFinding(t, "CREATE TABLE x (a int);\nCREATE TABLE t (a int);", 1, "Table `t` already exists.", shop)
+	oneFinding(t, "ALTER TABLE nosuch ADD COLUMN c int;", 0, "Table `nosuch` doesn't exist.", shop)
+	oneFinding(t, "ALTER TABLE v ADD COLUMN c int;", 0, "`v` is a view, not a table.", shop)
+	oneFinding(t, "ALTER TABLE t ADD COLUMN A int;", 0, "Column `A` already exists in `t`.", shop)
+	oneFinding(t, "ALTER TABLE t DROP COLUMN zz;", 0, "Column `zz` doesn't exist in `t`.", shop)
+	oneFinding(t, "ALTER TABLE t ADD INDEX I (a);", 0, "Index `I` already exists in `t`.", shop)
+	oneFinding(t, "ALTER TABLE t ADD PRIMARY KEY (a);", 0, "`t` already has a primary key.", shop)
+	oneFinding(t, "DROP TABLE t, nosuch;", 0, "Table `nosuch` doesn't exist.", shop)
+	oneFinding(t, "DROP VIEW t;", 0, "`t` is a table, not a view.", shop)
+	noFinding(t, "RENAME TABLE t TO tmp, r TO t, tmp TO r;\nALTER TABLE r ADD COLUMN zz int;\nALTER TABLE t ADD COLUMN zz int;", shop)
+	oneFinding(t, "RENAME TABLE t TO u;\nCREATE TABLE u (a int);", 1, "Table `u` already exists.", shop)
+	// A quoted `db.t` is one name, of the current database.
+	oneFinding(t, "ALTER TABLE t RENAME TO `q.t`;\nCREATE TABLE `q.t` (a int);", 1, "Table `` `q.t` `` already exists.", shop)
+}
+
+// TestWalkThroughTiDBAlterTable pins spec §3.3: every subcommand is judged
+// against the table as it was, two subcommands on one column or index fail
+// from the text, and RENAME TO takes no other subcommand.
+func TestWalkThroughTiDBAlterTable(t *testing.T) {
+	shop := review.Target{Schema: walkSchema()}
+	// MySQL runs the drops first; TiDB judges each against the table as it
+	// was (1060, 1061, 1054).
+	oneFinding(t, "ALTER TABLE t ADD COLUMN a int, DROP COLUMN a;", 0, "Column `a` already exists in `t`.", shop)
+	oneFinding(t, "ALTER TABLE t DROP INDEX i, ADD INDEX i (b);", 0, "Index `i` already exists in `t`.", shop)
+	oneFinding(t, "ALTER TABLE t RENAME COLUMN a TO c, ADD COLUMN a int;", 0, "Column `a` already exists in `t`.", shop)
+	oneFinding(t, "ALTER TABLE t RENAME COLUMN a TO b, RENAME COLUMN b TO a;", 0, "Column `b` already exists in `t`.", shop)
+	oneFinding(t, "ALTER TABLE t ADD COLUMN y1 int, ADD COLUMN y2 int AFTER y1;", 0, "Column `y1` doesn't exist in `t`.", shop)
+	oneFinding(t, "ALTER TABLE t ADD COLUMN x int, MODIFY x bigint;", 0, "Column `x` doesn't exist in `t`.", shop)
+	oneFinding(t, "ALTER TABLE t DROP PRIMARY KEY, ADD PRIMARY KEY (a);", 0, "`t` already has a primary key.", shop)
+	noFinding(t, "ALTER TABLE t DROP INDEX i, ADD INDEX j (b);\nALTER TABLE t DROP INDEX j;\nALTER TABLE t ADD INDEX i (a);", shop)
+	// Repeated subcommands (8200).
+	oneFinding(t, "ALTER TABLE t ADD COLUMN c int, ADD COLUMN c int;", 0, "This statement adds column `c` twice.", shop)
+	oneFinding(t, "ALTER TABLE t DROP INDEX i, DROP INDEX I;", 0, "This statement drops index `I` twice.", shop)
+	oneFinding(t, "ALTER TABLE t DROP PRIMARY KEY, DROP INDEX `PRIMARY`;", 0, "This statement drops index `` `PRIMARY` `` twice.", shop)
+	oneFinding(t, "ALTER TABLE nokey ADD PRIMARY KEY (a), ADD PRIMARY KEY (a);", 0, "`nokey` already has a primary key.", shop)
+	// TiDB drops fk1 and then fails (1091): the oracle judges it by its
+	// code (walktest.PartialRejecter).
+	oneFinding(t, "ALTER TABLE t DROP FOREIGN KEY fk1, DROP FOREIGN KEY fk1;", 0, "This statement drops foreign key `fk1` twice.", shop)
+	// TiDB loops on this one's rollback, so the oracle cannot run it.
+	oneFinding(t, "ALTER TABLE t ADD CONSTRAINT f2 FOREIGN KEY (a) REFERENCES r (id), ADD CONSTRAINT F2 FOREIGN KEY (b) REFERENCES r (id);", 0, "This statement adds foreign key `F2` twice.", shop)
+	// RENAME TO beside another subcommand (8200), but ALGORITHM and LOCK.
+	oneFinding(t, "ALTER TABLE t COMMENT 'x', RENAME TO t2;", 0, "TiDB doesn't accept `RENAME TO` with other changes to `t`.", shop)
+	oneFinding(t, "ALTER TABLE t RENAME TO t2, RENAME TO t3;", 0, "TiDB doesn't accept `RENAME TO` with other changes to `t`.", shop)
+	noFinding(t, "ALTER TABLE t COMMENT 'x', RENAME TO t;\nALTER TABLE t ADD COLUMN zz int, RENAME TO T;", shop)
+	noFinding(t, "ALTER TABLE t ALGORITHM = INSTANT, LOCK = NONE, RENAME TO t2;\nCREATE TABLE t (a int);\nALTER TABLE t2 ADD COLUMN zz int;", shop)
+	// DROP COLUMN IF EXISTS of a missing column is a note, and the
+	// statement goes on without it.
+	noFinding(t, "ALTER TABLE t DROP COLUMN IF EXISTS zz;\nALTER TABLE t DROP COLUMN IF EXISTS zz, DROP COLUMN IF EXISTS zz;", shop)
+	oneFinding(t, "ALTER TABLE t ADD COLUMN q int, DROP COLUMN IF EXISTS q;\nALTER TABLE t ADD COLUMN q int;", 1, "Column `q` already exists in `t`.", shop)
+	oneFinding(t, "ALTER TABLE t DROP COLUMN IF EXISTS a;\nALTER TABLE t DROP COLUMN a;", 1, "Column `a` doesn't exist in `t`.", shop)
+	// TiDB checks no length in CHANGE or RENAME COLUMN.
+	long := strings.Repeat("c", 65)
+	noFinding(t, "ALTER TABLE t CHANGE a "+long+" int;\nALTER TABLE t RENAME COLUMN b TO "+long+"2;", shop)
+	oneFinding(t, "ALTER TABLE t ADD COLUMN "+long+" int;", 0, "The name `"+long+"` is longer than TiDB's 64-character limit.", shop)
+	// A local temporary table ends the walk (8200).
+	noFinding(t, "CREATE TEMPORARY TABLE tt (a int);\nALTER TABLE tt ADD COLUMN b int;\nCREATE TABLE t (a int);", shop)
+}
+
+// TestWalkThroughTiDBForeignKeys pins spec §3.4: names are the table's,
+// generated ones are fk_<n> and survive RENAME TABLE, and ENGINE is
+// ignored.
+func TestWalkThroughTiDBForeignKeys(t *testing.T) {
+	on := review.Target{Schema: walkSchema(), ForeignKeyChecks: review.SwitchOn}
+	noFinding(t, "ALTER TABLE nokey ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES r (id);\nCREATE TABLE x (a int, CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES r (id));", on)
+	oneFinding(t, "ALTER TABLE t ADD CONSTRAINT FK1 FOREIGN KEY (a) REFERENCES r (id);", 0, "Foreign key `FK1` already exists in `t`.", on)
+	oneFinding(t, "ALTER TABLE nokey DROP FOREIGN KEY fk1;", 0, "Foreign key `fk1` doesn't exist in `nokey`.", on)
+	oneFinding(t, "ALTER TABLE t DROP FOREIGN KEY fk1, ADD CONSTRAINT fk1 FOREIGN KEY (b) REFERENCES r (id);", 0, "Foreign key `fk1` already exists in `t`.", on)
+	oneFinding(t, "CREATE TABLE x (a int, CONSTRAINT f FOREIGN KEY (a) REFERENCES r (id), CONSTRAINT F FOREIGN KEY (a) REFERENCES r (id));", 0, "This statement declares foreign key `F` twice.", on)
+	noFinding(t, "CREATE TABLE g (id int, b int, FOREIGN KEY (b) REFERENCES r (id));\nRENAME TABLE g TO h;\nALTER TABLE h DROP FOREIGN KEY fk_1;", on)
+	oneFinding(t, "CREATE TABLE g (id int, b int, FOREIGN KEY (b) REFERENCES r (id));\nRENAME TABLE g TO h;\nALTER TABLE h DROP FOREIGN KEY g_ibfk_1;", 2, "Foreign key `g_ibfk_1` doesn't exist in `h`.", on)
+	oneFinding(t, "RENAME TABLE t TO u;\nALTER TABLE u DROP FOREIGN KEY fk1;\nALTER TABLE u DROP FOREIGN KEY fk1;", 2, "Foreign key `fk1` doesn't exist in `u`.", on)
+	oneFinding(t, "CREATE TABLE my (a int, FOREIGN KEY (a) REFERENCES nosuch (id)) ENGINE=MyISAM;", 0, "Referenced table `nosuch` doesn't exist.", on)
+	oneFinding(t, "CREATE TABLE my (a int) ENGINE=MyISAM;\nALTER TABLE my DROP FOREIGN KEY nosuch;", 1, "Foreign key `nosuch` doesn't exist in `my`.", on)
+	oneFinding(t, "ALTER TABLE nokey ENGINE=MyISAM;\nALTER TABLE nokey DROP FOREIGN KEY nosuch;", 1, "Foreign key `nosuch` doesn't exist in `nokey`.", on)
+	oneFinding(t, "CREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES sq (id));", 0, "`sq` is a sequence, not a table a foreign key can reference.", on)
+	oneFinding(t, "CREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES v (id));", 0, "`v` is a view, not a table a foreign key can reference.", on)
+}
+
+// TestWalkThroughTiDBConstraintNames pins the names a key takes: a foreign
+// key and its index, and a UNIQUE key, take the CONSTRAINT symbol, or
+// without one the name after FOREIGN KEY or UNIQUE, which counts as long
+// only then. A CHECK constraint's long name is taken while CHECK
+// constraints are off, TiDB's default, which the walk cannot tell
+// (verified on v8.5.5).
+func TestWalkThroughTiDBConstraintNames(t *testing.T) {
+	on := review.Target{Schema: walkSchema(), ForeignKeyChecks: review.SwitchOn}
+	long := strings.Repeat("f", 65)
+	noFinding(t, "CREATE TABLE x (a int, CONSTRAINT cx FOREIGN KEY fx (a) REFERENCES r (id));\nALTER TABLE x DROP FOREIGN KEY cx;\nALTER TABLE x DROP INDEX cx;", on)
+	oneFinding(t, "CREATE TABLE x (a int, CONSTRAINT cx FOREIGN KEY fx (a) REFERENCES r (id));\nALTER TABLE x DROP FOREIGN KEY fx;", 1, "Foreign key `fx` doesn't exist in `x`.", on)
+	noFinding(t, "CREATE TABLE y (a int, FOREIGN KEY fy (a) REFERENCES r (id));\nALTER TABLE y DROP FOREIGN KEY fy;", on)
+	noFinding(t, "ALTER TABLE t ADD CONSTRAINT nk FOREIGN KEY fk1 (a) REFERENCES r (id);", on)
+	oneFinding(t, "ALTER TABLE t ADD FOREIGN KEY fk1 (a) REFERENCES r (id);", 0, "Foreign key `fk1` already exists in `t`.", on)
+	noFinding(t, "CREATE TABLE u (a int, CONSTRAINT cu UNIQUE KEY uu (a));\nALTER TABLE u DROP INDEX cu;", on)
+	oneFinding(t, "CREATE TABLE u (a int, CONSTRAINT cu UNIQUE KEY uu (a));\nALTER TABLE u DROP INDEX uu;", 1, "Index `uu` doesn't exist in `u`.", on)
+	noFinding(t, "ALTER TABLE t ADD CONSTRAINT cu UNIQUE KEY i (b);", on)
+	oneFinding(t, "ALTER TABLE t ADD CONSTRAINT i UNIQUE KEY cu (b);", 0, "Index `i` already exists in `t`.", on)
+	noFinding(t, "CREATE TABLE w (a int, CONSTRAINT cw FOREIGN KEY "+long+" (a) REFERENCES r (id), CONSTRAINT cu UNIQUE KEY "+long+"2 (a));", on)
+	oneFinding(t, "CREATE TABLE w (a int, FOREIGN KEY "+long+" (a) REFERENCES r (id));", 0, "The name `"+long+"` is longer than TiDB's 64-character limit.", on)
+	oneFinding(t, "ALTER TABLE nokey ADD UNIQUE KEY "+long+" (a);", 0, "The name `"+long+"` is longer than TiDB's 64-character limit.", on)
+	noFinding(t, "CREATE TABLE k (a int, CONSTRAINT "+long+" CHECK (a > 0));\nALTER TABLE k ADD CONSTRAINT "+long+"2 CHECK (a > 1);", on)
+}
+
+// TestWalkThroughTiDBObjects pins spec §3.2 and §3.5: no triggers,
+// functions, events, or procedures, sequences as relations, the kinds IF
+// EXISTS does not cover, and DROP forms TiDB does not run atomically.
+func TestWalkThroughTiDBObjects(t *testing.T) {
+	shop := review.Target{Schema: walkSchema()}
+	// CREATE and DROP PROCEDURE fail (8108) and end the walk.
+	noFinding(t, "CREATE PROCEDURE p() SELECT 1;\nCREATE TABLE t (a int);", shop)
+	noFinding(t, "DROP PROCEDURE IF EXISTS p;\nCREATE TABLE t (a int);", shop)
+	// TiDB has no ALTER VIEW (1064): it is a syntax finding, and the walk
+	// follows nothing after it.
+	oneFinding(t, "ALTER VIEW v AS SELECT 1 AS a;\nCREATE TABLE t (a int);", 0, `syntax error at or near "VIEW"`, shop)
+	// DML runs no trigger: a temporary table stays known.
+	oneFinding(t, "INSERT INTO t (id) VALUES (1);\nDROP TEMPORARY TABLE nosuch;", 1, "Temporary table `nosuch` doesn't exist.", shop)
+	oneFinding(t, "CREATE TEMPORARY TABLE tt (a int);\nUPDATE t JOIN r ON r.id = t.a SET t.a = 1;\nCREATE TEMPORARY TABLE tt (a int);", 2, "Temporary table `tt` already exists.", shop)
+	// Sequences are synced relations of their own kind.
+	oneFinding(t, "CREATE TABLE sq (a int);", 0, "The name `sq` is already taken.", shop)
+	oneFinding(t, "CREATE SEQUENCE SQ;", 0, "Sequence `SQ` already exists.", shop)
+	oneFinding(t, "CREATE SEQUENCE t;", 0, "The name `t` is already taken.", shop)
+	noFinding(t, "CREATE SEQUENCE IF NOT EXISTS sq;\nCREATE TEMPORARY TABLE sq (a int);", shop)
+	oneFinding(t, "DROP SEQUENCE nosuch;", 0, "Sequence `nosuch` doesn't exist.", shop)
+	oneFinding(t, "DROP SEQUENCE t;", 0, "`t` is a table, not a sequence.", shop)
+	noFinding(t, "DROP SEQUENCE IF EXISTS t, nosuch;\nDROP TABLE t;", shop)
+	oneFinding(t, "DROP SEQUENCE sq;\nDROP SEQUENCE sq;", 1, "Sequence `sq` doesn't exist.", shop)
+	oneFinding(t, "CREATE TEMPORARY TABLE tt (a int);\nDROP SEQUENCE tt;", 1, "Sequence `tt` doesn't exist.", shop)
+	oneFinding(t, "CREATE SEQUENCE s2;\nRENAME TABLE s2 TO s3;\nDROP SEQUENCE s2;", 2, "Sequence `s2` doesn't exist.", shop)
+	oneFinding(t, "DROP DATABASE shop;\nDROP SEQUENCE IF EXISTS sq;", 1, "No database is selected for `sq`.", shop)
+	oneFinding(t, "ALTER TABLE sq COMMENT 'x';", 0, "`sq` is a sequence, not a table.", shop)
+	oneFinding(t, "TRUNCATE TABLE sq;", 0, "`sq` is a sequence, not a table.", shop)
+	oneFinding(t, "DROP TABLE sq;", 0, "`sq` is a sequence, not a table.", shop)
+	oneFinding(t, "CREATE OR REPLACE VIEW sq AS SELECT 1 AS a;", 0, "`sq` is a sequence, not a view.", shop)
+	oneFinding(t, "CREATE TABLE x LIKE sq;", 0, "`sq` is a sequence, not a table.", shop)
+	// DROP TABLE IF EXISTS leaves a sequence or a view with a note.
+	oneFinding(t, "DROP TABLE IF EXISTS sq;\nDROP SEQUENCE sq;\nDROP SEQUENCE sq;", 2, "Sequence `sq` doesn't exist.", shop)
+	noFinding(t, "DROP TABLE IF EXISTS v;\nDROP VIEW v;", shop)
+	// DROP VIEW IF EXISTS of a table or a sequence fails (1347).
+	oneFinding(t, "DROP VIEW IF EXISTS t;", 0, "`t` is a table, not a view.", shop)
+	oneFinding(t, "DROP VIEW IF EXISTS sq;", 0, "`sq` is a sequence, not a view.", shop)
+	noFinding(t, "DROP VIEW IF EXISTS nosuch, v;", shop)
+	// CREATE INDEX of an expression succeeds on a view or a sequence: the
+	// walk ends there.
+	noFinding(t, "CREATE INDEX k ON v ((1 + 1));\nCREATE TABLE t (a int);", shop)
+	noFinding(t, "CREATE INDEX k ON sq ((1 + 1));\nDROP INDEX k ON sq;\nCREATE TABLE t (a int);", shop)
+	oneFinding(t, "CREATE INDEX k ON nosuch (a);", 0, "Table `nosuch` doesn't exist.", shop)
+	// DROP INDEX IF EXISTS makes a missing index a warning rather than a 1091,
+	// and still fails on a table that is not there: IF EXISTS speaks for the
+	// index, not for the table.
+	noFinding(t, "DROP INDEX IF EXISTS nosuch ON t;", shop)
+	noFinding(t, "DROP INDEX i ON t;\nDROP INDEX IF EXISTS i ON t;", shop)
+	noFinding(t, "DROP INDEX IF EXISTS i ON t;\nCREATE INDEX i ON t (a);", shop)
+	oneFinding(t, "DROP INDEX IF EXISTS i ON nosuch;", 0, "Table `nosuch` doesn't exist.", shop)
+	// LOCK STATS and UNLOCK STATS are not lowered, so the walk claims nothing
+	// from them and reports nothing either.
+	noFinding(t, "LOCK STATS t;", shop)
+	noFinding(t, "UNLOCK STATS t, r;", shop)
+	noFinding(t, "LOCK STATS t PARTITION p0;", shop)
+	noFinding(t, "LOCK STATS nosuch;", shop)
+	noFinding(t, "LOCK STATS t;\nALTER TABLE t DROP COLUMN zz;", shop)
+	// TiDB drops what it can of these before it fails; the statement fails
+	// all the same, and the oracle judges each by its code.
+	oneFinding(t, "DROP TABLE t, nosuch;", 0, "Table `nosuch` doesn't exist.", shop)
+	oneFinding(t, "DROP TABLE t, v;", 0, "`v` is a view, not a table.", shop)
+	oneFinding(t, "DROP TABLE t, sq;", 0, "`sq` is a sequence, not a table.", shop)
+	oneFinding(t, "DROP VIEW v, nosuch;", 0, "View `nosuch` doesn't exist.", shop)
+	oneFinding(t, "DROP SEQUENCE sq, nosuch;", 0, "Sequence `nosuch` doesn't exist.", shop)
+	// The hidden row id is Unknown; the primary key's absence is trusted.
+	noFinding(t, "ALTER TABLE nokey ADD COLUMN x int AFTER _tidb_rowid;\nALTER TABLE nokey DROP COLUMN _tidb_rowid;", shop)
+	noFinding(t, "CREATE TABLE g (a int);\nALTER TABLE g DROP COLUMN _tidb_rowid;", shop)
+	oneFinding(t, "ALTER TABLE nokey DROP PRIMARY KEY;", 0, "`nokey` has no primary key.", shop)
+	oneFinding(t, "CREATE TABLE g (a int);\nALTER TABLE g DROP PRIMARY KEY;", 1, "`g` has no primary key.", shop)
+	// TiDB checks no length in DROP TABLE.
+	long := strings.Repeat("d", 65)
+	noFinding(t, "DROP TABLE IF EXISTS "+long+";", shop)
+	oneFinding(t, "DROP TABLE "+long+";", 0, "Table `"+long+"` doesn't exist.", shop)
+}
+
+func TestWalkThroughTiDBCase(t *testing.T) {
+	// lower_case_table_names is 2 on TiDB, whatever the target says.
+	for _, lctn := range []int{0, 1, 2} {
+		target := review.Target{Schema: walkSchema(), LowerCaseTableNames: lctn}
+		oneFinding(t, "CREATE TABLE T (a int);", 0, "Table `T` already exists.", target)
+		oneFinding(t, "CREATE DATABASE SHOP;", 0, "Database `SHOP` already exists.", target)
+		oneFinding(t, "CREATE TEMPORARY TABLE tt (a int);\nCREATE TEMPORARY TABLE TT (a int);", 1, "Temporary table `TT` already exists.", target)
+	}
+}
+
+// TestWalkThroughTiDBNamesOutsideASCII pins that the walk follows no name
+// outside ASCII, which TiDB compares by rules of its own per space: a
+// statement that names one ends the walk, and a synced space that lists
+// one has no name known to be absent, since the Kelvin sign is k.
+func TestWalkThroughTiDBNamesOutsideASCII(t *testing.T) {
+	shop := review.Target{Schema: walkSchema()}
+	noFinding(t, "ALTER TABLE t DROP COLUMN `é`;", shop)
+	noFinding(t, "CREATE TABLE x (id INT, café INT);\nALTER TABLE x DROP COLUMN CAFé;", shop)
+	noFinding(t, "CREATE TABLE x (k INT);\nALTER TABLE x DROP COLUMN `\u212a`;\nALTER TABLE x DROP COLUMN zz;", shop)
+	// A string is no name.
+	oneFinding(t, "CREATE TABLE x (a int) COMMENT '中文';\nCREATE TABLE x (a int);", 1, "Table `x` already exists.", shop)
+	oneFinding(t, "INSERT INTO nokey VALUES ('é');\nDROP TEMPORARY TABLE nosuch;", 1, "Temporary table `nosuch` doesn't exist.", shop)
+	kelvin := walkSchema()
+	tables := kelvin.Schemas[0].Tables
+	tables[2].Columns = append(tables[2].Columns, &metadata.ColumnMetadata{Name: "\u212a"})
+	kelvin.Schemas[0].Tables = append(tables, &metadata.TableMetadata{Name: "t\u212a"})
+	target := review.Target{Schema: kelvin}
+	noFinding(t, "ALTER TABLE nokey DROP COLUMN k;\nALTER TABLE nokey DROP COLUMN zz;\nDROP TABLE tk;\nDROP TABLE nosuch;", target)
+	oneFinding(t, "ALTER TABLE t DROP COLUMN zz;", 0, "Column `zz` doesn't exist in `t`.", target)
+}
+
+func TestWalkThroughTiDBSession(t *testing.T) {
+	shop := review.Target{Schema: walkSchema()}
+	// Another database is unknown, until the change makes it.
+	noFinding(t, "USE other;\nCREATE TABLE t (a int);", shop)
+	oneFinding(t, "CREATE DATABASE q;\nCREATE TABLE q.x (a int);\nCREATE TABLE q.x (a int);", 2, "Table `q.x` already exists.", shop)
+	oneFinding(t, "DROP DATABASE shop;\nCREATE TABLE x (a int);", 1, "No database is selected for `x`.", shop)
+	oneFinding(t, "DROP DATABASE shop;\nCREATE SEQUENCE s;", 1, "No database is selected for `s`.", shop)
+	// A temporary table shadows the base table.
+	noFinding(t, "CREATE TEMPORARY TABLE nosuch (a int);\nALTER TABLE t ADD COLUMN zz int;\nINSERT INTO nosuch VALUES (1);", shop)
+	oneFinding(t, "DROP TEMPORARY TABLE t;", 0, "Temporary table `t` doesn't exist.", shop)
+	// A foreign key's target is checked only while the checks are on.
+	noFinding(t, "CREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES nosuch (id));", shop)
+	oneFinding(t, "SET foreign_key_checks = 1;\nCREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES nosuch (id));", 1, "Referenced table `nosuch` doesn't exist.", shop)
+	on := review.Target{Schema: walkSchema(), ForeignKeyChecks: review.SwitchOn}
+	noFinding(t, "SET FOREIGN_KEY_CHECKS = 0;\nCREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES nosuch (id));", on)
+	// Every assignment of foreign_key_checks reaches the session, GLOBAL
+	// too, in order.
+	noFinding(t, "SET GLOBAL foreign_key_checks = 0;\nCREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES nosuch (id));", on)
+	noFinding(t, "SET @@global.foreign_key_checks = 0;\nCREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES nosuch (id));", on)
+	oneFinding(t, "SET GLOBAL foreign_key_checks = 1;\nCREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES nosuch (id));", 1, "Referenced table `nosuch` doesn't exist.", shop)
+	noFinding(t, "SET GLOBAL foreign_key_checks = 1, @@session.foreign_key_checks = 0;\nCREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES nosuch (id));", on)
+	noFinding(t, "SET GLOBAL foreign_key_checks = 1, foreign_key_checks = 0;\nCREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES nosuch (id));", on)
+	oneFinding(t, "SET GLOBAL foreign_key_checks = 0, @@session.foreign_key_checks = 1;\nCREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES nosuch (id));", 1, "Referenced table `nosuch` doesn't exist.", shop)
+	oneFinding(t, "SET GLOBAL sql_mode = '', foreign_key_checks = 1;\nCREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES nosuch (id));", 1, "Referenced table `nosuch` doesn't exist.", shop)
+	// With another spec of the plan, only the change's own facts count.
+	other := review.Target{Schema: walkSchema(), OtherSpecs: true}
+	noFinding(t, "CREATE TABLE t (a int);", other)
+	oneFinding(t, "CREATE TABLE x (a int);\nCREATE TABLE x (a int);", 1, "Table `x` already exists.", other)
+}
+
+// TestWalkThroughTiDBTargetGroups pins OtherSpecs and ForeignKeyChecks in
+// the target grouping: two targets of one schema that differ in either are
+// walked apart.
+func TestWalkThroughTiDBTargetGroups(t *testing.T) {
+	schema := walkSchema()
+	got := walkFindings(t, "CREATE TABLE t (a int);", review.Target{Schema: schema}, review.Target{Schema: schema, OtherSpecs: true})
+	if len(got) != 1 || len(got[0].Targets) != 1 || got[0].Targets[0] != 0 {
+		t.Errorf("OtherSpecs: findings = %+v, want one on target 0", got)
+	}
+	got = walkFindings(t, "CREATE TABLE x (a int, FOREIGN KEY (a) REFERENCES nosuch (id));", review.Target{Schema: schema}, review.Target{Schema: schema, ForeignKeyChecks: review.SwitchOn})
+	if len(got) != 1 || len(got[0].Targets) != 1 || got[0].Targets[0] != 1 {
+		t.Errorf("ForeignKeyChecks: findings = %+v, want one on target 1", got)
+	}
+}
+
+// TestWalkThroughTiDBExplain pins what EXPLAIN does to the walk. Reporting a
+// plan changes nothing, so a plain EXPLAIN is followed and recorded as
+// nothing; ANALYZE runs the statement it carries, and on TiDB that reaches
+// DDL, so the walk follows the change it makes
+// (tidb/parser/explain_forms_test.go measures both against v8.5.5).
+func TestWalkThroughTiDBExplain(t *testing.T) {
+	shop := review.Target{Schema: walkSchema()}
+	// EXPLAIN ALTER TABLE leaves the table as it was, so the same change
+	// after it is not a repeat and a missing table is nobody's problem.
+	noFinding(t, "EXPLAIN ALTER TABLE t ADD COLUMN c int;\nALTER TABLE t ADD COLUMN c int;", shop)
+	noFinding(t, "EXPLAIN FORMAT = 'brief' ALTER TABLE t ADD COLUMN c int;\nALTER TABLE t ADD COLUMN c int;", shop)
+	noFinding(t, "EXPLAIN ALTER TABLE nosuch ADD COLUMN c int;", shop)
+	noFinding(t, "EXPLAIN ALTER TABLE t ADD COLUMN a int;", shop)
+	// EXPLAIN ANALYZE ALTER TABLE makes the change, so the column is there
+	// for the statement that follows (1060)...
+	oneFinding(t, "EXPLAIN ANALYZE ALTER TABLE t ADD COLUMN c int;\nALTER TABLE t ADD COLUMN c int;", 1,
+		"Column `c` already exists in `t`.", shop)
+	// ...and the change it carries is judged itself.
+	oneFinding(t, "EXPLAIN ANALYZE ALTER TABLE t ADD COLUMN a int;", 0,
+		"Column `a` already exists in `t`.", shop)
+	oneFinding(t, "EXPLAIN ANALYZE ALTER TABLE nosuch ADD COLUMN c int;", 0,
+		"Table `nosuch` doesn't exist.", shop)
+	// A query EXPLAIN ANALYZE runs still changes no name the walk keeps.
+	noFinding(t, "EXPLAIN ANALYZE SELECT 1;\nEXPLAIN ANALYZE UPDATE t SET a = 1;", shop)
+}
+
+// walkForms are the statement forms the walk lowers (the MySQL spec's §5
+// table, with spec §3's TiDB deltas), each on walkSchema. A form the table
+// lists must lower.
+var walkForms = []walktest.Form{
+	{SQL: "CREATE DATABASE q;"},
+	{SQL: "CREATE DATABASE IF NOT EXISTS shop;"},
+	{SQL: "DROP DATABASE IF EXISTS q;"},
+	{SQL: "ALTER DATABASE shop CHARACTER SET utf8mb4;"},
+	{SQL: "USE shop;"},
+	{SQL: "CREATE TABLE x (a int PRIMARY KEY, b int UNIQUE, KEY k (b), CONSTRAINT fx FOREIGN KEY (a) REFERENCES r (id), CHECK (a > 0));"},
+	{SQL: "CREATE TABLE IF NOT EXISTS t (a int);"},
+	{SQL: "CREATE TEMPORARY TABLE tmp (a int);"},
+	{SQL: "CREATE TABLE x LIKE t;"},
+	{SQL: "CREATE TABLE x AS SELECT 1 AS a;"},
+	{SQL: "ALTER TABLE t ADD COLUMN c int AFTER a, ADD COLUMN (d int, e int);"},
+	{SQL: "ALTER TABLE t DROP COLUMN a;"},
+	{SQL: "ALTER TABLE t DROP COLUMN IF EXISTS zz;"},
+	{SQL: "ALTER TABLE t MODIFY COLUMN a bigint;"},
+	{SQL: "ALTER TABLE t CHANGE a c int;"},
+	{SQL: "ALTER TABLE t RENAME COLUMN a TO c;"},
+	{SQL: "ALTER TABLE t ALTER COLUMN a SET DEFAULT 1;"},
+	{SQL: "ALTER TABLE t ADD INDEX k (a), ADD UNIQUE (b), ADD FULLTEXT INDEX ft (a);"},
+	{SQL: "ALTER TABLE nokey ADD PRIMARY KEY (a);"},
+	{SQL: "ALTER TABLE nokey ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES r (id);"},
+	{SQL: "ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0);"},
+	{SQL: "ALTER TABLE t DROP INDEX i, DROP KEY i2;"},
+	{SQL: "ALTER TABLE t DROP PRIMARY KEY;"},
+	{SQL: "ALTER TABLE t DROP FOREIGN KEY fk1;"},
+	{SQL: "ALTER TABLE t DROP CHECK c;"},
+	{SQL: "ALTER TABLE t DROP CONSTRAINT c;"},
+	{SQL: "ALTER TABLE t RENAME INDEX i TO j;"},
+	{SQL: "ALTER TABLE t ALTER INDEX i INVISIBLE;"},
+	{SQL: "ALTER TABLE t RENAME TO t2;"},
+	{SQL: "ALTER TABLE t ALGORITHM = INSTANT, LOCK = NONE, RENAME TO t2;"},
+	{SQL: "ALTER TABLE t ENGINE = InnoDB, COMMENT 'x', ALGORITHM = INPLACE, LOCK = NONE;"},
+	{SQL: "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4;"},
+	{SQL: "ALTER TABLE t FORCE;"},
+	{SQL: "RENAME TABLE t TO t2, r TO r2;"},
+	{SQL: "DROP TABLE IF EXISTS t, nosuch;"},
+	{SQL: "DROP TEMPORARY TABLE IF EXISTS tmp;"},
+	{SQL: "TRUNCATE TABLE t;"},
+	{SQL: "CREATE UNIQUE INDEX k ON t (a);"},
+	{SQL: "CREATE INDEX IF NOT EXISTS i ON t (a);"},
+	{SQL: "DROP INDEX i ON t;"},
+	{SQL: "CREATE VIEW w AS SELECT 1 AS a;"},
+	{SQL: "CREATE OR REPLACE VIEW v AS SELECT 1 AS a;"},
+	{SQL: "DROP VIEW IF EXISTS v, w;"},
+	{SQL: "CREATE SEQUENCE s2;"},
+	{SQL: "CREATE SEQUENCE IF NOT EXISTS sq;"},
+	{SQL: "DROP SEQUENCE IF EXISTS sq, s2;"},
+	{SQL: "INSERT INTO nokey VALUES (1);"},
+	{SQL: "REPLACE INTO nokey VALUES (1);"},
+	{SQL: "UPDATE nokey SET a = 1;"},
+	{SQL: "DELETE FROM nokey;"},
+	{SQL: "SELECT 1;"},
+	{SQL: "EXPLAIN SELECT 1;\nEXPLAIN ALTER TABLE t ADD COLUMN c int;\nEXPLAIN ANALYZE ALTER TABLE t ADD COLUMN c int;"},
+	{SQL: "SET foreign_key_checks = 0;\nSET @@session.foreign_key_checks = 1;\nSET NAMES utf8mb4;"},
+	{SQL: "BEGIN;\nSAVEPOINT a;\nRELEASE SAVEPOINT a;\nCOMMIT;"},
+	{SQL: "SHOW TABLES;\nANALYZE TABLE t;"},
+	{SQL: "CREATE GLOBAL BINDING FOR SELECT * FROM t USING SELECT * FROM t USE INDEX(i);\nCREATE BINDING USING UPDATE t SET a = 1;\nCREATE BINDING FROM HISTORY USING PLAN DIGEST 'abc';\nDROP SESSION BINDING FOR SELECT * FROM t;\nDROP BINDING FOR SQL DIGEST 'abc';\nSET BINDING DISABLED FOR SELECT * FROM t;"},
+	{SQL: "GRANT SELECT ON shop.t TO 'u'@'%';"},
+	// TiDB's ADMIN. Every kind must be lowered: one that is not ends the
+	// walk, and every change that holds an ADMIN statement would then lose
+	// the statements after it.
+	{SQL: "ADMIN SHOW DDL;\nADMIN SHOW DDL JOBS 5 WHERE id = 0;\nADMIN SHOW DDL JOB QUERIES 1;\nADMIN SHOW DDL JOB QUERIES LIMIT 2 OFFSET 1;"},
+	{SQL: "ADMIN SHOW t NEXT_ROW_ID;\nADMIN SHOW SLOW TOP ALL 3;\nADMIN SHOW BDR ROLE;"},
+	{SQL: "ADMIN CHECK TABLE t, v;\nADMIN CHECKSUM TABLE t;\nADMIN CHECK INDEX t i;\nADMIN CHECK INDEX t i (1, 2);"},
+	{SQL: "ADMIN RECOVER INDEX t i;\nADMIN CLEANUP INDEX t i;\nADMIN CLEANUP TABLE LOCK t;"},
+	{SQL: "ADMIN CANCEL DDL JOBS 1;\nADMIN PAUSE DDL JOBS 1;\nADMIN RESUME DDL JOBS 1;\nADMIN ALTER DDL JOBS 1 THREAD = 2;"},
+	{SQL: "ADMIN RELOAD EXPR_PUSHDOWN_BLACKLIST;\nADMIN RELOAD OPT_RULE_BLACKLIST;\nADMIN RELOAD STATISTICS;\nADMIN RELOAD BINDINGS;"},
+	{SQL: "ADMIN FLUSH BINDINGS;\nADMIN CAPTURE BINDINGS;\nADMIN EVOLVE BINDINGS;\nADMIN FLUSH INSTANCE PLAN_CACHE;"},
+	{SQL: "ADMIN PLUGINS ENABLE audit;\nADMIN PLUGINS DISABLE audit;\nADMIN SET BDR ROLE PRIMARY;\nADMIN UNSET BDR ROLE;"},
+	{SQL: "ADMIN REPAIR TABLE t CREATE TABLE t (a int);"},
+}
+
+func TestWalkThroughTiDBLowersEveryForm(t *testing.T) {
+	walktest.Coverage(t, walkForms, func(t *testing.T, sql string) (n, lowered int, last bool) {
+		t.Helper()
+		ranges := statementRanges(sql)
+		stmts, syntax := parse(sql, ranges)
+		if syntax != nil {
+			t.Fatalf("syntax: %s\n%s", syntax.Message, sql)
+		}
+		w := newWalker(sql, stmts, review.Target{Schema: walkSchema()})
+		l := walk.NewLedger(w.snap)
+		for i := range stmts {
+			s := w.lower(i, l)
+			if s == nil {
+				return len(stmts), i, false
+			}
+			if s.Last {
+				return len(stmts), i + 1, true
+			}
+			if s.Apply != nil {
+				s.Apply(l)
+			}
+		}
+		return len(stmts), len(stmts), false
+	})
+}
+
+// TestWalkThroughTiDBResourceControl pins that the resource control
+// statements are statements the walk follows. None of them names a relation
+// or a database the walk holds, so each must be followed and leave the ledger
+// as it was. Returning false for one instead would end the walk there and
+// lose every statement after it: the `CREATE TABLE t` below would never be
+// judged, and the finding this asserts would silently disappear.
+func TestWalkThroughTiDBResourceControl(t *testing.T) {
+	shop := review.Target{Schema: walkSchema()}
+	for _, stmt := range []string{
+		"CREATE RESOURCE GROUP rg RU_PER_SEC = 1000",
+		"CREATE RESOURCE GROUP IF NOT EXISTS rg RU_PER_SEC = UNLIMITED, PRIORITY = HIGH, BURSTABLE",
+		"ALTER RESOURCE GROUP rg QUERY_LIMIT = (EXEC_ELAPSED '10s' ACTION KILL)",
+		"ALTER RESOURCE GROUP IF EXISTS rg BACKGROUND = (TASK_TYPES 'br')",
+		"DROP RESOURCE GROUP rg",
+		"DROP RESOURCE GROUP IF EXISTS rg",
+		"SET RESOURCE GROUP rg",
+		"SET RESOURCE GROUP DEFAULT",
+		"CALIBRATE RESOURCE",
+		"CALIBRATE RESOURCE WORKLOAD TPCC",
+		"CALIBRATE RESOURCE START_TIME now() DURATION '20m'",
+		"QUERY WATCH ADD RESOURCE GROUP rg SQL TEXT SIMILAR TO 'select 1'",
+		"QUERY WATCH REMOVE 1",
+		"CREATE USER 'u'@'h' RESOURCE GROUP rg",
+		"ALTER USER 'u'@'h' RESOURCE GROUP rg",
+	} {
+		// The table the statement precedes is the one the walk must still
+		// reach, and the one it follows is the one it must not undo.
+		sql := "CREATE TABLE x (a int);\n" + stmt + ";\nCREATE TABLE t (a int);"
+		oneFinding(t, sql, 2, "Table `t` already exists.", shop)
+	}
+}

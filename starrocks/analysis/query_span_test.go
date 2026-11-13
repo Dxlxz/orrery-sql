@@ -1,0 +1,1136 @@
+package analysis
+
+import (
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Dxlxz/orrery-sql/starrocks/parser"
+)
+
+// tableSig is a compact form of TableAccess used for order-insensitive
+// comparison in tests.
+type tableSig struct {
+	Database string
+	Table    string
+	Alias    string
+}
+
+func toSigs(tables []TableAccess) []tableSig {
+	out := make([]tableSig, len(tables))
+	for i, t := range tables {
+		out[i] = tableSig{Database: t.Database, Table: t.Table, Alias: t.Alias}
+	}
+	return out
+}
+
+func containsSig(haystack []tableSig, needle tableSig) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func TestGetQuerySpan_Basics(t *testing.T) {
+	tests := []struct {
+		name        string
+		sql         string
+		wantType    QueryType
+		wantTables  []tableSig
+		wantResults []string // output column names, in order
+		wantCTEs    []string
+	}{
+		{
+			name:        "simple select",
+			sql:         "SELECT a FROM t",
+			wantType:    QueryTypeSelect,
+			wantTables:  []tableSig{{Table: "t"}},
+			wantResults: []string{"a"},
+		},
+		{
+			name:        "qualified table",
+			sql:         "SELECT * FROM db.t",
+			wantType:    QueryTypeSelect,
+			wantTables:  []tableSig{{Database: "db", Table: "t"}},
+			wantResults: []string{"*"},
+		},
+		{
+			name:        "three-part table name",
+			sql:         "SELECT * FROM catalog1.db1.t1",
+			wantType:    QueryTypeSelect,
+			wantTables:  []tableSig{{Database: "db1", Table: "t1"}},
+			wantResults: []string{"*"},
+		},
+		{
+			name:        "alias",
+			sql:         "SELECT a FROM t AS x",
+			wantType:    QueryTypeSelect,
+			wantTables:  []tableSig{{Table: "t", Alias: "x"}},
+			wantResults: []string{"a"},
+		},
+		{
+			name:        "select item alias",
+			sql:         "SELECT a AS col_a, b FROM t",
+			wantType:    QueryTypeSelect,
+			wantTables:  []tableSig{{Table: "t"}},
+			wantResults: []string{"col_a", "b"},
+		},
+		{
+			name:     "join of two tables",
+			sql:      "SELECT a, b FROM t1 JOIN t2 ON t1.id = t2.id",
+			wantType: QueryTypeSelect,
+			wantTables: []tableSig{
+				{Table: "t1"},
+				{Table: "t2"},
+			},
+			wantResults: []string{"a", "b"},
+		},
+		{
+			name:     "inner and left join",
+			sql:      "SELECT a FROM t1 INNER JOIN t2 ON t1.id = t2.id LEFT JOIN db.t3 ON t1.x = t3.x",
+			wantType: QueryTypeSelect,
+			wantTables: []tableSig{
+				{Table: "t1"},
+				{Table: "t2"},
+				{Database: "db", Table: "t3"},
+			},
+			wantResults: []string{"a"},
+		},
+		{
+			name:     "cte exclusion",
+			sql:      "WITH c AS (SELECT * FROM real_t) SELECT * FROM c",
+			wantType: QueryTypeSelect,
+			wantTables: []tableSig{
+				{Table: "real_t"},
+			},
+			wantResults: []string{"*"},
+			wantCTEs:    []string{"c"},
+		},
+		{
+			name: "multiple ctes chained",
+			sql: `WITH a AS (SELECT id FROM t1),
+			      b AS (SELECT id FROM a JOIN t2 ON a.id = t2.id)
+			      SELECT id FROM b`,
+			wantType: QueryTypeSelect,
+			wantTables: []tableSig{
+				{Table: "t1"},
+				{Table: "t2"},
+			},
+			wantResults: []string{"id"},
+			wantCTEs:    []string{"a", "b"},
+		},
+		{
+			name:     "subquery in where IN",
+			sql:      "SELECT a FROM t WHERE b IN (SELECT b FROM other)",
+			wantType: QueryTypeSelect,
+			wantTables: []tableSig{
+				{Table: "t"},
+				{Table: "other"},
+			},
+			wantResults: []string{"a"},
+		},
+		{
+			name:     "scalar subquery in select",
+			sql:      "SELECT a, (SELECT MAX(x) FROM agg) FROM t",
+			wantType: QueryTypeSelect,
+			wantTables: []tableSig{
+				{Table: "t"},
+				{Table: "agg"},
+			},
+		},
+		{
+			name:     "exists subquery",
+			sql:      "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM other WHERE other.id = t.id)",
+			wantType: QueryTypeSelect,
+			wantTables: []tableSig{
+				{Table: "t"},
+				{Table: "other"},
+			},
+			wantResults: []string{"a"},
+		},
+		{
+			name:     "from subquery",
+			sql:      "SELECT x.a FROM (SELECT a FROM inner_t) AS x",
+			wantType: QueryTypeSelect,
+			wantTables: []tableSig{
+				{Table: "inner_t"},
+			},
+		},
+		{
+			name:     "union two tables",
+			sql:      "SELECT a FROM t1 UNION SELECT a FROM t2",
+			wantType: QueryTypeSelect,
+			wantTables: []tableSig{
+				{Table: "t1"},
+				{Table: "t2"},
+			},
+			wantResults: []string{"a"},
+		},
+		{
+			name:     "union all three tables",
+			sql:      "SELECT a FROM t1 UNION ALL SELECT a FROM t2 UNION ALL SELECT a FROM db.t3",
+			wantType: QueryTypeSelect,
+			wantTables: []tableSig{
+				{Table: "t1"},
+				{Table: "t2"},
+				{Database: "db", Table: "t3"},
+			},
+			wantResults: []string{"a"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			span, err := GetQuerySpan(tt.sql)
+			if err != nil {
+				t.Fatalf("GetQuerySpan returned error: %v", err)
+			}
+			if span.Type != tt.wantType {
+				t.Errorf("Type = %v, want %v", span.Type, tt.wantType)
+			}
+
+			gotSigs := toSigs(span.AccessTables)
+			if len(gotSigs) != len(tt.wantTables) {
+				t.Errorf("AccessTables len = %d (%v), want %d (%v)",
+					len(gotSigs), gotSigs, len(tt.wantTables), tt.wantTables)
+			}
+			for _, want := range tt.wantTables {
+				if !containsSig(gotSigs, want) {
+					t.Errorf("AccessTables missing %+v (got %+v)", want, gotSigs)
+				}
+			}
+
+			if tt.wantResults != nil {
+				if len(span.Results) != len(tt.wantResults) {
+					t.Fatalf("Results len = %d, want %d (got %+v)",
+						len(span.Results), len(tt.wantResults), span.Results)
+				}
+				for i, want := range tt.wantResults {
+					if span.Results[i].Name != want {
+						t.Errorf("Results[%d].Name = %q, want %q", i, span.Results[i].Name, want)
+					}
+				}
+			}
+
+			if tt.wantCTEs != nil {
+				if len(span.CTEs) != len(tt.wantCTEs) {
+					t.Fatalf("CTEs = %v, want %v", span.CTEs, tt.wantCTEs)
+				}
+				for i, want := range tt.wantCTEs {
+					if span.CTEs[i] != want {
+						t.Errorf("CTEs[%d] = %q, want %q", i, span.CTEs[i], want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestGetQuerySpan_NonSelect(t *testing.T) {
+	tests := []struct {
+		sql      string
+		wantType QueryType
+	}{
+		{"CREATE TABLE t (id INT)", QueryTypeDDL},
+		{"SHOW TABLES", QueryTypeSelectInfoSchema},
+		{"INSERT INTO t VALUES (1)", QueryTypeDML},
+	}
+	for _, tt := range tests {
+		t.Run(tt.sql, func(t *testing.T) {
+			span, err := GetQuerySpan(tt.sql)
+			if err != nil {
+				t.Fatalf("GetQuerySpan returned error: %v", err)
+			}
+			if span.Type != tt.wantType {
+				t.Errorf("Type = %v, want %v", span.Type, tt.wantType)
+			}
+			// Non-SELECT statements should not populate AccessTables via our
+			// SELECT walker. (They may still land here in future when DML
+			// parsing is wired through — for now we only assert Type.)
+		})
+	}
+}
+
+func TestGetQuerySpan_Empty(t *testing.T) {
+	span, err := GetQuerySpan("")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	if span.Type != QueryTypeUnknown {
+		t.Errorf("Type = %v, want QueryTypeUnknown", span.Type)
+	}
+	if len(span.AccessTables) != 0 {
+		t.Errorf("AccessTables = %v, want empty", span.AccessTables)
+	}
+	if len(span.Results) != 0 {
+		t.Errorf("Results = %v, want empty", span.Results)
+	}
+}
+
+func TestGetQuerySpan_DedupTables(t *testing.T) {
+	// Same unaliased table referenced twice — should only appear once.
+	span, err := GetQuerySpan("SELECT a FROM t WHERE b IN (SELECT b FROM t)")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	if len(span.AccessTables) != 1 {
+		t.Errorf("AccessTables = %v, want one entry for t", span.AccessTables)
+	}
+}
+
+func TestGetQuerySpan_SameTableDifferentAliases(t *testing.T) {
+	// Self-join — two aliases of the same physical table should each appear.
+	span, err := GetQuerySpan("SELECT * FROM t AS a JOIN t AS b ON a.id = b.id")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	if len(span.AccessTables) != 2 {
+		t.Errorf("AccessTables = %+v, want two (a, b)", span.AccessTables)
+	}
+	sigs := toSigs(span.AccessTables)
+	if !containsSig(sigs, tableSig{Table: "t", Alias: "a"}) {
+		t.Errorf("missing alias a: %+v", sigs)
+	}
+	if !containsSig(sigs, tableSig{Table: "t", Alias: "b"}) {
+		t.Errorf("missing alias b: %+v", sigs)
+	}
+}
+
+func TestGetQuerySpan_SelectItemSourceColumns(t *testing.T) {
+	// Parser quirk: a SELECT item that starts with a qualified identifier
+	// (t.a) takes a fast path and only produces a ColumnRef, so we use bare
+	// identifiers here to exercise the full expression parser.
+	span, err := GetQuerySpan("SELECT a + b AS total FROM t")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	if len(span.Results) != 1 {
+		t.Fatalf("Results len = %d, want 1 (%+v)", len(span.Results), span.Results)
+	}
+	r := span.Results[0]
+	if r.Name != "total" {
+		t.Errorf("Results[0].Name = %q, want total", r.Name)
+	}
+	if len(r.SourceColumns) != 2 {
+		t.Fatalf("SourceColumns len = %d, want 2 (%+v)", len(r.SourceColumns), r.SourceColumns)
+	}
+	want := []ColumnRef{
+		{Column: "a"},
+		{Column: "b"},
+	}
+	for i, w := range want {
+		if r.SourceColumns[i] != w {
+			t.Errorf("SourceColumns[%d] = %+v, want %+v", i, r.SourceColumns[i], w)
+		}
+	}
+}
+
+func TestGetQuerySpan_InlineTable(t *testing.T) {
+	// A VALUES table constructor is literal-derived: it must parse and must NOT
+	// leak a phantom physical table (named "v" or "VALUES") into AccessTables.
+	span, err := GetQuerySpan("SELECT * FROM (VALUES (1,'a'),(2,'b')) AS v(id,name)")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	if len(span.AccessTables) != 0 {
+		t.Errorf("AccessTables = %+v, want empty (inline table is not physical)", span.AccessTables)
+	}
+	if len(span.Results) != 1 || span.Results[0].Name != "*" {
+		t.Errorf("Results = %+v, want [*]", span.Results)
+	}
+}
+
+func TestGetQuerySpan_InlineTableSubqueryRow(t *testing.T) {
+	// A subquery embedded in a VALUES row must still contribute its physical
+	// table to AccessTables (this is the discriminating lineage probe: it fails
+	// unless visitFromItem walks the inline table's row expressions).
+	span, err := GetQuerySpan("SELECT * FROM (VALUES ((SELECT a FROM inner_t))) AS v(x)")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	sigs := toSigs(span.AccessTables)
+	if len(sigs) != 1 || sigs[0].Table != "inner_t" {
+		t.Errorf("AccessTables = %+v, want [inner_t]", sigs)
+	}
+}
+
+func TestGetQuerySpan_TableFunction(t *testing.T) {
+	// A table function (unnest) is not a physical table: only the left table t
+	// must appear in AccessTables — never a phantom table named "unnest"/"u".
+	span, err := GetQuerySpan("SELECT * FROM t, unnest(t.arr) AS u")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	sigs := toSigs(span.AccessTables)
+	if len(sigs) != 1 || sigs[0].Table != "t" {
+		t.Errorf("AccessTables = %+v, want [t] (no phantom unnest)", sigs)
+	}
+}
+
+func TestGetQuerySpan_LateralUnnest(t *testing.T) {
+	// LATERAL unnest correlated against t: t is the only physical table.
+	span, err := GetQuerySpan("SELECT t.id, u.unnest FROM t, LATERAL unnest(t.arr) AS u")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	sigs := toSigs(span.AccessTables)
+	if len(sigs) != 1 || sigs[0].Table != "t" {
+		t.Errorf("AccessTables = %+v, want [t] (no phantom unnest)", sigs)
+	}
+}
+
+func TestGetQuerySpan_LateralInParenList(t *testing.T) {
+	// LATERAL after a comma inside a parenthesized relation list must parse so
+	// lineage is not silently dropped: t and the unnest-arg subquery table both
+	// surface.
+	span, err := GetQuerySpan("SELECT * FROM (t, LATERAL unnest((SELECT arr FROM latn)) AS u)")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	sigs := toSigs(span.AccessTables)
+	if !containsSig(sigs, tableSig{Table: "t"}) || !containsSig(sigs, tableSig{Table: "latn"}) {
+		t.Errorf("AccessTables = %+v, want both t and latn", sigs)
+	}
+}
+
+func TestGetQuerySpan_BinaryOperator(t *testing.T) {
+	// BINARY is a unary cast operator: the inner column must flow to lineage, a
+	// hex/bit literal contributes no source column.
+	span, err := GetQuerySpan("SELECT BINARY col1 AS c, X'4142' AS h FROM t")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	if !containsSig(toSigs(span.AccessTables), tableSig{Table: "t"}) {
+		t.Errorf("AccessTables = %+v, want t", span.AccessTables)
+	}
+	if len(span.Results) != 2 {
+		t.Fatalf("Results len = %d, want 2 (%+v)", len(span.Results), span.Results)
+	}
+	if got := span.Results[0].SourceColumns; len(got) != 1 || got[0].Column != "col1" {
+		t.Errorf("Results[0].SourceColumns = %+v, want [col1]", got)
+	}
+	if got := span.Results[1].SourceColumns; len(got) != 0 {
+		t.Errorf("Results[1].SourceColumns = %+v, want empty (hex literal)", got)
+	}
+}
+
+func TestGetQuerySpan_CollectionLiteral(t *testing.T) {
+	// Column refs inside a map/array literal's value expressions must flow to the
+	// output column's SourceColumns (a literal key contributes nothing).
+	span, err := GetQuerySpan("SELECT map<varchar,int>{'x':a_col} AS m, array<int>[b_col, c_col] AS arr FROM t")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	if !containsSig(toSigs(span.AccessTables), tableSig{Table: "t"}) {
+		t.Errorf("AccessTables = %+v, want t", span.AccessTables)
+	}
+	if len(span.Results) != 2 {
+		t.Fatalf("Results len = %d, want 2 (%+v)", len(span.Results), span.Results)
+	}
+	if got := span.Results[0].SourceColumns; len(got) != 1 || got[0].Column != "a_col" {
+		t.Errorf("map literal SourceColumns = %+v, want [a_col]", got)
+	}
+	gotArr := span.Results[1].SourceColumns
+	if len(gotArr) != 2 || gotArr[0].Column != "b_col" || gotArr[1].Column != "c_col" {
+		t.Errorf("array literal SourceColumns = %+v, want [b_col c_col]", gotArr)
+	}
+}
+
+func TestGetQuerySpan_CTEShadowsTable(t *testing.T) {
+	// Even if a physical table exists elsewhere named "real_t", a CTE with
+	// the same name inside the WITH clause means the outer reference resolves
+	// to the CTE — AccessTables should only contain the CTE's body tables.
+	span, err := GetQuerySpan(`
+		WITH real_t AS (SELECT id FROM underlying)
+		SELECT id FROM real_t
+	`)
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	sigs := toSigs(span.AccessTables)
+	if len(sigs) != 1 || sigs[0].Table != "underlying" {
+		t.Errorf("AccessTables = %+v, want [underlying]", sigs)
+	}
+}
+
+func TestGetQuerySpan_SetOpOuterOrderBySubquery(t *testing.T) {
+	// After hoisting, ORDER BY with a subquery lives on SetOpStmt.OrderBy.
+	// visitSetOp must walk it so t3 appears in AccessTables.
+	span, err := GetQuerySpan("SELECT a FROM t1 UNION SELECT b FROM t2 ORDER BY (SELECT max(c) FROM t3)")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	sigs := toSigs(span.AccessTables)
+	for _, want := range []string{"t1", "t2", "t3"} {
+		if !containsSig(sigs, tableSig{Table: want}) {
+			t.Errorf("AccessTables missing %s (got %+v)", want, sigs)
+		}
+	}
+}
+
+func TestGetQuerySpan_SetOpOuterLimitSubquery(t *testing.T) {
+	// Subquery in LIMIT expression on a set-op must be walked.
+	span, err := GetQuerySpan("SELECT a FROM t1 UNION SELECT b FROM t2 LIMIT (SELECT max(c) FROM t3)")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	sigs := toSigs(span.AccessTables)
+	for _, want := range []string{"t1", "t2", "t3"} {
+		if !containsSig(sigs, tableSig{Table: want}) {
+			t.Errorf("AccessTables missing %s (got %+v)", want, sigs)
+		}
+	}
+}
+
+func TestGetQuerySpan_IntersectOuterOrderBySubquery(t *testing.T) {
+	// Same regression test but for INTERSECT (previously never hoisted).
+	span, err := GetQuerySpan("SELECT a FROM t1 INTERSECT SELECT b FROM t2 ORDER BY (SELECT max(c) FROM t3)")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	sigs := toSigs(span.AccessTables)
+	for _, want := range []string{"t1", "t2", "t3"} {
+		if !containsSig(sigs, tableSig{Table: want}) {
+			t.Errorf("AccessTables missing %s (got %+v)", want, sigs)
+		}
+	}
+}
+
+func TestGetQuerySpan_ExtractSourceColumns(t *testing.T) {
+	// EXTRACT(unit FROM col) must expose col as a source column so masking and
+	// lineage see through the expression.
+	span, err := GetQuerySpan("SELECT EXTRACT(YEAR FROM created_at) AS y FROM t")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	if len(span.Results) != 1 {
+		t.Fatalf("Results len = %d, want 1 (%+v)", len(span.Results), span.Results)
+	}
+	r := span.Results[0]
+	if r.Name != "y" {
+		t.Errorf("Results[0].Name = %q, want y", r.Name)
+	}
+	want := []ColumnRef{{Column: "created_at"}}
+	if len(r.SourceColumns) != len(want) {
+		t.Fatalf("SourceColumns = %+v, want %+v", r.SourceColumns, want)
+	}
+	for i, w := range want {
+		if r.SourceColumns[i] != w {
+			t.Errorf("SourceColumns[%d] = %+v, want %+v", i, r.SourceColumns[i], w)
+		}
+	}
+}
+
+func TestGetQuerySpan_LambdaSourceColumns(t *testing.T) {
+	// Columns referenced inside a lambda body must reach lineage, but the
+	// lambda's own parameters must not: they are local bindings, not columns,
+	// and reporting one would feed a nonexistent column to masking.
+	tests := []struct {
+		name    string
+		sql     string
+		want    []string
+		notWant []string
+	}{
+		{
+			name:    "single parameter",
+			sql:     "SELECT array_map(x -> x + bonus, scores) AS adj FROM t",
+			want:    []string{"bonus", "scores"},
+			notWant: []string{"x"},
+		},
+		{
+			name:    "multiple parameters",
+			sql:     "SELECT array_map((x, y) -> x + y + bonus, a, b) AS adj FROM t",
+			want:    []string{"bonus", "a", "b"},
+			notWant: []string{"x", "y"},
+		},
+		{
+			name: "qualified name is a column even when it shadows a parameter",
+			sql:  "SELECT array_map(x -> t.x + bonus, scores) AS adj FROM t",
+			want: []string{"x", "bonus", "scores"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			span, err := GetQuerySpan(tt.sql)
+			if err != nil {
+				t.Fatalf("GetQuerySpan returned error: %v", err)
+			}
+			if len(span.Results) != 1 {
+				t.Fatalf("Results len = %d, want 1 (%+v)", len(span.Results), span.Results)
+			}
+			got := map[string]bool{}
+			for _, sc := range span.Results[0].SourceColumns {
+				got[sc.Column] = true
+			}
+			for _, want := range tt.want {
+				if !got[want] {
+					t.Errorf("SourceColumns %+v missing %q", span.Results[0].SourceColumns, want)
+				}
+			}
+			for _, notWant := range tt.notWant {
+				if got[notWant] {
+					t.Errorf("SourceColumns %+v contains lambda parameter %q", span.Results[0].SourceColumns, notWant)
+				}
+			}
+		})
+	}
+}
+
+func TestGetQuerySpan_JSONArrowSourceColumns(t *testing.T) {
+	// The reason the JSON path operator is a BinaryExpr and not a lambda
+	// (BYT-10088). Both readings parse `secret_col->'$.a'`, but a LambdaExpr
+	// would bind secret_col as a parameter, and columnRefCollector drops bound
+	// names — the column masking keys on would vanish from SourceColumns while
+	// the query still returned its value. So assert the column is there, in
+	// every position the operator can appear.
+	tests := []struct {
+		name string
+		sql  string
+		want []string
+	}{
+		{
+			name: "select item",
+			sql:  "SELECT secret_col->'$.a' FROM sensitive_table",
+			want: []string{"secret_col"},
+		},
+		{
+			name: "qualified left operand",
+			sql:  "SELECT t.secret_col->'$.a' FROM sensitive_table t",
+			want: []string{"secret_col"},
+		},
+		{
+			name: "inside a function call",
+			sql:  "SELECT length(secret_col->'$.a') FROM sensitive_table",
+			want: []string{"secret_col"},
+		},
+		{
+			name: "chained paths",
+			sql:  "SELECT secret_col->'$.a'->'$.b' FROM sensitive_table",
+			want: []string{"secret_col"},
+		},
+		{
+			name: "interleaved with a subscript",
+			sql:  "SELECT secret_col['a']->'$.b' FROM sensitive_table",
+			want: []string{"secret_col"},
+		},
+		{
+			name: "compared in the select list",
+			sql:  "SELECT secret_col->'$.a' = other_col FROM sensitive_table",
+			want: []string{"secret_col", "other_col"},
+		},
+		{
+			name: "in higher-order argument position, where a lambda also lives",
+			sql:  "SELECT array_map(secret_col -> '$.a', scores) FROM sensitive_table",
+			want: []string{"secret_col", "scores"},
+		},
+		{
+			name: "arrow inside a lambda body keeps the body's column",
+			sql:  "SELECT array_map(x -> secret_col->'$.a', scores) FROM sensitive_table",
+			want: []string{"secret_col", "scores"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			span, err := GetQuerySpan(tt.sql)
+			if err != nil {
+				t.Fatalf("GetQuerySpan(%q) error: %v", tt.sql, err)
+			}
+			if len(span.AccessTables) != 1 || span.AccessTables[0].Table != "sensitive_table" {
+				t.Fatalf("AccessTables = %+v, want [sensitive_table]", span.AccessTables)
+			}
+			if len(span.Results) != 1 {
+				t.Fatalf("Results len = %d, want 1 (%+v)", len(span.Results), span.Results)
+			}
+			got := map[string]bool{}
+			for _, sc := range span.Results[0].SourceColumns {
+				got[sc.Column] = true
+			}
+			for _, want := range tt.want {
+				if !got[want] {
+					t.Errorf("SourceColumns %+v missing %q", span.Results[0].SourceColumns, want)
+				}
+			}
+		})
+	}
+}
+
+func TestGetQuerySpan_SubscriptKeepsTableAccess(t *testing.T) {
+	// Before BYT-10084 the parser silently dropped everything after `[`, so
+	// this query lost its FROM clause and the span reported no table access —
+	// a fail-open blind spot for masking.
+	span, err := GetQuerySpan("SELECT secret_col[1] FROM sensitive_table")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	if len(span.AccessTables) != 1 || span.AccessTables[0].Table != "sensitive_table" {
+		t.Fatalf("AccessTables = %+v, want [sensitive_table]", span.AccessTables)
+	}
+	if len(span.Results) != 1 {
+		t.Fatalf("Results = %+v, want one column", span.Results)
+	}
+	got := map[string]bool{}
+	for _, sc := range span.Results[0].SourceColumns {
+		got[sc.Column] = true
+	}
+	if !got["secret_col"] {
+		t.Errorf("SourceColumns %+v missing secret_col", span.Results[0].SourceColumns)
+	}
+}
+
+func TestGetQuerySpan_EmptyStringAlias(t *testing.T) {
+	// SELECT c AS '' names the result column with the explicit empty alias;
+	// it must not fall back to the expression name.
+	span, err := GetQuerySpan("SELECT c AS '' FROM t")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	if len(span.Results) != 1 || span.Results[0].Name != "" {
+		t.Fatalf("Results = %+v, want one column named \"\"", span.Results)
+	}
+}
+
+func TestGetQuerySpan_QualifiedSubscriptKeepsTableAccess(t *testing.T) {
+	// The qualified twin of the subscript fail-open: the select-item fast
+	// path used to bypass the expression parser for t.col and drop the rest.
+	span, err := GetQuerySpan("SELECT t.secret_col[1] FROM sensitive_table t")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	if len(span.AccessTables) != 1 || span.AccessTables[0].Table != "sensitive_table" {
+		t.Fatalf("AccessTables = %+v, want [sensitive_table]", span.AccessTables)
+	}
+}
+
+func TestGetQuerySpan_FailsClosedOnParseError(t *testing.T) {
+	// Engine-invalid SQL the parser used to swallow must now yield an error,
+	// never a silently smaller span (BYT-10085).
+	// `->` is the JSON path operator as of BYT-10088; `->>` is the shape this
+	// engine still has no form of.
+	if _, err := GetQuerySpan("SELECT j->>'$.a' FROM t"); err == nil {
+		t.Fatal("GetQuerySpan accepted a statement with trailing junk")
+	}
+
+	// A subquery that does not fully parse fails the whole span: its table
+	// reads would otherwise vanish from AccessTables.
+	if _, err := GetQuerySpan("SELECT (SELECT j->>'$.a' FROM t2) x FROM t1"); err == nil {
+		t.Fatal("GetQuerySpan accepted an unparseable subquery")
+	}
+
+	// Empty input keeps the zero-span contract.
+	span, err := GetQuerySpan("")
+	if err != nil || span == nil || span.Type != QueryTypeUnknown {
+		t.Fatalf("empty input: span=%+v err=%v, want zero span and nil error", span, err)
+	}
+}
+
+func TestGetQuerySpan_TableNamesResemblingKeywords(t *testing.T) {
+	// The FROM-subquery detection is an explicit AST discriminator, not a
+	// prefix heuristic: tables named selected/within (and a quoted `select`)
+	// are ordinary tables, not query text to re-parse.
+	for _, tc := range []struct{ sql, table string }{
+		{"SELECT * FROM selected", "selected"},
+		{"SELECT * FROM within", "within"},
+		{"SELECT * FROM `select`", "select"},
+	} {
+		span, err := GetQuerySpan(tc.sql)
+		if err != nil {
+			t.Fatalf("GetQuerySpan(%q) error: %v", tc.sql, err)
+		}
+		if len(span.AccessTables) != 1 || span.AccessTables[0].Table != tc.table {
+			t.Errorf("GetQuerySpan(%q) AccessTables = %+v, want [%s]", tc.sql, span.AccessTables, tc.table)
+		}
+	}
+}
+
+func TestGetQuerySpan_DMLSubqueriesFailClosed(t *testing.T) {
+	// The fail-closed contract holds for statements that produce no lineage
+	// of their own: a malformed subquery inside DML surfaces as an error.
+	if _, err := GetQuerySpan("DELETE FROM t WHERE id IN (SELECT 1 */ 2 FROM secret)"); err == nil {
+		t.Fatal("malformed DML subquery accepted")
+	}
+	// A well-formed one contributes its table reads.
+	span, err := GetQuerySpan("DELETE FROM t WHERE id IN (SELECT id FROM other)")
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	found := false
+	for _, a := range span.AccessTables {
+		if a.Table == "other" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("AccessTables = %+v, want to include other", span.AccessTables)
+	}
+}
+
+func TestGetQuerySpan_SubqueryErrorLocationsAreOuter(t *testing.T) {
+	// Errors from re-parsing a subquery's raw text must be shifted into the
+	// outer statement's coordinates so diagnostics highlight the right spot.
+	sql := "SELECT (SELECT 1 */ 2 FROM t2) x FROM t1"
+	_, err := GetQuerySpan(sql)
+	if err == nil {
+		t.Fatal("malformed subquery accepted")
+	}
+	pe, ok := err.(*parser.ParseError)
+	if !ok {
+		t.Fatalf("err = %T, want *parser.ParseError", err)
+	}
+	want := strings.Index(sql, "*/")
+	if pe.Position != want {
+		t.Errorf("error Loc.Start = %d, want %d (the */ in the outer text)", pe.Position, want)
+	}
+}
+
+func TestGetQuerySpan_TableFunctionArgSubqueriesFailClosed(t *testing.T) {
+	// Subqueries embedded in table-function arguments are validated too: the
+	// function call is walked, so a malformed one fails the span.
+	if _, err := GetQuerySpan("SELECT * FROM numbers(EXISTS (SELECT 1 */ 2 FROM secret)) x"); err == nil {
+		t.Fatal("malformed subquery in table-function argument accepted")
+	}
+}
+
+func TestGetQuerySpan_NestedSubqueryErrorLocationsAccumulate(t *testing.T) {
+	// Each nesting level's TextStart is relative to its own extracted text;
+	// the walker must accumulate ancestor bases so a deeply nested error
+	// still points into the original statement.
+	sql := "SELECT (SELECT (SELECT 1 */ 2 FROM t3) FROM t2) FROM t1"
+	_, err := GetQuerySpan(sql)
+	if err == nil {
+		t.Fatal("malformed nested subquery accepted")
+	}
+	pe, ok := err.(*parser.ParseError)
+	if !ok {
+		t.Fatalf("err = %T, want *parser.ParseError", err)
+	}
+	if want := strings.Index(sql, "*/"); pe.Position != want {
+		t.Errorf("error Loc.Start = %d, want %d", pe.Position, want)
+	}
+}
+
+func TestGetQuerySpan_NonQuerySubqueryFailsClosed(t *testing.T) {
+	// A placeholder body that parses cleanly as a non-query statement is not
+	// a valid subquery; accepting it would hide its reads from the span.
+	if _, err := GetQuerySpan("SELECT EXISTS (DELETE FROM secret) FROM public"); err == nil {
+		t.Fatal("EXISTS with a DML body accepted")
+	}
+}
+
+func TestGetQuerySpan_EmptySubqueryPlaceholdersFailClosed(t *testing.T) {
+	// Empty or comment-only placeholder bodies parse to zero statements and
+	// used to bypass the query-node validation entirely.
+	for _, sql := range []string{
+		"SELECT EXISTS () FROM public",
+		"SELECT EXISTS (/*comment*/) FROM public",
+	} {
+		if _, err := GetQuerySpan(sql); err == nil {
+			t.Errorf("GetQuerySpan(%q) accepted an empty subquery body", sql)
+		}
+	}
+}
+
+func TestGetQuerySpan_InsertSelectRecordsReads(t *testing.T) {
+	// A parsed query child inside DML carries real table reads: the SELECT
+	// side of INSERT ... SELECT must land in AccessTables.
+	span, err := GetQuerySpan("INSERT INTO dest SELECT * FROM secret")
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	found := false
+	for _, a := range span.AccessTables {
+		if a.Table == "secret" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("AccessTables = %+v, want to include secret", span.AccessTables)
+	}
+}
+
+func TestGetQuerySpan_TopLevelParenSelect(t *testing.T) {
+	// (SELECT * FROM secret) parses as ParenSelect; it is the outermost query,
+	// so both its table reads and its Results must populate.
+	span, err := GetQuerySpan("(SELECT * FROM secret)")
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	if len(span.AccessTables) != 1 || span.AccessTables[0].Table != "secret" {
+		t.Fatalf("AccessTables = %+v, want [secret]", span.AccessTables)
+	}
+	if len(span.Results) != 1 {
+		t.Errorf("Results = %+v, want the wrapped SELECT's output", span.Results)
+	}
+}
+
+func TestGetQuerySpan_DMLSourceTablesRecorded(t *testing.T) {
+	// Physical tables read by DML — UPDATE ... FROM, DELETE ... USING,
+	// MERGE ... USING — must reach AccessTables for access checks.
+	for _, sql := range []string{
+		"UPDATE target SET x = secret.x FROM secret",
+		"DELETE FROM target USING secret",
+		"MERGE INTO target USING secret ON target.id = secret.id WHEN MATCHED THEN UPDATE SET x = 1",
+	} {
+		span, err := GetQuerySpan(sql)
+		if err != nil {
+			t.Fatalf("GetQuerySpan(%q) error: %v", sql, err)
+		}
+		found := false
+		for _, a := range span.AccessTables {
+			if a.Table == "secret" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("GetQuerySpan(%q) AccessTables = %+v, want to include secret", sql, span.AccessTables)
+		}
+	}
+}
+
+func TestGetQuerySpan_ReparsedTableAccessLocationsAreOuter(t *testing.T) {
+	// TableAccess locations from a reparsed subquery must be rebased into
+	// outer-statement coordinates, like the parse errors already are.
+	sql := "UPDATE dest SET x=(SELECT x FROM secret)"
+	span, err := GetQuerySpan(sql)
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	if len(span.AccessTables) != 1 {
+		t.Fatalf("AccessTables = %+v, want [secret]", span.AccessTables)
+	}
+	if want := strings.Index(sql, "secret"); span.AccessTables[0].Loc.Start != want {
+		t.Errorf("Loc.Start = %d, want %d", span.AccessTables[0].Loc.Start, want)
+	}
+}
+
+func TestGetQuerySpan_DMLWithClauseScopesCTEs(t *testing.T) {
+	// WITH-prefixed DML: the CTE name must not surface as a physical table —
+	// an access check against nonexistent `c` could falsely deny the query —
+	// and the CTE body's real read must.
+	span, err := GetQuerySpan("WITH c AS (SELECT id FROM secret) DELETE FROM dest WHERE id IN (SELECT id FROM c)")
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	for _, a := range span.AccessTables {
+		if a.Table == "c" {
+			t.Errorf("CTE c reported as physical table: %+v", span.AccessTables)
+		}
+	}
+	foundSecret := false
+	for _, a := range span.AccessTables {
+		if a.Table == "secret" {
+			foundSecret = true
+		}
+	}
+	if !foundSecret {
+		t.Errorf("AccessTables = %+v, want secret from the CTE body", span.AccessTables)
+	}
+	if len(span.CTEs) != 1 || span.CTEs[0] != "c" {
+		t.Errorf("CTEs = %v, want [c]", span.CTEs)
+	}
+}
+
+func TestGetQuerySpan_CTASReadsRecordedAndValidated(t *testing.T) {
+	// CTAS keeps its query as raw text; the read it performs must reach
+	// AccessTables, and a malformed body must fail the span.
+	span, err := GetQuerySpan("CREATE TABLE dest AS SELECT * FROM secret")
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	found := false
+	for _, a := range span.AccessTables {
+		if a.Table == "secret" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("AccessTables = %+v, want to include secret", span.AccessTables)
+	}
+	if _, err := GetQuerySpan("CREATE TABLE dest AS SELECT 1 */ 2 FROM secret"); err == nil {
+		t.Error("malformed CTAS body accepted")
+	}
+}
+
+func TestGetQuerySpan_MultiStatementPlaceholderFailsClosed(t *testing.T) {
+	// A subquery placeholder must hold exactly one query; embedded delimiters
+	// smuggle in extra statements the engine would reject.
+	if _, err := GetQuerySpan("SELECT EXISTS (SELECT * FROM secret; SELECT * FROM other)"); err == nil {
+		t.Fatal("multi-statement placeholder accepted")
+	}
+}
+
+func TestGetQuerySpan_NestedParenSelect(t *testing.T) {
+	span, err := GetQuerySpan("((SELECT * FROM secret))")
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	if len(span.AccessTables) != 1 || span.AccessTables[0].Table != "secret" {
+		t.Fatalf("AccessTables = %+v, want [secret]", span.AccessTables)
+	}
+}
+
+func TestGetQuerySpan_ParenOuterOrderBySubquery(t *testing.T) {
+	// Clauses outside the parens live on the ParenSelect wrapper;
+	// visitSetOpArm must walk them so t3 appears in AccessTables.
+	span, err := GetQuerySpan("(SELECT a FROM t1) ORDER BY (SELECT max(c) FROM t3)")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	sigs := toSigs(span.AccessTables)
+	for _, want := range []string{"t1", "t3"} {
+		if !containsSig(sigs, tableSig{Table: want}) {
+			t.Errorf("AccessTables missing %s (got %+v)", want, sigs)
+		}
+	}
+}
+
+func TestGetQuerySpan_ParenInnerClausesPreserved(t *testing.T) {
+	// An outer clause must not erase an inner one: the subquery inside the
+	// inner ORDER BY keeps contributing its table read.
+	span, err := GetQuerySpan("((SELECT a FROM t1 ORDER BY (SELECT max(c) FROM t3))) ORDER BY 1")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	sigs := toSigs(span.AccessTables)
+	for _, want := range []string{"t1", "t3"} {
+		if !containsSig(sigs, tableSig{Table: want}) {
+			t.Errorf("AccessTables missing %s (got %+v)", want, sigs)
+		}
+	}
+}
+
+func TestGetQuerySpan_CTEScopeCoversSetOp(t *testing.T) {
+	// The WITH clause on the leftmost SELECT scopes over the whole set
+	// operation (engine-verified): the right arm's c is a CTE reference,
+	// not a physical table.
+	span, err := GetQuerySpan("WITH c AS (SELECT * FROM secret) SELECT 1 UNION SELECT * FROM c")
+	if err != nil {
+		t.Fatalf("GetQuerySpan returned error: %v", err)
+	}
+	sigs := toSigs(span.AccessTables)
+	if !containsSig(sigs, tableSig{Table: "secret"}) {
+		t.Errorf("AccessTables missing secret (got %+v)", sigs)
+	}
+	if containsSig(sigs, tableSig{Table: "c"}) {
+		t.Errorf("CTE c misreported as a physical table (got %+v)", sigs)
+	}
+}
+
+// TestGetQuerySpanNestedSubqueriesStayLinear: the strict parse already parses
+// every subquery body in place, and the span walks that tree. Parsing each
+// body again from its raw text did it once per level, so 2,000 nested
+// subqueries took 4s; these take milliseconds.
+func TestGetQuerySpanNestedSubqueriesStayLinear(t *testing.T) {
+	const depth = 2000
+	nest := func(innermost, wrap string) string {
+		open, closing, _ := strings.Cut(wrap, "?")
+		return strings.Repeat(open, depth) + innermost + strings.Repeat(closing, depth)
+	}
+	for _, tc := range []struct{ name, sql string }{
+		{"scalar", nest("SELECT 1", "SELECT (?)")},
+		{"derived table", nest("SELECT * FROM t", "SELECT * FROM (?) x")},
+		{"EXISTS", nest("SELECT 1 FROM t", "SELECT 1 FROM t WHERE EXISTS (?)")},
+		{"IN", nest("SELECT a FROM t", "SELECT a FROM t WHERE a IN (?)")},
+		{"WITH", "SELECT * FROM (" + nest("SELECT * FROM t", "WITH c AS (?) SELECT * FROM c, t") + ") x"},
+	} {
+		done := make(chan error, 1)
+		go func() {
+			_, err := GetQuerySpan(tc.sql)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s: GetQuerySpan error = %v", tc.name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: GetQuerySpan through %d nested subqueries took over 2s", tc.name, depth)
+		}
+	}
+}
+
+// spanWithin runs GetQuerySpan against a deadline, so a walk gone quadratic
+// fails the test instead of hanging it.
+func spanWithin(t *testing.T, name, sql string) *QuerySpan {
+	t.Helper()
+	type result struct {
+		span *QuerySpan
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		span, err := GetQuerySpan(sql)
+		done <- result{span, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("%s: GetQuerySpan error = %v", name, r.err)
+		}
+		return r.span
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s: GetQuerySpan took over 5s", name)
+		return nil
+	}
+}
+
+// TestGetQuerySpanSetOpChainsStayLinear: a set operation installs the WITH
+// of its leftmost SELECT, which scopes over every arm. Each level of a
+// left-deep chain searched the left spine for it again, so 99,990 arms took
+// two minutes; the chain now searches once.
+func TestGetQuerySpanSetOpChainsStayLinear(t *testing.T) {
+	const arms = 50000
+	chain := func(first, op, arm string) string {
+		return first + strings.Repeat(" "+op+" "+arm, arms-1)
+	}
+	for _, tc := range []struct{ name, sql string }{
+		{"UNION ALL", chain("SELECT 1", "UNION ALL", "SELECT 1")},
+		{"UNION", chain("SELECT 1", "UNION", "SELECT 1")},
+		{"INTERSECT", chain("SELECT 1", "INTERSECT", "SELECT 1")},
+		{"EXCEPT", chain("SELECT 1", "EXCEPT", "SELECT 1")},
+		{"WITH", chain("WITH c AS (SELECT a FROM t) SELECT a FROM c", "UNION ALL", "SELECT a FROM c")},
+	} {
+		span := spanWithin(t, tc.name, tc.sql)
+		if len(span.Results) != 1 {
+			t.Errorf("%s: Results = %+v, want one column", tc.name, span.Results)
+		}
+		want := []tableSig(nil)
+		if tc.name == "WITH" {
+			// Every arm's c is the CTE; only its body reads a table.
+			want = []tableSig{{Table: "t"}}
+		}
+		if got := toSigs(span.AccessTables); len(got) != len(want) || (len(want) > 0 && got[0] != want[0]) {
+			t.Errorf("%s: AccessTables = %+v, want %+v", tc.name, got, want)
+		}
+	}
+}
+
+// TestGetQuerySpanNestedLambdasStayLinear: an output column's source columns
+// skip the names its enclosing lambdas bind. Copying the bound names into
+// each nested lambda, and its columns back out, made 4,000 nested lambdas
+// take 4s.
+func TestGetQuerySpanNestedLambdasStayLinear(t *testing.T) {
+	const depth = 8000
+	var b strings.Builder
+	b.WriteString("SELECT ")
+	for i := range depth {
+		b.WriteString("array_map(x" + strconv.Itoa(i) + " -> ")
+	}
+	b.WriteString("x0 + y" + strings.Repeat(", arr)", depth) + " FROM t")
+	span := spanWithin(t, "nested lambdas", b.String())
+	if len(span.Results) != 1 {
+		t.Fatalf("Results = %+v, want one column", span.Results)
+	}
+	// y and every level's arr, but not the lambda parameter x0.
+	cols := span.Results[0].SourceColumns
+	if len(cols) != depth+1 || cols[0] != (ColumnRef{Column: "y"}) {
+		t.Fatalf("SourceColumns: %d columns starting %+v, want y then %d of arr", len(cols), cols[:min(len(cols), 2)], depth)
+	}
+	for _, c := range cols[1:] {
+		if c != (ColumnRef{Column: "arr"}) {
+			t.Fatalf("SourceColumns holds %+v, want only y and arr", c)
+		}
+	}
+}

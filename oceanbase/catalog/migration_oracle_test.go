@@ -1,0 +1,573 @@
+package catalog
+
+import (
+	"context"
+	"fmt"
+	"hash/fnv"
+	"strconv"
+	"strings"
+	"testing"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+// The oracle proof for generate-core (correctness-protocol.md gates 1 & 2), against
+// OceanBase. This is the first node that EMITS DDL, so it proves both
+// oracle gates mechanically:
+//
+//  1. APPLY-CORRECTNESS. For a representative (from, to) pair: build a real database in
+//     state `from` (apply from's DDL), run GenerateMigration(from, to).SQL() against it, then
+//     SHOW CREATE the result and assert its canonical form equals `to`'s canonical form
+//     (DiffWithNormalizer(result, to).IsEmpty()). The from/to catalogs are loaded from the
+//     ENGINE'S OWN readbacks so they are in authentic stored form, exactly as the release
+//     path sees them.
+//
+//  2. IDEMPOTENCE (the spine). When from == to the generated plan is EMPTY (SQL() == ""), and
+//     the full round-trip — apply `to`, dump SHOW CREATE, reload, diff against `to` → empty,
+//     generate → empty — produces no DDL. A non-empty no-op plan is a bug in ordering or
+//     rendering (or an upstream normalization gap → flagged, not patched here).
+//
+// The harness reuses oceanBaseOracle / showCreate / serverCharsetFor / loadOneTable
+// from the diff + normalize oracle tests.
+
+// catalogFromReadback applies createSQL in a throwaway db, reads back the table's SHOW
+// CREATE, and loads it into a catalog (wrapped with the box's server charset so table-charset
+// inheritance resolves identically to loadOneTable). It returns the catalog + the table's
+// authentic stored form.
+func (o *oracleConn) catalogFromReadback(t testing.TB, dbName, createSQL, table string) (*Catalog, *Table, string, bool) {
+	t.Helper()
+	rb, ok := o.showCreate(t, dbName, createSQL, table)
+	if !ok {
+		return nil, nil, "", false
+	}
+	cat, tbl := loadOneTable(t, serverCharsetFor(o.version), rb, table)
+	return cat, tbl, rb, true
+}
+
+// migrationProbe is one apply-correctness case: transform a single table from `fromDDL` to
+// `toDDL`. An empty fromDDL means "table does not exist yet" (a pure CREATE).
+type migrationProbe struct {
+	id      string
+	table   string
+	fromDDL string // "" → table absent in from
+	toDDL   string
+}
+
+// migrationProbes enumerates the table + column op FORMS this node covers. Each is proven on
+// the listed versions: the generated DDL, applied to a real `from` database, must yield a
+// table whose canonical form equals `to`.
+func migrationProbes() []migrationProbe {
+	return []migrationProbe{
+		// ---- CREATE TABLE (from empty) — every column rendering surface ----
+		{"create-simple", "t", "",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))"},
+		{"create-int-widths", "t", "",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT(11), b BIGINT(20), p TINYINT, h INT UNSIGNED, z INT ZEROFILL)"},
+		{"create-boolean", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, m BOOLEAN, d TINYINT(1))"},
+		{"create-numeric", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL, b DECIMAL(10,2), j REAL, f FLOAT, g DOUBLE(15,4))"},
+		{"create-char-bit-year", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, a CHAR, d BINARY, c BIT, y YEAR, v VARCHAR(40), bb VARBINARY(8))"},
+		{"create-enum-set", "t", "",
+			`CREATE TABLE t (id INT PRIMARY KEY, a ENUM('x','y','z'), b SET('a','b','c'))`},
+		{"create-defaults", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT DEFAULT 0, b INT DEFAULT '7', f DECIMAL(10,2) DEFAULT 0, c VARCHAR(20) DEFAULT 'x', j BOOLEAN DEFAULT TRUE)"},
+		{"create-nullability", "t", "",
+			"CREATE TABLE t (id INT, a INT NULL, b INT DEFAULT NULL, d VARCHAR(10) NOT NULL, PRIMARY KEY (id))"},
+		{"create-comment", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT COMMENT 'has ''quote'' inside') COMMENT='tbl ''c'''"},
+		{"create-autoinc", "t", "",
+			"CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, a INT) AUTO_INCREMENT=100"},
+		{"create-generated", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT GENERATED ALWAYS AS (a+1) VIRTUAL, c INT GENERATED ALWAYS AS (a*2) STORED)"},
+		{"create-timestamp", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, a TIMESTAMP, b TIMESTAMP NULL, d TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"},
+		{"create-datetime-default", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, g DATETIME DEFAULT CURRENT_TIMESTAMP, h DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)"},
+		{"create-charset-explicit", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, a VARCHAR(10) CHARACTER SET utf8mb4, b VARCHAR(10)) DEFAULT CHARSET=utf8mb4"},
+		{"create-engine-myisam", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT) ENGINE=MyISAM"},
+		{"create-multi-column", "t", "",
+			"CREATE TABLE t (id INT NOT NULL, c1 VARCHAR(10), c2 INT DEFAULT 0, c3 DATE, c4 DECIMAL(8,3), PRIMARY KEY (id))"},
+		{"create-functional-default", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT DEFAULT (1+1), b VARCHAR(36) DEFAULT (UUID()))"},
+		{"create-row-format", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8"},
+
+		// ---- DROP TABLE ----
+		{"drop-table", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT)",
+			""},
+
+		// ---- ADD COLUMN ----
+		{"add-column", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY)",
+			"CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(20))"},
+		{"add-column-notnull-default", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY)",
+			"CREATE TABLE t (id INT PRIMARY KEY, n INT NOT NULL DEFAULT 5)"},
+		{"add-generated-column", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT)",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT GENERATED ALWAYS AS (a+1) STORED)"},
+		{"add-timestamp-column", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY)",
+			"CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP)"},
+
+		// ---- DROP COLUMN ----
+		{"drop-column", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(20))",
+			"CREATE TABLE t (id INT PRIMARY KEY)"},
+
+		// ---- MODIFY COLUMN (type / nullability / default / charset / comment / autoinc) ----
+		{"modify-type", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+			"CREATE TABLE t (id INT PRIMARY KEY, v BIGINT)"},
+		{"modify-type-width-57-vs-80", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, v SMALLINT)",
+			"CREATE TABLE t (id INT PRIMARY KEY, v BIGINT)"},
+		{"modify-nullability", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, v INT NULL)",
+			"CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL)"},
+		{"modify-default", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, v INT DEFAULT 0)",
+			"CREATE TABLE t (id INT PRIMARY KEY, v INT DEFAULT 1)"},
+		// bug: changing TO the BIGINT UNSIGNED max default must generate a MODIFY that applies
+		// to the EXACT value 18446744073709551615 (not int64-clamped 9223372036854775807). The
+		// apply-correctness diff catches a corrupted value; TestOracle_BigintUnsignedExactValue
+		// additionally asserts the literal survives byte-for-byte.
+		{"modify-default-bigint-unsigned-max", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, big BIGINT UNSIGNED NOT NULL DEFAULT 0)",
+			"CREATE TABLE t (id INT PRIMARY KEY, big BIGINT UNSIGNED NOT NULL DEFAULT 18446744073709551615)"},
+		// bug: changing TO a BIT default written as hex (0x05) must apply as b'101'.
+		{"modify-default-bit-hex", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, f BIT(8) NOT NULL DEFAULT b'0')",
+			"CREATE TABLE t (id INT PRIMARY KEY, f BIT(8) NOT NULL DEFAULT 0x05)"},
+		// bug: changing TO a numeric YEAR default (2000) must apply and round-trip vs '2000'.
+		{"modify-default-year", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, y YEAR NOT NULL DEFAULT 1999)",
+			"CREATE TABLE t (id INT PRIMARY KEY, y YEAR NOT NULL DEFAULT 2000)"},
+		{"modify-charset", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(10) CHARACTER SET latin1) DEFAULT CHARSET=utf8mb4",
+			"CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(10) CHARACTER SET utf8mb4) DEFAULT CHARSET=utf8mb4"},
+		// bug (Roundcube et al.): the legacy `BINARY` string-column modifier resolves to the
+		// charset's `_bin` collation. The generated DDL for a `varchar BINARY` target must
+		// apply to a real engine and yield a column whose stored form (COLLATE <cs>_bin) equals
+		// the target — i.e. ADD/MODIFY emits the resolved _bin collation, not the table default.
+		// (entry char-binary-attribute)
+		{"add-column-binary-modifier", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY) DEFAULT CHARSET=utf8mb4",
+			"CREATE TABLE t (id INT PRIMARY KEY, k VARCHAR(128) BINARY NOT NULL) DEFAULT CHARSET=utf8mb4"},
+		// MODIFY a plain column TO its BINARY (_bin) form — a genuine collation change that must
+		// be emitted and applied (proves the fix doesn't make plain↔BINARY an invisible no-op).
+		{"modify-column-to-binary-modifier", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(10)) DEFAULT CHARSET=utf8mb4",
+			"CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(10) BINARY) DEFAULT CHARSET=utf8mb4"},
+		{"modify-comment", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, v INT COMMENT 'a')",
+			"CREATE TABLE t (id INT PRIMARY KEY, v INT COMMENT 'b')"},
+		{"modify-add-autoinc", "t",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+			"CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)"},
+		// A column leaves the primary key, widens and becomes nullable, and a new index
+		// needs the width: only NULL waits for the key, the rest of the MODIFY runs first.
+		{"modify-pk-member-widen-and-null", "t",
+			"CREATE TABLE t (id INT NOT NULL, a VARCHAR(5) NOT NULL, PRIMARY KEY (id, a))",
+			"CREATE TABLE t (id INT NOT NULL, a VARCHAR(20), PRIMARY KEY (id), KEY ka (a(10)))"},
+		{"modify-generated-expr", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, g INT GENERATED ALWAYS AS (a+1) STORED)",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, g INT GENERATED ALWAYS AS (a+2) STORED)"},
+		// OceanBase refuses the MODIFY (1235), so the column is dropped and added again, and
+		// the indexes over it with it: one of its own and one it shares with another column.
+		{"modify-generated-expr-indexed", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, g INT GENERATED ALWAYS AS (a+1) VIRTUAL, KEY kg (g), KEY kga (g, a), KEY ka (a))",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, g INT GENERATED ALWAYS AS (a+2) VIRTUAL, KEY kg (g), KEY kga (g, a), KEY ka (a))"},
+		// An index stores the column: DROP COLUMN takes it out of the STORING, so that index
+		// is dropped and added again too.
+		{"modify-generated-expr-stored-by-index", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, g INT GENERATED ALWAYS AS (a+1) STORED, KEY k (a) STORING (g))",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, g INT GENERATED ALWAYS AS (a+2) STORED, KEY k (a) STORING (g))"},
+		// A CHECK reads the column, so it cannot be dropped: the plan keeps the MODIFY and
+		// warns, and OceanBase refuses it (obRefused).
+		{"modify-generated-expr-under-check", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, g INT GENERATED ALWAYS AS (a+1) STORED, CONSTRAINT c_g CHECK (g > 0))",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, g INT GENERATED ALWAYS AS (a+2) STORED, CONSTRAINT c_g CHECK (g > 0))"},
+
+		// ---- table-option ALTER (engine / charset / comment / row_format) ----
+		{"alter-engine", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY) ENGINE=InnoDB",
+			"CREATE TABLE t (id INT PRIMARY KEY) ENGINE=MyISAM"},
+		{"alter-comment", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY) COMMENT='old'",
+			"CREATE TABLE t (id INT PRIMARY KEY) COMMENT='new'"},
+		{"alter-charset", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY) DEFAULT CHARSET=latin1",
+			"CREATE TABLE t (id INT PRIMARY KEY) DEFAULT CHARSET=utf8mb4"},
+		{"alter-rowformat-add", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY)",
+			"CREATE TABLE t (id INT PRIMARY KEY) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8"},
+		{"alter-rowformat-change", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY) ROW_FORMAT=COMPACT",
+			"CREATE TABLE t (id INT PRIMARY KEY) ROW_FORMAT=DYNAMIC"},
+
+		// ---- review-regression apply proofs (blockers #1, #2) ----
+		// Generated storage-mode flip VIRTUAL→STORED: must be DROP+ADD (in-place MODIFY is
+		// rejected by MySQL, error 3106). 8.0 only — stored generated cols need 5.7.x patches the
+		// box may lack; proven on 8.0.
+		{"gen-storage-flip", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, g INT GENERATED ALWAYS AS (a+1) VIRTUAL)",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, g INT GENERATED ALWAYS AS (a+1) STORED)"},
+		// Dropping a base column AND a generated column that references it: the generated column
+		// must be dropped first (error 3108 otherwise).
+		{"gen-drop-with-base", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, a INT, z INT GENERATED ALWAYS AS (a+1) STORED)",
+			"CREATE TABLE t (id INT PRIMARY KEY)"},
+		// Re-round N2: a generated column `g` (refs base `z`, sorts before it) flips storage
+		// (DROP+ADD) in the same plan as a type-widening MODIFY of `z`. The generated ADD must
+		// land after the base MODIFY (else the re-add references a column mid-change). 8.0 only
+		// (stored generated columns).
+		{"gen-flip-with-base-modify", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY, g INT GENERATED ALWAYS AS (z+1) VIRTUAL, z SMALLINT)",
+			"CREATE TABLE t (id INT PRIMARY KEY, g INT GENERATED ALWAYS AS (z+1) STORED, z BIGINT)"},
+
+		// ---- coverage: INVISIBLE column, COLLATE-only divergence (8.0 features) ----
+		{"create-invisible-column", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, secret INT INVISIBLE)"},
+		{"add-invisible-column", "t",
+			"CREATE TABLE t (id INT PRIMARY KEY)",
+			"CREATE TABLE t (id INT PRIMARY KEY, secret INT INVISIBLE)"},
+		{"create-collate-only-column", "t", "",
+			"CREATE TABLE t (id INT PRIMARY KEY, a VARCHAR(10) COLLATE utf8mb4_unicode_ci) DEFAULT CHARSET=utf8mb4"},
+	}
+}
+
+// TestOracle_MigrationApplyCorrectness proves gate 2 (apply-correctness) for every probe:
+// the generated DDL transforms a real `from` database into a `to`-equal one.
+func TestOracle_MigrationApplyCorrectness(t *testing.T) {
+	for _, version := range oracleVersions() {
+		o := oceanBaseOracle(t)
+		n := NormalizerFor(version)
+		for _, probe := range migrationProbes() {
+			t.Run(fmt.Sprintf("%s/%s", o.name, probe.id), gapped(func(t testing.TB) {
+				assertApplyCorrect(t, o, n, probe)
+			}))
+		}
+	}
+}
+
+// assertApplyCorrect is the core gate-2 assertion. It loads from/to catalogs from the
+// engine's own readbacks, generates the plan, applies it to a from-state database, reads the
+// result back, and asserts the result canonicalizes equal to `to` (in both directions).
+func assertApplyCorrect(t testing.TB, o *oracleConn, n *Normalizer, p migrationProbe) {
+	t.Helper()
+
+	// Each probe gets its OWN apply database (and its own throwaway readback databases) so the
+	// suite is hermetic: the shared apply harness used to contend on one fixed `diffdb` across the
+	// generate-core, index, and check apply suites — a pre-existing pooled-`USE` race that surfaced
+	// as `Unknown database 'diffdb'` when several apply suites ran in one process (or two
+	// concurrent `go test` processes). applyDBName derives a per-probe-unique, identifier-safe name
+	// (mirrors the partition harness's pa_<slug> convention; see assertPartitionApplyCorrect).
+	applyDB := applyDBName(t, p.id)
+	sc := serverCharsetFor(o.version)
+	ctx := context.Background()
+
+	// One pinned connection for ALL of this probe's statements (readbacks + setup + apply), so the
+	// pool never lands a `USE` on a different connection than the next statement.
+	conn, err := o.session(ctx)
+	if err != nil {
+		t.Fatalf("[%s] grab conn: %v", o.name, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// readbackVia applies a CREATE in a throwaway db on this connection and returns its SHOW
+	// CREATE (the engine's authentic stored form). The throwaway db name is derived per-probe so
+	// it never collides with another suite's readback db.
+	readbackVia := func(throwaway, createSQL, table string) (string, bool) {
+		for _, s := range []string{
+			"DROP DATABASE IF EXISTS " + throwaway,
+			fmt.Sprintf("CREATE DATABASE %s DEFAULT CHARSET=%s", throwaway, sc),
+			"USE " + throwaway,
+			createSQL,
+		} {
+			if _, err := conn.ExecContext(ctx, s); err != nil {
+				t.Logf("[%s] %s readback setup failed: %q: %v", o.name, p.id, s, err)
+				o.refusal = fmt.Errorf("%q: %w", s, err)
+				return "", false
+			}
+		}
+		var name, ddl string
+		row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE %s.%s", throwaway, table))
+		if err := row.Scan(&name, &ddl); err != nil {
+			t.Logf("[%s] %s SHOW CREATE failed: %v", o.name, p.id, err)
+			return "", false
+		}
+		return ddl, true
+	}
+
+	// Build `to` and `from` catalogs from the engine's own readbacks (authentic stored form),
+	// each wrapped in applyDB so the generated plan qualifies tables as `applyDB`.`t` — the same
+	// database we set up and apply in below.
+	var toCat *Catalog
+	tableInTo := strings.TrimSpace(p.toDDL) != ""
+	if tableInTo {
+		rb, ok := readbackVia(applyDB+"_to", p.toDDL, p.table)
+		if !ok {
+			o.refused(t, nil, "could not obtain `to` readback for %s", p.id)
+			return
+		}
+		toCat, _ = loadOnePartTable(t, applyDB, sc, rehomed(rb, applyDB+"_to", applyDB), p.table)
+	} else {
+		toCat = New()
+	}
+
+	// The `from` state is built in the apply database itself and read back from there: a
+	// name the engine makes up for an unnamed CHECK or foreign key belongs to one table in
+	// one database, so a plan drawn from a readback taken anywhere else would drop a name
+	// this database does not have. readbackVia selects the apply database, so the plan
+	// applies there.
+	var fromCat *Catalog
+	tableInFrom := strings.TrimSpace(p.fromDDL) != ""
+	if tableInFrom {
+		rb, ok := readbackVia(applyDB, p.fromDDL, p.table)
+		if !ok {
+			o.refused(t, nil, "could not set up `from` state for %s", p.id)
+			return
+		}
+		fromCat, _ = loadOnePartTable(t, applyDB, sc, rb, p.table)
+	} else {
+		fromCat = New()
+		for _, s := range []string{
+			"DROP DATABASE IF EXISTS " + applyDB,
+			fmt.Sprintf("CREATE DATABASE %s DEFAULT CHARSET=%s", applyDB, sc),
+			"USE " + applyDB,
+		} {
+			if _, err := conn.ExecContext(ctx, s); err != nil {
+				t.Fatalf("[%s] could not set up the apply database for %s: %q: %v", o.name, p.id, s, err)
+			}
+		}
+	}
+
+	// Generate the plan (version-aware).
+	diff := DiffWithNormalizer(fromCat, toCat, n)
+	plan := GenerateMigrationWithNormalizer(fromCat, toCat, diff, n)
+
+	// Apply the migration statements one at a time on the same connection.
+	if !o.applyPlan(t, conn, plan) {
+		return
+	}
+
+	// Read back the result (on the same connection) and compare to `to`.
+	readback := func(table string) (string, bool) {
+		var name, ddl string
+		row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE %s.%s", applyDB, table))
+		if err := row.Scan(&name, &ddl); err != nil {
+			return "", false
+		}
+		return ddl, true
+	}
+
+	if !tableInTo {
+		// The table should be gone (DROP). Assert SHOW CREATE now fails.
+		if _, ok := readback(p.table); ok {
+			t.Errorf("[%s] %s: table %s still exists after DROP plan:\n%s", o.name, p.id, p.table, plan.SQL())
+		}
+		return
+	}
+
+	resultRB, ok := readback(p.table)
+	if !ok {
+		t.Fatalf("[%s] %s: result table %s missing after apply:\n%s", o.name, p.id, p.table, plan.SQL())
+	}
+	// Load the result into the SAME applyDB so it shares the (database, table) identity with toCat
+	// — loading into a different db name would phantom a whole-table DROP+ADD in the diff.
+	resultCat, _ := loadOnePartTable(t, applyDB, sc, resultRB, p.table)
+
+	if d := DiffWithNormalizer(resultCat, toCat, n); !d.IsEmpty() {
+		// Asked on conn, which holds the pool's one connection: o.db would wait for it
+		// forever.
+		var toName, toRB string
+		_ = conn.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE %s_to.%s", applyDB, p.table)).Scan(&toName, &toRB)
+		t.Errorf("[%s] APPLY-CORRECTNESS FAILED for %s: result != to\n  plan:\n%s\n  result: %s\n  want:   %s\n  diff: %s",
+			o.name, p.id, plan.SQL(), strings.TrimSpace(resultRB), strings.TrimSpace(toRB), describeDiff(d))
+	}
+	// Symmetry: to vs result must also be empty.
+	if d := DiffWithNormalizer(toCat, resultCat, n); !d.IsEmpty() {
+		t.Errorf("[%s] APPLY-CORRECTNESS (reverse) FAILED for %s: %s", o.name, p.id, describeDiff(d))
+	}
+}
+
+// applyDBName builds a per-probe, identifier-safe apply-database name for the shared apply
+// harness, so each probe (and each suite that reuses assertApplyCorrect) has databases of its
+// own. It combines the slugged probe id with a short hash of the full test name: t.Name()
+// carries the suite path, so two probes sharing an id across suites get distinct databases.
+// Nothing else goes into the name, because it is part of every request the probe sends and a
+// tape replays only the requests it recorded. The result stays well under the 64-character
+// identifier limit even with the harness's `_to` / `_from` throwaway suffixes appended. The
+// `pa_` prefix mirrors the partition harness's convention (assertPartitionApplyCorrect).
+func applyDBName(t testing.TB, probeID string) string {
+	t.Helper()
+	slug := strings.ReplaceAll(probeID, "-", "_")
+	if len(slug) > 40 {
+		slug = slug[:40]
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(t.Name()))
+	return "pa_" + slug + "_" + strconv.FormatUint(uint64(h.Sum32()), 16)
+}
+
+// TestOracle_MigrationIdempotence proves gate 1 (the spine): for a schema in its real stored
+// form, the generated no-op plan is EMPTY — and the full round-trip (apply → dump → reload →
+// diff → generate) emits nothing. A non-empty no-op plan is a bug.
+func TestOracle_MigrationIdempotence(t *testing.T) {
+	for _, version := range oracleVersions() {
+		o := oceanBaseOracle(t)
+		n := NormalizerFor(version)
+		// Reuse the diff idempotence corpus (the same high-risk forms), but assert the PLAN is
+		// empty rather than just the diff.
+		for _, probe := range diffIdempotenceProbes() {
+			t.Run(fmt.Sprintf("%s/%s", o.name, probe.id), gapped(func(t testing.TB) {
+				// Load the engine's stored form of the schema.
+				cat, _, rb, ok := o.catalogFromReadback(t, "gen_idem_"+strings.ReplaceAll(probe.id, "-", "_"), probe.create, probe.table)
+				if !ok {
+					o.refused(t, nil, "could not obtain readback for %s", probe.id)
+					return
+				}
+				// Self-plan must be empty (idempotence spine).
+				diff := DiffWithNormalizer(cat, cat, n)
+				plan := GenerateMigrationWithNormalizer(cat, cat, diff, n)
+				if plan.SQL() != "" {
+					t.Errorf("[%s] NON-EMPTY NO-OP PLAN for %s (normalization/ordering bug):\n  stored: %s\n  plan:\n%s",
+						o.name, probe.id, strings.TrimSpace(rb), plan.SQL())
+				}
+
+				// Round-trip: apply the user form, dump, reload, diff against the user-form
+				// catalog, generate — must be empty. This catches a rendering form that the
+				// engine would re-normalize differently from the loader.
+				userCat, _ := loadOneTable(t, serverCharsetFor(o.version), probe.create, probe.table)
+				rtDiff := DiffWithNormalizer(userCat, cat, n)
+				rtPlan := GenerateMigrationWithNormalizer(userCat, cat, rtDiff, n)
+				if rtPlan.SQL() != "" {
+					t.Errorf("[%s] NON-EMPTY ROUND-TRIP PLAN (user vs stored) for %s:\n  user:   %s\n  stored: %s\n  plan:\n%s",
+						o.name, probe.id, strings.TrimSpace(probe.create), strings.TrimSpace(rb), rtPlan.SQL())
+				}
+			}))
+		}
+	}
+}
+
+// TestOracle_BigintUnsignedExactValue is the dedicated bug-1 proof: a generated migration to
+// a BIGINT UNSIGNED default of the uint64 maximum (18446744073709551615) must, when applied to
+// a real database, store the EXACT value — not the int64-clamped 9223372036854775807. It
+// asserts the literal survives byte-for-byte in the readback (the apply-correctness diff alone
+// could be satisfied by both sides being equally corrupted; this checks the absolute value).
+// It also covers the other integer boundaries that overflow int64 on the way in.
+func TestOracle_BigintUnsignedExactValue(t *testing.T) {
+	cases := []struct {
+		id      string
+		colType string
+		def     string // exact decimal literal the user writes (and that must be stored)
+	}{
+		{"uint64-max", "BIGINT UNSIGNED", "18446744073709551615"},
+		{"int64-max-plus-1", "BIGINT UNSIGNED", "9223372036854775808"},
+		{"int64-max", "BIGINT", "9223372036854775807"},
+		{"int64-min", "BIGINT", "-9223372036854775808"},
+	}
+	for _, version := range oracleVersions() {
+		o := oceanBaseOracle(t)
+		n := NormalizerFor(version)
+		sc := serverCharsetFor(o.version)
+		ctx := context.Background()
+		for _, c := range cases {
+			t.Run(o.name+"/"+c.id, gapped(func(t testing.TB) {
+				applyDB := applyDBName(t, "bigexact_"+c.id)
+				fromDDL := fmt.Sprintf("CREATE TABLE t (id INT PRIMARY KEY, big %s NOT NULL DEFAULT 0)", c.colType)
+				toDDL := fmt.Sprintf("CREATE TABLE t (id INT PRIMARY KEY, big %s NOT NULL DEFAULT %s)", c.colType, c.def)
+
+				// One pinned connection for all statements so a pooled USE never lands on a
+				// different connection than the next statement.
+				conn, err := o.session(ctx)
+				if err != nil {
+					t.Fatalf("[%s] grab conn: %v", o.name, err)
+				}
+				defer func() { _ = conn.Close() }()
+
+				readbackVia := func(throwaway, createSQL string) (string, bool) {
+					for _, s := range []string{
+						"DROP DATABASE IF EXISTS " + throwaway,
+						fmt.Sprintf("CREATE DATABASE %s DEFAULT CHARSET=%s", throwaway, sc),
+						"USE " + throwaway,
+						createSQL,
+					} {
+						if _, err := conn.ExecContext(ctx, s); err != nil {
+							t.Logf("[%s] readback setup failed: %q: %v", o.name, s, err)
+							return "", false
+						}
+					}
+					var name, ddl string
+					row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE %s.t", throwaway))
+					if err := row.Scan(&name, &ddl); err != nil {
+						return "", false
+					}
+					return ddl, true
+				}
+
+				// Load from/to into applyDB-named catalogs (authentic stored form) so the plan
+				// qualifies tables as `applyDB`.`t` — the db we set up and apply in below.
+				fromRB, ok := readbackVia(applyDB+"_from", fromDDL)
+				if !ok {
+					o.refused(t, nil, "could not obtain `from` readback")
+					return
+				}
+				toRB, ok := readbackVia(applyDB+"_to", toDDL)
+				if !ok {
+					o.refused(t, nil, "could not obtain `to` readback")
+					return
+				}
+				fromCat, _ := loadOnePartTable(t, applyDB, sc, fromRB, "t")
+				toCat, _ := loadOnePartTable(t, applyDB, sc, toRB, "t")
+
+				diff := DiffWithNormalizer(fromCat, toCat, n)
+				plan := GenerateMigrationWithNormalizer(fromCat, toCat, diff, n)
+				if plan.SQL() == "" {
+					t.Fatalf("[%s] expected a MODIFY plan changing the default to %s, got empty", o.name, c.def)
+				}
+				// The generated DDL itself must carry the exact literal, never the clamped value.
+				if !strings.Contains(plan.SQL(), c.def) {
+					t.Errorf("[%s] generated plan must carry exact default %s:\n%s", o.name, c.def, plan.SQL())
+				}
+				if c.def != "9223372036854775807" && strings.Contains(plan.SQL(), "9223372036854775807") {
+					t.Errorf("[%s] generated plan leaked int64-clamped value:\n%s", o.name, plan.SQL())
+				}
+
+				// Build a real from-state database and apply the plan on the pinned connection.
+				for _, s := range []string{
+					"DROP DATABASE IF EXISTS " + applyDB,
+					fmt.Sprintf("CREATE DATABASE %s DEFAULT CHARSET=%s", applyDB, sc),
+					"USE " + applyDB,
+					fromDDL,
+				} {
+					if _, err := conn.ExecContext(ctx, s); err != nil {
+						o.refused(t, err, "could not set up from-state: %q", s)
+						return
+					}
+				}
+				if !o.applyPlan(t, conn, plan) {
+					return
+				}
+				// COLUMN_DEFAULT is NOT NULL for these columns; COALESCE guards against a driver
+				// surfacing it as NULL so a plain string scan is safe.
+				var storedDefault string
+				row := conn.QueryRowContext(ctx,
+					"SELECT COALESCE(COLUMN_DEFAULT, '') FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME='t' AND COLUMN_NAME='big'", applyDB)
+				if err := row.Scan(&storedDefault); err != nil {
+					t.Fatalf("[%s] reading stored default failed: %v", o.name, err)
+				}
+				if storedDefault != c.def {
+					t.Errorf("[%s] EXACT-VALUE CORRUPTION: stored default = %q, want %q (plan:\n%s)",
+						o.name, storedDefault, c.def, plan.SQL())
+				}
+			}))
+		}
+	}
+}

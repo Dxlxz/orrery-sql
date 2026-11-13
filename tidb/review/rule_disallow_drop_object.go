@@ -1,0 +1,120 @@
+package review
+
+import (
+	"strconv"
+
+	"github.com/Dxlxz/orrery-sql/review"
+	"github.com/Dxlxz/orrery-sql/tidb/ast"
+)
+
+// checkDisallowDropObject reports every DROP: the DROP statement of any
+// object kind, and ALTER TABLE ... DROP COLUMN, DROP INDEX, and DROP
+// PARTITION, which anchor the subcommand. IF EXISTS does not exempt a
+// statement, and neither does a routine body around it: the statement
+// tree is walked, so a DROP inside a procedure is reported where it is.
+// Dropping a primary key, a foreign key, a check constraint, or DROP
+// CONSTRAINT belongs to DisallowDropConstraint; a unique index dropped as
+// an index is an index here, and a unique key there.
+func checkDisallowDropObject(sql string, s *statement, r *reporter) {
+	ast.Inspect(s.node, func(n ast.Node) bool {
+		// report anchors a DROP statement; reportAt a subcommand. The code
+		// follows the kind the message names the object by.
+		reportAt := func(code review.FindingCode, rng review.Range, msg string) {
+			r.report(code, s.index, rng, msg)
+		}
+		report := func(loc ast.Loc, kind string, names ...string) {
+			reportAt(review.DropCode(kind), anchor(s, n, loc), drops(kind, names...))
+		}
+		switch v := n.(type) {
+		case *ast.ExplainStmt, *ast.TraceStmt, *ast.PlanReplayerStmt:
+			// A plain EXPLAIN reports a plan, TRACE PLAN traces the
+			// optimizer and a plain PLAN REPLAYER DUMP writes a dump, so
+			// what any of the three carries is no change of this kind. The
+			// form that runs the statement is followed; wrapped says which
+			// form that is.
+			return runsWrapped(v)
+		case *ast.DropTableStmt:
+			kind := "table"
+			if v.Temporary {
+				kind = "temporary table"
+			}
+			report(v.Loc, kind, tables(v.Tables)...)
+		case *ast.DropViewStmt:
+			report(v.Loc, "view", tables(v.Views)...)
+		case *ast.DropSequenceStmt:
+			report(v.Loc, "sequence", tables(v.Sequences)...)
+		case *ast.DropDatabaseStmt:
+			report(v.Loc, "database", ident(v.Name))
+		case *ast.DropIndexStmt:
+			if sameName(v.Name, "PRIMARY") {
+				return true
+			}
+			reportAt(review.DropCode("index"), anchor(s, n, v.Loc), dropsOf("index", table(v.Table), ident(v.Name)))
+		case *ast.DropRoutineStmt:
+			kind := "function"
+			if v.IsProcedure {
+				kind = "procedure"
+			}
+			report(v.Loc, kind, table(v.Name))
+		case *ast.DropTriggerStmt:
+			report(v.Loc, "trigger", table(v.Name))
+		case *ast.DropEventStmt:
+			report(v.Loc, "event", ident(v.Name))
+		case *ast.DropUserStmt:
+			report(v.Loc, "user", accounts(v.Users)...)
+		case *ast.DropRoleStmt:
+			report(v.Loc, "role", accounts(v.Roles)...)
+		case *ast.DropSpatialRefSysStmt:
+			report(v.Loc, "spatial reference system", strconv.FormatInt(v.SRID, 10))
+		case *ast.DropResourceGroupStmt:
+			report(v.Loc, "resource group", ident(v.Name))
+		case *ast.DropPlacementPolicyStmt:
+			report(v.Loc, "placement policy", ident(v.Name))
+		case *ast.AlterTableStmt:
+			for _, cmd := range v.Commands {
+				if cmd == nil {
+					continue
+				}
+				switch dropKindOf(sql, cmd) {
+				case dropColumn:
+					reportAt(review.DropCode("column"), rangeOf(cmd.Loc), dropsOf("column", table(v.Table), ident(cmd.Name)))
+				case dropIndex:
+					reportAt(review.DropCode("index"), rangeOf(cmd.Loc), dropsOf("index", table(v.Table), ident(cmd.Name)))
+				case dropPartition:
+					names := make([]string, len(cmd.PartitionNames))
+					for i, name := range cmd.PartitionNames {
+						names[i] = ident(name)
+					}
+					reportAt(review.DropCode("partition"), rangeOf(cmd.Loc), dropsOf("partition", table(v.Table), names...))
+				}
+			}
+		}
+		return true
+	})
+}
+
+// drops writes the finding for the DROP of objects of one kind: "Drops
+// table `t`.", "Drops tables `t` and `p`.".
+func drops(kind string, names ...string) string {
+	if len(names) == 0 {
+		return "Drops the " + kind + "."
+	}
+	return "Drops " + review.Plural(kind, len(names)) + " " + review.Names(names...) + "."
+}
+
+// dropsOf writes the finding for the DROP of objects of one kind of an
+// owner: "Drops column `n` of `t`.", "Drops partitions `p0` and `p1` of
+// `t`.".
+func dropsOf(kind, owner string, names ...string) string {
+	return "Drops " + review.Plural(kind, len(names)) + " " + review.Names(names...) + " of " + review.Code(owner) + "."
+}
+
+// accounts writes account names as the statement gave them, with a line
+// break written as \n or \r, so a message stays one line.
+func accounts(names []string) []string {
+	out := make([]string, len(names))
+	for i, name := range names {
+		out[i] = escapeLines(name)
+	}
+	return out
+}

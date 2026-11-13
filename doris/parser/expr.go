@@ -1,0 +1,1839 @@
+package parser
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/Dxlxz/orrery-sql/doris/ast"
+)
+
+// Binding power constants for Pratt parsing (low to high).
+// Doris operator precedence from DorisParser.g4:
+//
+//	OR / || < XOR < AND / && < NOT (prefix) < predicates/comparison <
+//	bitwise | < bitwise & < shifts << >> < add +- < mul */% DIV MOD <
+//	bitwise ^ < unary (-, +, ~) < primary
+const (
+	bpNone    = 0
+	bpOr      = 10 // OR, ||
+	bpXor     = 15 // XOR
+	bpAnd     = 20 // AND, &&
+	bpNot     = 25 // NOT (prefix)
+	bpPred    = 30 // IS, BETWEEN, IN, LIKE, REGEXP/RLIKE
+	bpCmp     = 35 // =, <, >, <=, >=, <>, !=, <=>
+	bpBitOr   = 40 // |
+	bpBitAnd  = 45 // &
+	bpShift   = 50 // <<, >>
+	bpAdd     = 55 // +, -
+	bpMul     = 60 // *, /, %, DIV
+	bpBitXor  = 65 // ^
+	bpUnary   = 70 // unary -, +, ~
+	bpPrimary = 80 // atoms
+)
+
+// ---------------------------------------------------------------------------
+// Core Pratt loop
+// ---------------------------------------------------------------------------
+
+// parseExpr is the entry point for expression parsing.
+func (p *Parser) parseExpr() (ast.Node, error) {
+	return p.parseExprPrec(bpNone + 1)
+}
+
+// parseExprPrec parses an expression with the given minimum binding power.
+func (p *Parser) parseExprPrec(minBP int) (ast.Node, error) {
+	if err := p.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer p.leaveNesting()
+	left, err := p.parsePrefixExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	for {
+		bp, op, special, ok := p.infixBindingPower()
+		if !ok || bp < minBP {
+			break
+		}
+
+		if special != "" {
+			switch special {
+			case "IS":
+				left, err = p.parseIsExpr(left)
+			case "BETWEEN":
+				left, err = p.parseBetweenExpr(left, false)
+			case "NOT_BETWEEN":
+				left, err = p.parseBetweenExpr(left, true)
+			case "IN":
+				left, err = p.parseInExpr(left, false)
+			case "NOT_IN":
+				left, err = p.parseInExpr(left, true)
+			case "LIKE":
+				left, err = p.parseLikeExpr(left, false)
+			case "NOT_LIKE":
+				left, err = p.parseLikeExpr(left, true)
+			case "REGEXP":
+				left, err = p.parseRegexpExpr(left, false)
+			case "NOT_REGEXP":
+				left, err = p.parseRegexpExpr(left, true)
+			}
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		// Regular binary operator: consume the operator, parse right side.
+		p.advance()
+		right, err := p.parseExprPrec(bp + 1)
+		if err != nil {
+			return nil, err
+		}
+		left = &ast.BinaryExpr{
+			Op:    op,
+			Left:  left,
+			Right: right,
+			Loc:   ast.Loc{Start: ast.NodeLoc(left).Start, End: ast.NodeLoc(right).End},
+		}
+	}
+
+	return left, nil
+}
+
+// infixBindingPower returns (bp, op, special, ok) for the current token.
+// If special is non-empty, the caller must dispatch to the named handler
+// instead of building a BinaryExpr.
+func (p *Parser) infixBindingPower() (int, ast.BinaryOp, string, bool) {
+	switch p.cur.Kind {
+	// Logical
+	case kwOR, tokDoublePipes:
+		return bpOr, ast.BinOr, "", true
+	case kwXOR:
+		return bpXor, ast.BinXor, "", true
+	case kwAND, tokLogicalAnd:
+		return bpAnd, ast.BinAnd, "", true
+
+	// NOT as infix prefix for BETWEEN, IN, LIKE, REGEXP/RLIKE
+	case kwNOT:
+		next := p.peekNext()
+		switch next.Kind {
+		case kwBETWEEN:
+			return bpPred, 0, "NOT_BETWEEN", true
+		case kwIN:
+			return bpPred, 0, "NOT_IN", true
+		case kwLIKE:
+			return bpPred, 0, "NOT_LIKE", true
+		case kwREGEXP, kwRLIKE:
+			return bpPred, 0, "NOT_REGEXP", true
+		}
+		return 0, 0, "", false
+
+	// Predicates
+	case kwIS:
+		return bpPred, 0, "IS", true
+	case kwBETWEEN:
+		return bpPred, 0, "BETWEEN", true
+	case kwIN:
+		return bpPred, 0, "IN", true
+	case kwLIKE:
+		return bpPred, 0, "LIKE", true
+	case kwREGEXP, kwRLIKE:
+		return bpPred, 0, "REGEXP", true
+
+	// Comparison operators
+	case int('='):
+		return bpCmp, ast.BinEq, "", true
+	case tokNotEq:
+		return bpCmp, ast.BinNe, "", true
+	case int('<'):
+		return bpCmp, ast.BinLt, "", true
+	case int('>'):
+		return bpCmp, ast.BinGt, "", true
+	case tokLessEq:
+		return bpCmp, ast.BinLe, "", true
+	case tokGreaterEq:
+		return bpCmp, ast.BinGe, "", true
+	case tokNullSafeEq:
+		return bpCmp, ast.BinNullSafeEq, "", true
+
+	// Bitwise OR
+	case int('|'):
+		return bpBitOr, ast.BinBitOr, "", true
+
+	// Bitwise AND
+	case int('&'):
+		return bpBitAnd, ast.BinBitAnd, "", true
+
+	// Shifts
+	case tokShiftLeft:
+		return bpShift, ast.BinShiftLeft, "", true
+	case tokShiftRight:
+		return bpShift, ast.BinShiftRight, "", true
+
+	// Addition / subtraction
+	case int('+'):
+		return bpAdd, ast.BinAdd, "", true
+	case int('-'):
+		return bpAdd, ast.BinSub, "", true
+
+	// Multiplication / division / modulo
+	case int('*'):
+		return bpMul, ast.BinMul, "", true
+	case int('/'):
+		return bpMul, ast.BinDiv, "", true
+	case int('%'):
+		return bpMul, ast.BinMod, "", true
+	case kwDIV:
+		return bpMul, ast.BinIntDiv, "", true
+
+	// Bitwise XOR
+	case int('^'):
+		return bpBitXor, ast.BinBitXor, "", true
+	}
+
+	return 0, 0, "", false
+}
+
+// ---------------------------------------------------------------------------
+// Prefix dispatch
+// ---------------------------------------------------------------------------
+
+// parsePrefixExpr handles prefix unary operators (-, +, ~, NOT) and delegates
+// everything else to parsePrimaryExpr.
+func (p *Parser) parsePrefixExpr() (ast.Node, error) {
+	switch p.cur.Kind {
+	case int('-'):
+		start := p.cur.Loc
+		p.advance()
+		operand, err := p.parseExprPrec(bpUnary)
+		if err != nil {
+			return nil, err
+		}
+		return &ast.UnaryExpr{
+			Op:   ast.UnaryMinus,
+			Expr: operand,
+			Loc:  ast.Loc{Start: start.Start, End: ast.NodeLoc(operand).End},
+		}, nil
+
+	case int('+'):
+		start := p.cur.Loc
+		p.advance()
+		operand, err := p.parseExprPrec(bpUnary)
+		if err != nil {
+			return nil, err
+		}
+		return &ast.UnaryExpr{
+			Op:   ast.UnaryPlus,
+			Expr: operand,
+			Loc:  ast.Loc{Start: start.Start, End: ast.NodeLoc(operand).End},
+		}, nil
+
+	case int('~'):
+		start := p.cur.Loc
+		p.advance()
+		operand, err := p.parseExprPrec(bpUnary)
+		if err != nil {
+			return nil, err
+		}
+		return &ast.UnaryExpr{
+			Op:   ast.UnaryBitNot,
+			Expr: operand,
+			Loc:  ast.Loc{Start: start.Start, End: ast.NodeLoc(operand).End},
+		}, nil
+
+	case kwNOT:
+		// NOT as a prefix unary operator. Only if the next token does NOT form
+		// an infix predicate (NOT BETWEEN, NOT IN, NOT LIKE, NOT REGEXP/RLIKE).
+		// In the prefix case we are at the start of an expression, so NOT always
+		// acts as prefix.
+		start := p.cur.Loc
+		p.advance()
+		operand, err := p.parseExprPrec(bpNot)
+		if err != nil {
+			return nil, err
+		}
+		return &ast.UnaryExpr{
+			Op:   ast.UnaryNot,
+			Expr: operand,
+			Loc:  ast.Loc{Start: start.Start, End: ast.NodeLoc(operand).End},
+		}, nil
+
+	case kwEXISTS:
+		return p.parseExistsExpr()
+
+	case kwINTERVAL:
+		return p.parseIntervalExpr()
+
+	default:
+		node, err := p.parsePrimaryExpr()
+		if err != nil {
+			return nil, err
+		}
+		return p.parsePostfixSubscripts(node)
+	}
+}
+
+// parsePostfixSubscripts parses any chain of element-access / slice suffixes
+// after a primary expression: m['k'], arr[1][2], arr[1:3], arr[2:]. The
+// grammar (elementAt, arraySlice) applies these to primaryExpression, so they
+// bind tighter than any operator. The index and bounds are valueExpressions —
+// comparisons are allowed but AND/OR/NOT are not, hence bpNot+1.
+func (p *Parser) parsePostfixSubscripts(node ast.Node) (ast.Node, error) {
+	for p.cur.Kind == int('[') {
+		p.advance() // consume '['
+		begin, err := p.parseExprPrec(bpNot + 1)
+		if err != nil {
+			return nil, err
+		}
+		if p.cur.Kind == int(':') {
+			p.advance() // consume ':'
+			var end ast.Node
+			if p.cur.Kind != int(']') {
+				end, err = p.parseExprPrec(bpNot + 1)
+				if err != nil {
+					return nil, err
+				}
+			}
+			closeTok, err := p.expect(int(']'))
+			if err != nil {
+				return nil, err
+			}
+			node = &ast.ArraySliceExpr{
+				Value: node,
+				Begin: begin,
+				End:   end,
+				Loc:   ast.Loc{Start: ast.NodeLoc(node).Start, End: closeTok.Loc.End},
+			}
+			continue
+		}
+		closeTok, err := p.expect(int(']'))
+		if err != nil {
+			return nil, err
+		}
+		node = &ast.ElementAtExpr{
+			Value: node,
+			Index: begin,
+			Loc:   ast.Loc{Start: ast.NodeLoc(node).Start, End: closeTok.Loc.End},
+		}
+	}
+	return node, nil
+}
+
+// ---------------------------------------------------------------------------
+// Primary expression dispatch
+// ---------------------------------------------------------------------------
+
+// parsePrimaryExpr parses atomic expressions: literals, identifiers,
+// function calls, parenthesized expressions, CASE, CAST, etc.
+func (p *Parser) parsePrimaryExpr() (ast.Node, error) {
+	switch p.cur.Kind {
+	// KEY ident — Doris encryption-key reference (used in AES_ENCRYPT/AES_DECRYPT
+	// function arguments). Represent as a ColumnRef with a "KEY/" prefix so the
+	// AST is round-trippable.
+	case kwKEY:
+		keyLoc := p.advance().Loc
+		if isIdentifierToken(p.cur.Kind) {
+			name, err := p.parseMultipartIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			return &ast.ColumnRef{
+				Name: &ast.ObjectName{Parts: append([]string{"KEY"}, name.Parts...), Loc: ast.Loc{Start: keyLoc.Start, End: name.Loc.End}},
+				Loc:  ast.Loc{Start: keyLoc.Start, End: name.Loc.End},
+			}, nil
+		}
+		// Bare KEY — return as literal
+		return &ast.Literal{Kind: ast.LitKeyword, Value: "KEY", Loc: keyLoc}, nil
+
+	case tokInt:
+		tok := p.advance()
+		return &ast.Literal{
+			Kind:  ast.LitInt,
+			Value: tok.Str,
+			Loc:   tok.Loc,
+		}, nil
+
+	case tokFloat:
+		tok := p.advance()
+		return &ast.Literal{
+			Kind:  ast.LitFloat,
+			Value: tok.Str,
+			Loc:   tok.Loc,
+		}, nil
+
+	case tokString:
+		tok := p.advance()
+		return &ast.Literal{
+			Kind:  ast.LitString,
+			Value: tok.Str,
+			Loc:   tok.Loc,
+		}, nil
+
+	case tokHexLiteral:
+		tok := p.advance()
+		return &ast.Literal{
+			Kind:  ast.LitHex,
+			Value: tok.Str,
+			Loc:   tok.Loc,
+		}, nil
+
+	case tokBitLiteral:
+		tok := p.advance()
+		return &ast.Literal{
+			Kind:  ast.LitBit,
+			Value: tok.Str,
+			Loc:   tok.Loc,
+		}, nil
+
+	case kwTRUE:
+		tok := p.advance()
+		return &ast.Literal{
+			Kind:  ast.LitBool,
+			Value: tok.Str,
+			Loc:   tok.Loc,
+		}, nil
+
+	case kwFALSE:
+		tok := p.advance()
+		return &ast.Literal{
+			Kind:  ast.LitBool,
+			Value: tok.Str,
+			Loc:   tok.Loc,
+		}, nil
+
+	case kwNULL:
+		tok := p.advance()
+		return &ast.Literal{
+			Kind:  ast.LitNull,
+			Value: tok.Str,
+			Loc:   tok.Loc,
+		}, nil
+
+	case int('('):
+		return p.parseParenExprOrSubquery()
+
+	case int('{'):
+		// Untyped map constructor: { k: v, ... }.
+		return p.finishMapLiteral(p.cur.Loc.Start)
+
+	case int('['):
+		// Untyped array constructor: [ e, ... ].
+		return p.finishArrayLiteral(p.cur.Loc.Start)
+
+	case kwBINARY:
+		// BINARY binds at PRIMARY level to an identifier or a string literal
+		// only (grammar: BINARY? identifier #columnReference and
+		// BINARY? STRING_LITERAL #stringLiteral; engine-verified: BINARY 1,
+		// BINARY (1) and BINARY now() are all syntax errors, and
+		// BINARY a = 'x' parses as (BINARY a) = 'x'). StarRocks differs — its
+		// engine accepts the general prefix form, so its parser keeps it.
+		start := p.cur.Loc
+		p.advance()
+		var operand ast.Node
+		switch {
+		case p.cur.Kind == tokString:
+			tok := p.advance()
+			operand = &ast.Literal{Kind: ast.LitString, Value: tok.Str, Loc: tok.Loc}
+		case p.isExprIdentToken():
+			name, err := p.parseMultipartIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			if p.cur.Kind == int('(') {
+				// BINARY fn(...) is not in the grammar; the engine rejects it.
+				return nil, p.syntaxErrorAtCur()
+			}
+			operand = &ast.ColumnRef{Name: name, Loc: name.Loc}
+		default:
+			return nil, p.syntaxErrorAtCur()
+		}
+		return &ast.UnaryExpr{
+			Op:   ast.UnaryBinary,
+			Expr: operand,
+			Loc:  ast.Loc{Start: start.Start, End: ast.NodeLoc(operand).End},
+		}, nil
+
+	case kwCASE:
+		return p.parseCaseExpr()
+
+	case kwCAST:
+		return p.parseCastExpr(false)
+
+	case kwTRY_CAST:
+		return p.parseCastExpr(true)
+
+	case kwCONVERT:
+		// CONVERT is non-reserved, so only treat it specially when applied.
+		if p.peekNext().Kind == int('(') {
+			return p.parseConvertExpr()
+		}
+		return p.parseIdentExpr()
+
+	case kwEXTRACT:
+		return p.parseExtractExpr()
+
+	// Nilary functions: CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP,
+	// CURRENT_USER, SESSION_USER, LOCALTIME, LOCALTIMESTAMP.
+	case kwCURRENT_DATE, kwCURRENT_TIME, kwCURRENT_TIMESTAMP,
+		kwCURRENT_USER, kwSESSION_USER, kwLOCALTIME, kwLOCALTIMESTAMP:
+		return p.parseNilaryFunction()
+
+	case tokDoubleAt:
+		return p.parseVariableRef(true)
+
+	case int('@'):
+		return p.parseVariableRef(false)
+
+	case tokPlaceholder:
+		tok := p.advance()
+		return &ast.Literal{
+			Kind:  ast.LitNull, // placeholder treated as a null-ish literal
+			Value: "?",
+			Loc:   tok.Loc,
+		}, nil
+
+	default:
+		// A reserved keyword that the grammar still allows as a function name,
+		// but only when it is immediately applied: `TRIM(s)` is a call,
+		// `LEFT JOIN` is not.
+		if isFunctionNameKeyword(p.cur.Kind) && p.peekNext().Kind == int('(') {
+			tok := p.advance()
+			name := &ast.ObjectName{Parts: []string{strings.ToUpper(tok.Str)}, Loc: tok.Loc}
+			return p.parseFuncCall(name)
+		}
+
+		// Identifier-based: column ref or function call.
+		if p.isExprIdentToken() {
+			return p.parseIdentExpr()
+		}
+
+		return nil, p.syntaxErrorAtCur()
+	}
+}
+
+// isFunctionNameKeyword reports whether kind is a reserved keyword that is
+// nonetheless usable as a function name. It mirrors the grammar's
+// functionNameIdentifier rule; without it `IF(a,1,2)`, `LEFT(s,2)`, `TRIM(s)`
+// and `DATABASE()` all fail to parse even though the engine accepts them.
+func isFunctionNameKeyword(kind TokenKind) bool {
+	switch kind {
+	case kwADD, kwCONNECTION_ID, kwCURRENT_CATALOG, kwCURRENT_USER, kwDATABASE,
+		kwIF, kwLEFT, kwLIKE, kwPASSWORD, kwREGEXP, kwRIGHT, kwSCHEMA,
+		kwSESSION_USER, kwTRIM, kwUSER:
+		return true
+	}
+	return false
+}
+
+// isExprIdentToken reports whether the current token is usable as an identifier
+// in expression context: tokIdent, tokQuotedIdent, or a non-reserved keyword.
+func (p *Parser) isExprIdentToken() bool {
+	switch p.cur.Kind {
+	case tokIdent, tokQuotedIdent:
+		return true
+	default:
+		return p.cur.Kind >= 700 && !IsReserved(p.cur.Kind)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Primary expression helpers
+// ---------------------------------------------------------------------------
+
+// parseIdentExpr parses an identifier that could be a column ref or function
+// call (name followed by '(').
+func (p *Parser) parseIdentExpr() (ast.Node, error) {
+	name, err := p.parseMultipartIdentifier()
+	if err != nil {
+		return nil, err
+	}
+
+	// Check for function call: name(
+	if p.cur.Kind == int('(') {
+		return p.parseFuncCall(name)
+	}
+
+	// Simple or qualified column reference.
+	return &ast.ColumnRef{
+		Name: name,
+		Loc:  name.Loc,
+	}, nil
+}
+
+// parseFuncCall parses a function call starting at the opening '('.
+// The function name has already been parsed as an ObjectName.
+func (p *Parser) parseFuncCall(name *ast.ObjectName) (*ast.FuncCallExpr, error) {
+	p.advance() // consume '('
+
+	funcName := strings.ToUpper(name.Parts[len(name.Parts)-1])
+	fc := &ast.FuncCallExpr{
+		Name: name,
+		Loc:  ast.Loc{Start: name.Loc.Start},
+	}
+
+	// COUNT(*) special handling
+	if funcName == "COUNT" && p.cur.Kind == int('*') {
+		p.advance()
+		fc.Star = true
+		closeTok, err := p.expect(int(')'))
+		if err != nil {
+			return nil, err
+		}
+		fc.Loc.End = closeTok.Loc.End
+		return fc, nil
+	}
+
+	// DISTINCT handling for aggregates like COUNT(DISTINCT x)
+	if p.cur.Kind == kwDISTINCT {
+		p.advance()
+		fc.Distinct = true
+	}
+
+	if p.cur.Kind != int(')') {
+		args, err := p.parseFuncArgList()
+		if err != nil {
+			return nil, err
+		}
+		fc.Args = args
+
+		// Trailing USING charset, as in CHAR(65 USING utf8): the argument
+		// parser stops at USING because it is not a comma. Only CHAR takes it
+		// on this generic path — CONVERT has its own production, and the engine
+		// rejects the clause on anything else (`SUM(a USING utf8)` is a syntax
+		// error), so it must not be consumed for arbitrary function names.
+		if funcName == "CHAR" && p.cur.Kind == kwUSING {
+			p.advance() // consume USING
+			charset, ok := p.identOrKeywordToken()
+			if !ok {
+				return nil, p.syntaxErrorAtCur()
+			}
+			fc.Using = strings.ToUpper(charset.Str)
+		}
+
+		// Optional ORDER BY within aggregate functions (e.g., GROUP_CONCAT)
+		if p.cur.Kind == kwORDER {
+			p.advance() // consume ORDER
+			if _, err := p.expect(kwBY); err != nil {
+				return nil, err
+			}
+			orderItems, err := p.parseOrderByList()
+			if err != nil {
+				return nil, err
+			}
+			fc.OrderBy = orderItems
+		}
+
+		// Optional SEPARATOR for GROUP_CONCAT
+		if p.cur.Kind == kwSEPARATOR {
+			p.advance() // consume SEPARATOR
+			if p.cur.Kind != tokString {
+				return nil, &ParseError{
+					Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+					Message: "expected string after SEPARATOR",
+				}
+			}
+			fc.Separator = p.advance().Str
+		}
+	}
+
+	closeTok, err := p.expect(int(')'))
+	if err != nil {
+		return nil, err
+	}
+	fc.Loc.End = closeTok.Loc.End
+
+	// Optional OVER (...) window specification — turns this call into a window
+	// function. Without consuming OVER here it is left dangling, which breaks
+	// parsing wherever a specific following token is expected (e.g. the ')'
+	// closing a CTE body: WITH x AS (SELECT f() OVER (...) ... ) ...).
+	if p.cur.Kind == kwOVER {
+		over, err := p.parseWindowSpec()
+		if err != nil {
+			return nil, err
+		}
+		fc.Over = over
+		fc.Loc.End = over.Loc.End
+	}
+
+	return fc, nil
+}
+
+// parseWindowSpec parses an OVER clause window specification. The OVER keyword
+// is the current token (not yet consumed):
+//
+//	OVER ( [PARTITION BY expr, ...] [ORDER BY item, ...] [frame] )
+//	OVER window_name
+func (p *Parser) parseWindowSpec() (*ast.WindowSpec, error) {
+	overTok := p.advance() // consume OVER
+	spec := &ast.WindowSpec{Loc: ast.Loc{Start: overTok.Loc.Start}}
+
+	// OVER window_name — a named-window reference (no parentheses).
+	if p.cur.Kind != int('(') {
+		name, nameLoc, err := p.parseIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		spec.Name = name
+		spec.Loc.End = nameLoc.End
+		return spec, nil
+	}
+
+	p.advance() // consume '('
+
+	// Optional PARTITION BY.
+	if p.cur.Kind == kwPARTITION {
+		p.advance()
+		if _, err := p.expect(kwBY); err != nil {
+			return nil, err
+		}
+		exprs, err := p.parseExprList()
+		if err != nil {
+			return nil, err
+		}
+		spec.PartitionBy = exprs
+	}
+
+	// Optional ORDER BY.
+	if p.cur.Kind == kwORDER {
+		p.advance()
+		if _, err := p.expect(kwBY); err != nil {
+			return nil, err
+		}
+		items, err := p.parseOrderByList()
+		if err != nil {
+			return nil, err
+		}
+		spec.OrderBy = items
+	}
+
+	// Optional frame clause.
+	if p.cur.Kind == kwROWS || p.cur.Kind == kwRANGE {
+		frame, err := p.parseWindowFrame()
+		if err != nil {
+			return nil, err
+		}
+		spec.Frame = frame
+	}
+
+	closeTok, err := p.expect(int(')'))
+	if err != nil {
+		return nil, err
+	}
+	spec.Loc.End = closeTok.Loc.End
+	return spec, nil
+}
+
+// parseWindowFrame parses a window frame clause. The ROWS/RANGE keyword is the
+// current token (not yet consumed):
+//
+//	(ROWS | RANGE) frame_bound
+//	(ROWS | RANGE) BETWEEN frame_bound AND frame_bound
+func (p *Parser) parseWindowFrame() (*ast.WindowFrame, error) {
+	unitTok := p.advance() // consume ROWS or RANGE
+	frame := &ast.WindowFrame{
+		Unit: strings.ToUpper(unitTok.Str),
+		Loc:  ast.Loc{Start: unitTok.Loc.Start},
+	}
+
+	if p.cur.Kind == kwBETWEEN {
+		p.advance()
+		startType, startExpr, err := p.parseWindowFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		frame.StartType, frame.StartExpr = startType, startExpr
+		if _, err := p.expect(kwAND); err != nil {
+			return nil, err
+		}
+		endType, endExpr, err := p.parseWindowFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		frame.EndType, frame.EndExpr = endType, endExpr
+	} else {
+		startType, startExpr, err := p.parseWindowFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		frame.StartType, frame.StartExpr = startType, startExpr
+	}
+
+	frame.Loc.End = p.prev.Loc.End
+	return frame, nil
+}
+
+// parseWindowFrameBound parses one window frame bound:
+//
+//	UNBOUNDED PRECEDING | UNBOUNDED FOLLOWING | CURRENT ROW
+//	<expr> PRECEDING | <expr> FOLLOWING
+//
+// It returns the bound kind and, for the "<expr> PRECEDING/FOLLOWING" forms,
+// the offset expression (nil otherwise).
+func (p *Parser) parseWindowFrameBound() (string, ast.Node, error) {
+	switch p.cur.Kind {
+	case kwUNBOUNDED:
+		p.advance()
+		switch p.cur.Kind {
+		case kwPRECEDING:
+			p.advance()
+			return "UNBOUNDED PRECEDING", nil, nil
+		case kwFOLLOWING:
+			p.advance()
+			return "UNBOUNDED FOLLOWING", nil, nil
+		default:
+			return "", nil, &ParseError{Position: p.cur.Loc.Start, End: p.cur.Loc.End, Message: "expected PRECEDING or FOLLOWING after UNBOUNDED"}
+		}
+	case kwCURRENT:
+		p.advance()
+		if _, err := p.expect(kwROW); err != nil {
+			return "", nil, err
+		}
+		return "CURRENT ROW", nil, nil
+	default:
+		expr, err := p.parseExpr()
+		if err != nil {
+			return "", nil, err
+		}
+		switch p.cur.Kind {
+		case kwPRECEDING:
+			p.advance()
+			return "PRECEDING", expr, nil
+		case kwFOLLOWING:
+			p.advance()
+			return "FOLLOWING", expr, nil
+		default:
+			return "", nil, &ParseError{Position: p.cur.Loc.Start, End: p.cur.Loc.End, Message: "expected PRECEDING or FOLLOWING in window frame bound"}
+		}
+	}
+}
+
+// tryParseParenLambda speculatively parses the parenthesized multi-parameter
+// lambda form `(x, y) -> body`, rolling the parser back and reporting ok=false
+// when the input turns out to be an ordinary parenthesized expression.
+//
+// The grammar requires at least two parameters in this form; a single
+// parameter must be written bare (`x -> ...`), and the engine rejects
+// `(x) -> ...`. That is why len(params) < 2 backtracks rather than accepting.
+func (p *Parser) tryParseParenLambda() (ast.Node, bool, error) {
+	if p.cur.Kind != int('(') {
+		return nil, false, nil
+	}
+	saved := p.save()
+	start := p.cur.Loc.Start
+	p.advance() // consume '('
+
+	var params []string
+	for {
+		if !p.isExprIdentToken() {
+			p.restore(saved)
+			return nil, false, nil
+		}
+		params = append(params, p.advance().Str)
+		if p.cur.Kind != int(',') {
+			break
+		}
+		p.advance() // consume ','
+	}
+	if len(params) < 2 || p.cur.Kind != int(')') {
+		p.restore(saved)
+		return nil, false, nil
+	}
+	p.advance() // consume ')'
+	if p.cur.Kind != tokArrow {
+		p.restore(saved)
+		return nil, false, nil
+	}
+	p.advance() // consume '->'
+
+	// Past the arrow the shape is unambiguous, so a bad body is a real error
+	// rather than a reason to backtrack.
+	body, err := p.parseExpr()
+	if err != nil {
+		return nil, false, err
+	}
+	return &ast.LambdaExpr{
+		Params: params,
+		Body:   body,
+		Loc:    ast.Loc{Start: start, End: ast.NodeLoc(body).End},
+	}, true, nil
+}
+
+// parseFuncArgList parses a function-call argument list. Unlike a plain
+// expression list it also accepts a lambda (`x -> body`), which the grammar
+// permits only here, as an argument to a higher-order array function. Keeping
+// lambdas scoped to this position means a stray `->` anywhere else stays a
+// syntax error — matching the engine, which has no `->` JSON operator.
+func (p *Parser) parseFuncArgList() ([]ast.Node, error) {
+	var list []ast.Node
+	for {
+		lam, ok, err := p.tryParseParenLambda()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			lam, err = p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if p.cur.Kind == tokArrow {
+				lam, err = p.parseLambdaExpr(lam)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		list = append(list, lam)
+		if p.cur.Kind != int(',') {
+			break
+		}
+		p.advance() // consume ','
+	}
+	return list, nil
+}
+
+// parseExprList parses a comma-separated list of expressions.
+func (p *Parser) parseExprList() ([]ast.Node, error) {
+	var list []ast.Node
+	for {
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, expr)
+		if p.cur.Kind != int(',') {
+			break
+		}
+		p.advance() // consume ','
+	}
+	return list, nil
+}
+
+// parseOrderByList parses a comma-separated list of ORDER BY items.
+func (p *Parser) parseOrderByList() ([]*ast.OrderByItem, error) {
+	var items []*ast.OrderByItem
+	for {
+		item, err := p.parseOrderByItem()
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+		if p.cur.Kind != int(',') {
+			break
+		}
+		p.advance() // consume ','
+	}
+	return items, nil
+}
+
+// parseOrderByItem parses one ORDER BY item: expr [ASC|DESC] [NULLS FIRST|LAST].
+func (p *Parser) parseOrderByItem() (*ast.OrderByItem, error) {
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	item := &ast.OrderByItem{
+		Expr: expr,
+		Loc:  ast.NodeLoc(expr),
+	}
+
+	// Optional ASC/DESC
+	if p.cur.Kind == kwASC {
+		p.advance()
+		item.Desc = false
+		item.Loc.End = p.prev.Loc.End
+	} else if p.cur.Kind == kwDESC {
+		p.advance()
+		item.Desc = true
+		item.Loc.End = p.prev.Loc.End
+	}
+
+	// Optional NULLS FIRST/LAST
+	if p.cur.Kind == kwNULLS {
+		p.advance() // consume NULLS
+		switch p.cur.Kind {
+		case kwFIRST:
+			p.advance()
+			b := true
+			item.NullsFirst = &b
+			item.Loc.End = p.prev.Loc.End
+		case kwLAST:
+			p.advance()
+			b := false
+			item.NullsFirst = &b
+			item.Loc.End = p.prev.Loc.End
+		default:
+			return nil, &ParseError{
+				Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+				Message: "expected FIRST or LAST after NULLS",
+			}
+		}
+	}
+
+	return item, nil
+}
+
+// parseParenExprOrSubquery parses a parenthesized expression or subquery.
+// For subqueries (SELECT/WITH after open paren), we create a placeholder
+// SubqueryExpr that stores the raw text.
+func (p *Parser) parseParenExprOrSubquery() (ast.Node, error) {
+	openTok := p.advance() // consume '('
+
+	// Subquery: (SELECT ...) or (WITH ... SELECT ...)
+	if p.cur.Kind == kwSELECT || p.cur.Kind == kwWITH {
+		return p.parseSubqueryPlaceholder(openTok.Loc.Start)
+	}
+
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	closeTok, err := p.expect(int(')'))
+	if err != nil {
+		return nil, err
+	}
+
+	return &ast.ParenExpr{
+		Expr: expr,
+		Loc:  ast.Loc{Start: openTok.Loc.Start, End: closeTok.Loc.End},
+	}, nil
+}
+
+// parseSubqueryPlaceholder consumes tokens until the matching closing ')' for
+// a subquery expression and returns a SubqueryExpr with the raw text.
+// startOffset is the byte offset of the opening '(' token.
+//
+// Strict mode validates every body (validateRawQueries). It first parses the
+// body in place: a body that parses as a query ending at the matching ')',
+// recording no error on the way, is valid and is not parsed again. Validating
+// it afterwards instead reparsed the text of every nested body once per
+// level, so n nested subqueries cost O(n²). A body that fails here is scanned
+// raw and validated afterwards as before, so its errors are unchanged.
+func (p *Parser) parseSubqueryPlaceholder(startOffset int) (*ast.SubqueryExpr, error) {
+	subStart := p.cur.Loc.Start
+	if p.strictTrailing {
+		cp := p.save()
+		n, err := p.parseStmt()
+		// parseStmt parses a statement, so it also takes the statement-level
+		// INTO OUTFILE clause, which a body may not carry. Such a body falls
+		// through to the raw scan and validateRawQueries reports it there.
+		if err == nil && isQueryBody(n) && queryIntoOutfile(n) == nil && p.cur.Kind == int(')') &&
+			len(p.errors) == cp.errLen && len(p.lexer.errors) == cp.lexErrLen {
+			sub := p.finishSubqueryPlaceholder(startOffset, subStart)
+			sub.Query = n
+			return sub, nil
+		}
+		p.restore(cp)
+	}
+	for p.cur.Kind != int(')') && p.cur.Kind != tokEOF {
+		if p.cur.Kind == int('(') {
+			p.skipParenGroup()
+			if p.cur.Kind == tokEOF {
+				break
+			}
+		}
+		p.advance()
+	}
+	p.recordParenGroupEnd(startOffset)
+	if p.cur.Kind == tokEOF {
+		return nil, &ParseError{
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: "unterminated subquery",
+		}
+	}
+	sub := p.finishSubqueryPlaceholder(startOffset, subStart)
+	p.rawQueries = append(p.rawQueries, rawQuery{text: sub.RawText, start: sub.TextStart, depth: p.depth})
+	return sub, nil
+}
+
+// skipParenGroup moves from the '(' at p.cur to its matching ')', left as
+// p.cur, or to EOF when it never closes. A group scanned before is jumped
+// over (see parenGroupEnd).
+//
+// The scan keeps the groups it is inside on a stack of its own rather than
+// recursing per nested group, which overflowed the Go stack on a few hundred
+// kilobytes of '('. It records the same group ends in the same order.
+func (p *Parser) skipParenGroup() {
+	var open []int // the '(' offset of each group being scanned, innermost last
+	for {
+		// p.cur is the '(' of a group to skip: jump over it when it was
+		// scanned before, enter it otherwise.
+		if r, ok := p.parenGroupEnd[p.cur.Loc.Start]; ok {
+			p.replayParen(r)
+		} else {
+			open = append(open, p.cur.Loc.Start)
+			p.advance() // consume '('
+			p.advanceToParen()
+			if p.cur.Kind == int('(') {
+				continue
+			}
+			p.recordParenGroupEnd(open[len(open)-1])
+			open = open[:len(open)-1]
+		}
+		// The group skipped last ended at p.cur, its ')' or EOF. Resume the
+		// groups around it, innermost first, until one meets another '('.
+		for len(open) > 0 {
+			if p.cur.Kind != tokEOF {
+				p.advance() // consume the ')' that closed the inner group
+				p.advanceToParen()
+				if p.cur.Kind == int('(') {
+					break
+				}
+			}
+			p.recordParenGroupEnd(open[len(open)-1])
+			open = open[:len(open)-1]
+		}
+		if len(open) == 0 {
+			return
+		}
+	}
+}
+
+// advanceToParen moves to the next '(' or ')', or to EOF.
+func (p *Parser) advanceToParen() {
+	for p.cur.Kind != int('(') && p.cur.Kind != int(')') && p.cur.Kind != tokEOF {
+		p.advance()
+	}
+}
+
+// recordParenGroupEnd records the current token, the matching ')' or EOF, as
+// the end of the '(' group at absolute offset open.
+func (p *Parser) recordParenGroupEnd(open int) {
+	if p.parenGroupEnd == nil {
+		p.parenGroupEnd = make(map[int]parenReplay)
+	}
+	p.parenGroupEnd[open] = p.recordParenReplay(open)
+}
+
+// finishSubqueryPlaceholder consumes the ')' that closes a subquery body
+// starting at subStart and returns its placeholder.
+func (p *Parser) finishSubqueryPlaceholder(startOffset, subStart int) *ast.SubqueryExpr {
+	rawText := p.input[subStart-p.baseOffset : p.cur.Loc.Start-p.baseOffset]
+	closeTok := p.advance() // consume ')'
+
+	trimmedFromStart := len(rawText) - len(strings.TrimLeft(rawText, " \t\r\n"))
+	return &ast.SubqueryExpr{
+		RawText:   strings.TrimSpace(rawText),
+		TextStart: subStart + trimmedFromStart,
+		Loc:       ast.Loc{Start: startOffset, End: closeTok.Loc.End},
+	}
+}
+
+// parseCaseExpr parses a CASE expression (simple or searched).
+func (p *Parser) parseCaseExpr() (*ast.CaseExpr, error) {
+	caseTok := p.advance() // consume CASE
+
+	ce := &ast.CaseExpr{
+		Loc: ast.Loc{Start: caseTok.Loc.Start},
+	}
+
+	// Determine if this is a simple CASE (CASE expr WHEN ...) or
+	// searched CASE (CASE WHEN ...).
+	if p.cur.Kind != kwWHEN {
+		// Simple CASE: parse the operand expression.
+		operand, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		ce.Kind = ast.CaseSimple
+		ce.Operand = operand
+	} else {
+		ce.Kind = ast.CaseSearched
+	}
+
+	// Parse WHEN clauses.
+	for p.cur.Kind == kwWHEN {
+		whenTok := p.advance() // consume WHEN
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(kwTHEN); err != nil {
+			return nil, err
+		}
+		result, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		ce.Whens = append(ce.Whens, &ast.WhenClause{
+			Cond:   cond,
+			Result: result,
+			Loc:    ast.Loc{Start: whenTok.Loc.Start, End: ast.NodeLoc(result).End},
+		})
+	}
+
+	if len(ce.Whens) == 0 {
+		return nil, &ParseError{
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: "expected WHEN in CASE expression",
+		}
+	}
+
+	// Optional ELSE.
+	if p.cur.Kind == kwELSE {
+		p.advance() // consume ELSE
+		elseExpr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		ce.Else = elseExpr
+	}
+
+	endTok, err := p.expect(kwEND)
+	if err != nil {
+		return nil, err
+	}
+	ce.Loc.End = endTok.Loc.End
+
+	return ce, nil
+}
+
+// parseCastExpr parses CAST(expr AS type) or TRY_CAST(expr AS type).
+func (p *Parser) parseCastExpr(tryCast bool) (*ast.CastExpr, error) {
+	castTok := p.advance() // consume CAST or TRY_CAST
+	if _, err := p.expect(int('(')); err != nil {
+		return nil, err
+	}
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(kwAS); err != nil {
+		return nil, err
+	}
+	typeName, err := p.parseDataType()
+	if err != nil {
+		return nil, err
+	}
+	closeTok, err := p.expect(int(')'))
+	if err != nil {
+		return nil, err
+	}
+	return &ast.CastExpr{
+		Expr:     expr,
+		TypeName: typeName,
+		TryCast:  tryCast,
+		Loc:      ast.Loc{Start: castTok.Loc.Start, End: closeTok.Loc.End},
+	}, nil
+}
+
+// parseExtractExpr parses EXTRACT(unit FROM expr).
+//
+// EXTRACT is a reserved keyword, so without a production for it the whole
+// statement fails to parse at the EXTRACT token.
+func (p *Parser) parseExtractExpr() (ast.Node, error) {
+	extractTok := p.advance() // consume EXTRACT
+	if _, err := p.expect(int('(')); err != nil {
+		return nil, err
+	}
+	unit, err := p.parseExtractUnit()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(kwFROM); err != nil {
+		return nil, err
+	}
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	closeTok, err := p.expect(int(')'))
+	if err != nil {
+		return nil, err
+	}
+	return &ast.ExtractExpr{
+		Expr: expr,
+		Unit: unit,
+		Loc:  ast.Loc{Start: extractTok.Loc.Start, End: closeTok.Loc.End},
+	}, nil
+}
+
+// parseExtractUnit parses the unit of EXTRACT(unit FROM expr).
+//
+// The grammar takes an identifier, which covers plain identifiers (DAYOFWEEK,
+// DOY, ...) and the non-reserved unit keywords (YEAR, MONTH, WEEK, ...). The
+// compound units DAY_HOUR, DAY_SECOND and MINUTE_SECOND lex as reserved
+// keywords, so they are accepted explicitly.
+func (p *Parser) parseExtractUnit() (string, error) {
+	switch p.cur.Kind {
+	case kwDAY_HOUR, kwDAY_SECOND, kwMINUTE_SECOND:
+		tok := p.advance()
+		return strings.ToUpper(tok.Str), nil
+	default:
+		if p.isExprIdentToken() {
+			tok := p.advance()
+			return strings.ToUpper(tok.Str), nil
+		}
+		return "", &ParseError{
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: fmt.Sprintf("expected EXTRACT unit, got %q", p.cur.Str),
+		}
+	}
+}
+
+// finishMapLiteral parses the { key: value, ... } body of a map constructor.
+func (p *Parser) finishMapLiteral(start int) (ast.Node, error) {
+	if _, err := p.expect(int('{')); err != nil {
+		return nil, err
+	}
+
+	// Empty braces are a map literal (the struct form requires at least one
+	// element — both grammar rules and the engine agree).
+	if p.cur.Kind == int('}') {
+		closeTok := p.advance()
+		return &ast.MapLiteral{Loc: ast.Loc{Start: start, End: closeTok.Loc.End}}, nil
+	}
+
+	// The first constant decides the form: a following ':' makes this a map
+	// ({k: v, ...}), anything else a struct ({c1, c2, ...}).
+	first, err := p.parseCollectionConstant()
+	if err != nil {
+		return nil, err
+	}
+
+	if p.cur.Kind == int(':') {
+		lit := &ast.MapLiteral{}
+		entry, err := p.finishMapEntry(first)
+		if err != nil {
+			return nil, err
+		}
+		lit.Entries = append(lit.Entries, entry)
+		for p.cur.Kind == int(',') {
+			p.advance() // consume ','
+			key, err := p.parseCollectionConstant()
+			if err != nil {
+				return nil, err
+			}
+			entry, err = p.finishMapEntry(key)
+			if err != nil {
+				return nil, err
+			}
+			lit.Entries = append(lit.Entries, entry)
+		}
+		closeTok, err := p.expect(int('}'))
+		if err != nil {
+			return nil, err
+		}
+		lit.Loc = ast.Loc{Start: start, End: closeTok.Loc.End}
+		return lit, nil
+	}
+
+	lit := &ast.StructLiteral{Elements: []ast.Node{first}}
+	for p.cur.Kind == int(',') {
+		p.advance() // consume ','
+		el, err := p.parseCollectionConstant()
+		if err != nil {
+			return nil, err
+		}
+		lit.Elements = append(lit.Elements, el)
+	}
+	closeTok, err := p.expect(int('}'))
+	if err != nil {
+		return nil, err
+	}
+	lit.Loc = ast.Loc{Start: start, End: closeTok.Loc.End}
+	return lit, nil
+}
+
+// parseCollectionConstant parses one element of an array/map/struct literal.
+// The grammar (constant) admits literals and nested collection literals only —
+// engine-verified: [1+1], [a] and {'a': 1+1} are syntax errors while
+// [[1],[2]], [NULL, 1] and {'a': [1,2]} parse. StarRocks differs: its array
+// literals take full expressions and its parser keeps them.
+func (p *Parser) parseCollectionConstant() (ast.Node, error) {
+	if err := p.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer p.leaveNesting()
+	// No sign arm: the engine rejects even [-1] — a signed number is an
+	// expression, not a constant (container-verified).
+	switch p.cur.Kind {
+	case tokInt, tokFloat, tokString, tokHexLiteral, tokBitLiteral,
+		kwTRUE, kwFALSE, kwNULL:
+		return p.parsePrimaryExpr()
+	case int('['):
+		return p.finishArrayLiteral(p.cur.Loc.Start)
+	case int('{'):
+		return p.finishMapLiteral(p.cur.Loc.Start)
+	}
+	return nil, p.syntaxErrorAtCur()
+}
+
+// finishMapEntry completes one `key: value` pair, the key already parsed.
+func (p *Parser) finishMapEntry(key ast.Node) (*ast.MapEntry, error) {
+	if _, err := p.expect(int(':')); err != nil {
+		return nil, err
+	}
+	value, err := p.parseCollectionConstant()
+	if err != nil {
+		return nil, err
+	}
+	return &ast.MapEntry{
+		Key:   key,
+		Value: value,
+		Loc:   ast.Loc{Start: ast.NodeLoc(key).Start, End: ast.NodeLoc(value).End},
+	}, nil
+}
+
+// finishArrayLiteral parses an array constructor body starting at '['.
+func (p *Parser) finishArrayLiteral(start int) (ast.Node, error) {
+	lit := &ast.ArrayLiteral{}
+
+	if _, err := p.expect(int('[')); err != nil {
+		return nil, err
+	}
+	if p.cur.Kind != int(']') {
+		el, err := p.parseCollectionConstant()
+		if err != nil {
+			return nil, err
+		}
+		lit.Elements = append(lit.Elements, el)
+		for p.cur.Kind == int(',') {
+			p.advance() // consume ','
+			el, err = p.parseCollectionConstant()
+			if err != nil {
+				return nil, err
+			}
+			lit.Elements = append(lit.Elements, el)
+		}
+	}
+	closeTok, err := p.expect(int(']'))
+	if err != nil {
+		return nil, err
+	}
+	lit.Loc = ast.Loc{Start: start, End: closeTok.Loc.End}
+	return lit, nil
+}
+
+// parseLambdaExpr parses `params -> body`, given the already-parsed expression
+// to the left of the arrow.
+func (p *Parser) parseLambdaExpr(left ast.Node) (ast.Node, error) {
+	arrowTok := p.advance() // consume '->'
+
+	params, ok := lambdaParams(left)
+	if !ok {
+		return nil, &ParseError{
+			Position: arrowTok.Loc.Start, End: arrowTok.Loc.End,
+			Message: "invalid lambda parameter list before '->'",
+		}
+	}
+	body, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	return &ast.LambdaExpr{
+		Params: params,
+		Body:   body,
+		Loc:    ast.Loc{Start: ast.NodeLoc(left).Start, End: ast.NodeLoc(body).End},
+	}, nil
+}
+
+// lambdaParams extracts parameter names from the expression left of '->'. The
+// parameters parse as ordinary column references (`x`, or `(x, y)` as a
+// parenthesized row), so they are reinterpreted here rather than lexed
+// specially.
+func lambdaParams(n ast.Node) ([]string, bool) {
+	switch v := n.(type) {
+	case *ast.ColumnRef:
+		if v.Name == nil || len(v.Name.Parts) != 1 {
+			return nil, false
+		}
+		return []string{v.Name.Parts[0]}, true
+	}
+	return nil, false
+}
+
+// parseGroupingElementCall parses a reserved-keyword grouping element such as
+// CUBE(a, b) as a function call, keeping GROUP BY items uniform with ROLLUP and
+// GROUPING SETS (both non-reserved, so they already take the expression path).
+func (p *Parser) parseGroupingElementCall() (*ast.FuncCallExpr, error) {
+	tok := p.advance()
+	name := &ast.ObjectName{Parts: []string{strings.ToUpper(tok.Str)}, Loc: tok.Loc}
+	return p.parseFuncCall(name)
+}
+
+// parseConvertExpr parses the two CONVERT forms:
+//
+//	CONVERT(expr USING charset)  -- transcoding; kept as a CONVERT call
+//	CONVERT(expr, type)          -- CAST spelled differently, so it becomes a CastExpr
+func (p *Parser) parseConvertExpr() (ast.Node, error) {
+	convertTok := p.advance() // consume CONVERT
+	if _, err := p.expect(int('(')); err != nil {
+		return nil, err
+	}
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	if p.cur.Kind == kwUSING {
+		p.advance() // consume USING
+		charset, ok := p.identOrKeywordToken()
+		if !ok {
+			return nil, p.syntaxErrorAtCur()
+		}
+		closeTok, err := p.expect(int(')'))
+		if err != nil {
+			return nil, err
+		}
+		return &ast.FuncCallExpr{
+			Name:  &ast.ObjectName{Parts: []string{"CONVERT"}, Loc: convertTok.Loc},
+			Args:  []ast.Node{expr},
+			Using: strings.ToUpper(charset.Str),
+			Loc:   ast.Loc{Start: convertTok.Loc.Start, End: closeTok.Loc.End},
+		}, nil
+	}
+
+	if _, err := p.expect(int(',')); err != nil {
+		return nil, err
+	}
+	typeName, err := p.parseConvertTargetType()
+	if err != nil {
+		return nil, err
+	}
+	closeTok, err := p.expect(int(')'))
+	if err != nil {
+		return nil, err
+	}
+	return &ast.CastExpr{
+		Expr:     expr,
+		TypeName: typeName,
+		Loc:      ast.Loc{Start: convertTok.Loc.Start, End: closeTok.Loc.End},
+	}, nil
+}
+
+// parseConvertTargetType parses the target type of CONVERT(expr, type). It
+// additionally accepts SIGNED / UNSIGNED [INTEGER], which are cast-only type
+// names rather than column types and so are unknown to parseDataType.
+func (p *Parser) parseConvertTargetType() (*ast.TypeName, error) {
+	switch p.cur.Kind {
+	case kwSIGNED, kwUNSIGNED:
+		tok := p.advance()
+		tn := &ast.TypeName{Name: strings.ToUpper(tok.Str), Loc: tok.Loc}
+		if p.cur.Kind == kwINTEGER || p.cur.Kind == kwINT {
+			end := p.advance()
+			tn.Loc.End = end.Loc.End
+		}
+		return tn, nil
+	}
+	return p.parseDataType()
+}
+
+// parseVariableRef parses a system variable (@@name, @@scope.name) or a
+// user-defined variable (@name).
+func (p *Parser) parseVariableRef(system bool) (ast.Node, error) {
+	atTok := p.advance() // consume '@@' or '@'
+
+	// A user variable name may also be a quoted string — @'name' / @"name"
+	// (grammar: ATSIGN identifierOrText; engine-verified accept on both
+	// engines). System variables stay identifier-shaped.
+	if !system && p.cur.Kind == tokString {
+		tok := p.advance()
+		return &ast.VariableRef{
+			System: false,
+			Name:   tok.Str,
+			Loc:    ast.Loc{Start: atTok.Loc.Start, End: tok.Loc.End},
+		}, nil
+	}
+
+	first, ok := p.identOrKeywordToken()
+	if !ok {
+		return nil, p.syntaxErrorAtCur()
+	}
+	v := &ast.VariableRef{
+		System: system,
+		Name:   first.Str,
+		Loc:    ast.Loc{Start: atTok.Loc.Start, End: first.Loc.End},
+	}
+	// @@session.x / @@global.x — the scope qualifier only exists for system
+	// variables.
+	if system && p.cur.Kind == int('.') {
+		p.advance() // consume '.'
+		second, ok := p.identOrKeywordToken()
+		if !ok {
+			return nil, p.syntaxErrorAtCur()
+		}
+		v.Scope = strings.ToUpper(v.Name)
+		v.Name = second.Str
+		v.Loc.End = second.Loc.End
+	}
+	return v, nil
+}
+
+// identOrKeywordToken accepts any identifier- or keyword-shaped token, for
+// positions where there is no ambiguity: after an @ / @@ prefix, or after
+// USING. Scope names (SESSION, GLOBAL), charset names and many variable names
+// are themselves keywords.
+func (p *Parser) identOrKeywordToken() (Token, bool) {
+	switch {
+	case p.cur.Kind == tokIdent || p.cur.Kind == tokQuotedIdent:
+		return p.advance(), true
+	case p.cur.Kind >= 700: // any keyword
+		return p.advance(), true
+	}
+	return Token{}, false
+}
+
+// parseNilaryFunction parses zero-argument keyword functions like
+// CURRENT_DATE, CURRENT_TIMESTAMP, etc.
+func (p *Parser) parseNilaryFunction() (ast.Node, error) {
+	tok := p.advance()
+	name := strings.ToUpper(tok.Str)
+	objName := &ast.ObjectName{
+		Parts: []string{name},
+		Loc:   tok.Loc,
+	}
+
+	// Some of these may optionally have empty parens: CURRENT_TIMESTAMP()
+	fc := &ast.FuncCallExpr{
+		Name: objName,
+		Loc:  tok.Loc,
+	}
+	if p.cur.Kind == int('(') {
+		p.advance() // consume '('
+		// Optional fractional-seconds precision: CURRENT_TIMESTAMP(3).
+		if p.cur.Kind != int(')') {
+			args, err := p.parseExprList()
+			if err != nil {
+				return nil, err
+			}
+			fc.Args = args
+		}
+		closeTok, err := p.expect(int(')'))
+		if err != nil {
+			return nil, err
+		}
+		fc.Loc.End = closeTok.Loc.End
+	}
+	return fc, nil
+}
+
+// parseExistsExpr parses EXISTS (subquery).
+func (p *Parser) parseExistsExpr() (ast.Node, error) {
+	existsTok := p.advance() // consume EXISTS
+	if _, err := p.expect(int('(')); err != nil {
+		return nil, err
+	}
+
+	subq, err := p.parseSubqueryPlaceholder(existsTok.Loc.Start)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ast.ExistsExpr{
+		Subquery: subq,
+		Loc:      ast.Loc{Start: existsTok.Loc.Start, End: subq.Loc.End},
+	}, nil
+}
+
+// parseIntervalExpr parses INTERVAL expr unit.
+func (p *Parser) parseIntervalExpr() (ast.Node, error) {
+	intervalTok := p.advance() // consume INTERVAL
+
+	value, err := p.parseExprPrec(bpPrimary)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse interval unit keyword
+	unit, err := p.parseIntervalUnit()
+	if err != nil {
+		return nil, err
+	}
+
+	return &ast.IntervalExpr{
+		Value: value,
+		Unit:  unit,
+		Loc:   ast.Loc{Start: intervalTok.Loc.Start, End: p.prev.Loc.End},
+	}, nil
+}
+
+// parseIntervalUnit parses and returns the interval unit keyword as a string.
+func (p *Parser) parseIntervalUnit() (string, error) {
+	switch p.cur.Kind {
+	case kwYEAR, kwMONTH, kwWEEK, kwDAY, kwHOUR, kwMINUTE, kwSECOND:
+		tok := p.advance()
+		return strings.ToUpper(tok.Str), nil
+	default:
+		// Allow any identifier-like token as a unit for forward compatibility
+		if p.cur.Kind == tokIdent {
+			tok := p.advance()
+			return strings.ToUpper(tok.Str), nil
+		}
+		return "", &ParseError{
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: fmt.Sprintf("expected interval unit, got %q", p.cur.Str),
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Infix/postfix handlers
+// ---------------------------------------------------------------------------
+
+// parseIsExpr parses IS [NOT] NULL/TRUE/FALSE.
+func (p *Parser) parseIsExpr(left ast.Node) (ast.Node, error) {
+	p.advance() // consume IS
+
+	notFlag := false
+	if p.cur.Kind == kwNOT {
+		p.advance()
+		notFlag = true
+	}
+
+	var isWhat string
+	switch p.cur.Kind {
+	case kwNULL:
+		isWhat = "NULL"
+	case kwTRUE:
+		isWhat = "TRUE"
+	case kwFALSE:
+		isWhat = "FALSE"
+	default:
+		return nil, &ParseError{
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: "expected NULL, TRUE, or FALSE after IS [NOT]",
+		}
+	}
+	endTok := p.advance()
+
+	return &ast.IsExpr{
+		Expr:   left,
+		Not:    notFlag,
+		IsWhat: isWhat,
+		Loc:    ast.Loc{Start: ast.NodeLoc(left).Start, End: endTok.Loc.End},
+	}, nil
+}
+
+// parseBetweenExpr parses [NOT] BETWEEN low AND high.
+func (p *Parser) parseBetweenExpr(left ast.Node, notFlag bool) (ast.Node, error) {
+	if notFlag {
+		p.advance() // consume NOT
+	}
+	p.advance() // consume BETWEEN
+
+	// Parse low bound at bpPred+1 to avoid re-consuming AND as an
+	// infix binary operator.
+	low, err := p.parseExprPrec(bpPred + 1)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := p.expect(kwAND); err != nil {
+		return nil, &ParseError{
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: "expected AND in BETWEEN expression",
+		}
+	}
+
+	high, err := p.parseExprPrec(bpPred + 1)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ast.BetweenExpr{
+		Expr: left,
+		Low:  low,
+		High: high,
+		Not:  notFlag,
+		Loc:  ast.Loc{Start: ast.NodeLoc(left).Start, End: ast.NodeLoc(high).End},
+	}, nil
+}
+
+// parseInExpr parses [NOT] IN (values...) or [NOT] IN (subquery).
+func (p *Parser) parseInExpr(left ast.Node, notFlag bool) (ast.Node, error) {
+	if notFlag {
+		p.advance() // consume NOT
+	}
+	p.advance() // consume IN
+
+	if _, err := p.expect(int('(')); err != nil {
+		return nil, err
+	}
+
+	// Subquery: IN (SELECT ...) or IN (WITH ... SELECT ...)
+	if p.cur.Kind == kwSELECT || p.cur.Kind == kwWITH {
+		subq, err := p.parseSubqueryPlaceholder(ast.NodeLoc(left).Start)
+		if err != nil {
+			return nil, err
+		}
+		return &ast.InExpr{
+			Expr:   left,
+			Values: []ast.Node{subq},
+			Not:    notFlag,
+			Loc:    ast.Loc{Start: ast.NodeLoc(left).Start, End: subq.Loc.End},
+		}, nil
+	}
+
+	values, err := p.parseExprList()
+	if err != nil {
+		return nil, err
+	}
+
+	closeTok, err := p.expect(int(')'))
+	if err != nil {
+		return nil, err
+	}
+
+	return &ast.InExpr{
+		Expr:   left,
+		Values: values,
+		Not:    notFlag,
+		Loc:    ast.Loc{Start: ast.NodeLoc(left).Start, End: closeTok.Loc.End},
+	}, nil
+}
+
+// parseLikeExpr parses [NOT] LIKE pattern [ESCAPE esc].
+func (p *Parser) parseLikeExpr(left ast.Node, notFlag bool) (ast.Node, error) {
+	if notFlag {
+		p.advance() // consume NOT
+	}
+	p.advance() // consume LIKE
+
+	pattern, err := p.parseExprPrec(bpPred + 1)
+	if err != nil {
+		return nil, err
+	}
+
+	le := &ast.LikeExpr{
+		Expr:    left,
+		Pattern: pattern,
+		Not:     notFlag,
+		Loc:     ast.Loc{Start: ast.NodeLoc(left).Start, End: ast.NodeLoc(pattern).End},
+	}
+
+	// Optional ESCAPE clause
+	if p.cur.Kind == kwESCAPE {
+		p.advance() // consume ESCAPE
+		esc, err := p.parseExprPrec(bpPred + 1)
+		if err != nil {
+			return nil, err
+		}
+		le.Escape = esc
+		le.Loc.End = ast.NodeLoc(esc).End
+	}
+
+	return le, nil
+}
+
+// parseRegexpExpr parses [NOT] REGEXP|RLIKE pattern.
+func (p *Parser) parseRegexpExpr(left ast.Node, notFlag bool) (ast.Node, error) {
+	if notFlag {
+		p.advance() // consume NOT
+	}
+	p.advance() // consume REGEXP or RLIKE
+
+	pattern, err := p.parseExprPrec(bpPred + 1)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ast.RegexpExpr{
+		Expr:    left,
+		Pattern: pattern,
+		Not:     notFlag,
+		Loc:     ast.Loc{Start: ast.NodeLoc(left).Start, End: ast.NodeLoc(pattern).End},
+	}, nil
+}

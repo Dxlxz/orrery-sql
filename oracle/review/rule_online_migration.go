@@ -1,0 +1,13 @@
+package review
+
+import "github.com/Dxlxz/orrery-sql/review"
+
+// checkOnlineMigration reports a change that asks for online migration.
+// Bytebase runs every change whose sheet carries the gh-ost directive
+// through gh-ost, which only exists for the MySQL family, so on Oracle the
+// request itself is the finding.
+//
+// bytebase: backend/runner/taskrun/database_migrate_executor.go — RunOnce (ghost.IsGhostEnabled)
+func checkOnlineMigration(r *reporter) {
+	r.report(review.OnlineMigrationUnsupported, -1, review.Range{}, "Oracle doesn't support online migration.\n\nTurn off **Online migration** for this change.")
+}

@@ -1,0 +1,231 @@
+// Package parser - partition.go implements T-SQL CREATE/ALTER/DROP PARTITION FUNCTION/SCHEME parsing.
+package parser
+
+import (
+	"strings"
+
+	nodes "github.com/Dxlxz/orrery-sql/mssql/ast"
+)
+
+// alterPartitionFunctionActions matches SqlScriptDOM's closed set for
+// ALTER PARTITION FUNCTION: only SPLIT or MERGE after the empty `()`.
+var alterPartitionFunctionActions = newOptionSet().withIdents("SPLIT", "MERGE")
+
+// parseCreatePartitionFunctionStmt parses a CREATE PARTITION FUNCTION statement.
+//
+// BNF: mssql/parser/bnf/create-partition-function-transact-sql.bnf
+//
+//	CREATE PARTITION FUNCTION partition_function_name ( input_parameter_type )
+//	AS RANGE [ LEFT | RIGHT ]
+//	FOR VALUES ( [ boundary_value [ ,...n ] ] )
+func (p *Parser) parseCreatePartitionFunctionStmt() (*nodes.CreatePartitionFunctionStmt, error) {
+	loc := p.pos()
+	// FUNCTION keyword already consumed by caller
+
+	stmt := &nodes.CreatePartitionFunctionStmt{
+		Loc: nodes.Loc{Start: loc, End: -1},
+	}
+
+	// Name
+	if p.isIdentLike() {
+		stmt.Name = p.cur.Str
+		p.advance()
+	}
+
+	// ( input_parameter_type )
+	if p.cur.Type == '(' {
+		p.advance()
+		stmt.InputType, _ = p.parseDataType()
+		p.match(')')
+	}
+
+	// AS RANGE [LEFT|RIGHT]
+	if p.cur.Type == kwAS {
+		p.advance()
+	}
+	if p.cur.Type == kwRANGE {
+		p.advance()
+	}
+	if p.cur.Type == kwLEFT || p.cur.Type == kwRIGHT {
+		stmt.Range = strings.ToUpper(p.cur.Str)
+		p.advance()
+	}
+
+	// FOR VALUES ( boundary_value [,...n] )
+	if p.cur.Type == kwFOR {
+		p.advance()
+	}
+	if p.cur.Type == kwVALUES {
+		p.advance()
+	}
+	if p.cur.Type == '(' {
+		p.advance()
+		var vals []nodes.Node
+		for p.cur.Type != ')' && p.cur.Type != tokEOF {
+			expr, _ := p.parseExpr()
+			if expr != nil {
+				vals = append(vals, expr)
+			}
+			if _, ok := p.match(','); !ok {
+				break
+			}
+		}
+		p.match(')')
+		stmt.Values = &nodes.List{Items: vals}
+	}
+
+	stmt.Loc.End = p.prevEnd()
+	return stmt, nil
+}
+
+// parseAlterPartitionFunctionStmt parses an ALTER PARTITION FUNCTION statement.
+//
+// BNF: mssql/parser/bnf/alter-partition-function-transact-sql.bnf
+//
+//	ALTER PARTITION FUNCTION partition_function_name ()
+//	{ SPLIT | MERGE } RANGE ( boundary_value )
+func (p *Parser) parseAlterPartitionFunctionStmt() (*nodes.AlterPartitionFunctionStmt, error) {
+	loc := p.pos()
+	// FUNCTION keyword already consumed by caller
+
+	stmt := &nodes.AlterPartitionFunctionStmt{
+		Loc: nodes.Loc{Start: loc, End: -1},
+	}
+
+	// Name
+	if p.isIdentLike() {
+		stmt.Name = p.cur.Str
+		p.advance()
+	}
+
+	// ()
+	if p.cur.Type == '(' {
+		p.advance()
+		p.match(')')
+	}
+
+	// SPLIT or MERGE — SqlScriptDOM's AlterPartitionFunctionStatement closed set.
+	if !p.isValidOption(alterPartitionFunctionActions) {
+		return nil, p.unexpectedToken()
+	}
+	stmt.Action = strings.ToUpper(p.cur.Str)
+	p.advance()
+
+	// RANGE ( boundary_value )
+	if p.cur.Type == kwRANGE {
+		p.advance()
+	}
+	if p.cur.Type == '(' {
+		p.advance()
+		stmt.BoundaryValue, _ = p.parseExpr()
+		p.match(')')
+	}
+
+	stmt.Loc.End = p.prevEnd()
+	return stmt, nil
+}
+
+// parseCreatePartitionSchemeStmt parses a CREATE PARTITION SCHEME statement.
+//
+// BNF: mssql/parser/bnf/create-partition-scheme-transact-sql.bnf
+//
+//	CREATE PARTITION SCHEME partition_scheme_name
+//	AS PARTITION partition_function_name
+//	[ ALL ] TO ( { file_group_name | [ PRIMARY ] } [ ,...n ] )
+func (p *Parser) parseCreatePartitionSchemeStmt() (*nodes.CreatePartitionSchemeStmt, error) {
+	loc := p.pos()
+	// SCHEME keyword already consumed by caller
+
+	stmt := &nodes.CreatePartitionSchemeStmt{
+		Loc: nodes.Loc{Start: loc, End: -1},
+	}
+
+	// Name
+	if p.isIdentLike() {
+		stmt.Name = p.cur.Str
+		p.advance()
+	}
+
+	// AS PARTITION function_name
+	if p.cur.Type == kwAS {
+		p.advance()
+	}
+	if p.cur.Type == kwPARTITION {
+		p.advance()
+	}
+	if p.isIdentLike() {
+		stmt.FunctionName = p.cur.Str
+		p.advance()
+	}
+
+	// ALL TO filegroup | TO ( filegrouplist )
+	allTo := false
+	if p.cur.Type == kwALL {
+		p.advance()
+		allTo = true
+	}
+	if p.cur.Type == kwTO {
+		p.advance()
+	}
+
+	if p.cur.Type == '(' {
+		p.advance()
+		var fgs []nodes.Node
+		for p.cur.Type != ')' && p.cur.Type != tokEOF {
+			if p.isIdentLike() || p.cur.Type == kwPRIMARY {
+				fgname := p.cur.Str
+				p.advance()
+				if allTo && len(fgs) == 0 {
+					stmt.AllToFileGroup = strings.ToUpper(fgname)
+				}
+				fgs = append(fgs, &nodes.String{Str: strings.ToUpper(fgname)})
+			}
+			if _, ok := p.match(','); !ok {
+				break
+			}
+		}
+		p.match(')')
+		if !allTo {
+			stmt.FileGroups = &nodes.List{Items: fgs}
+		}
+	}
+
+	stmt.Loc.End = p.prevEnd()
+	return stmt, nil
+}
+
+// parseAlterPartitionSchemeStmt parses an ALTER PARTITION SCHEME statement.
+//
+// BNF: mssql/parser/bnf/alter-partition-scheme-transact-sql.bnf
+//
+//	ALTER PARTITION SCHEME partition_scheme_name
+//	NEXT USED [ filegroup_name ]
+func (p *Parser) parseAlterPartitionSchemeStmt() (*nodes.AlterPartitionSchemeStmt, error) {
+	loc := p.pos()
+	// SCHEME keyword already consumed by caller
+
+	stmt := &nodes.AlterPartitionSchemeStmt{
+		Loc: nodes.Loc{Start: loc, End: -1},
+	}
+
+	// Name
+	if p.isIdentLike() {
+		stmt.Name = p.cur.Str
+		p.advance()
+	}
+
+	// NEXT USED [filegroup_name]
+	if p.cur.Type == kwNEXT {
+		p.advance()
+	}
+	if p.cur.Type == kwUSED {
+		p.advance()
+	}
+	if (p.isIdentLike() || p.cur.Type == kwPRIMARY) {
+		stmt.FileGroup = p.cur.Str
+		p.advance()
+	}
+
+	stmt.Loc.End = p.prevEnd()
+	return stmt, nil
+}

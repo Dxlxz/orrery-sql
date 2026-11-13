@@ -1,0 +1,260 @@
+package catalog
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+// The oracle proof for the index differ (correctness-protocol.md gates 1 & 2), against OceanBase. For every index variant the node covers, two
+// properties are proven mechanically:
+//
+//  1. Idempotence (the spine): a schema in its real stored form (the engine's SHOW CREATE
+//     readback, reloaded into a catalog) self-diffs empty, and the user form vs the engine's
+//     stored form diffs empty — e.g. an unnamed KEY (a) (which MySQL auto-names `a`) collapses
+//     onto the readback's named form. A non-empty diff is a normalization bug.
+//  2. Foreign keys beside indexes: a table with a foreign key self-diffs empty, with the
+//     indexes it declares and no other (OceanBase makes none for the foreign key), proven
+//     via a multi-table round-trip (single-table readback cannot resolve the FK's referenced
+//     table).
+//
+// The harness reuses assertDiffEmptyAgainstReadback / oceanBaseOracle / serverCharsetFor
+// from the diff + normalize oracle tests.
+
+// indexDiffProbes enumerates the single-table index FORMS that must round-trip empty: a user-form
+// DDL whose engine-stored form differs (auto-name, prefix echo, version-flagged DESC/KBS, ...) but
+// must canonicalize equal. Cross-table FK forms are proven separately (they need both tables).
+func indexDiffProbes() []diffProbe {
+	return []diffProbe{
+		// PRIMARY KEY — single and composite; columns are forced NOT NULL by the PK.
+		{"pk-simple", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)", "t"},
+		{"pk-composite", "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY (a,b))", "t"},
+		// UNIQUE — MySQL's unique constraint is a unique index; single + composite.
+		{"unique-single", "CREATE TABLE t (id INT PRIMARY KEY, a INT, UNIQUE KEY ua (a))", "t"},
+		{"unique-composite", "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, UNIQUE KEY uab (a,b))", "t"},
+		// Secondary (non-unique) — single, composite, multiple.
+		{"secondary", "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, KEY ka (a), KEY kab (a,b))", "t"},
+		// Unnamed indexes → MySQL auto-name (a, a_2): the user form vs stored named form must
+		// collapse. The headline auto-name canonicalization case.
+		{"unnamed-autoname", "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, KEY (a), KEY (a,b))", "t"},
+		// USING BTREE echo (InnoDB coerces HASH→BTREE; BTREE is echoed verbatim).
+		{"using-btree", "CREATE TABLE t (id INT PRIMARY KEY, a INT, KEY ua (a) USING BTREE) ENGINE=InnoDB", "t"},
+		// Prefix length col(N).
+		{"prefix", "CREATE TABLE t (id INT PRIMARY KEY, s VARCHAR(100), c CHAR(40), KEY sp (s(10)), KEY cp (c(5)))", "t"},
+		// Index COMMENT (escaped).
+		{"comment", "CREATE TABLE t (id INT PRIMARY KEY, a INT, KEY ka (a) COMMENT 'idx ''c'' here')", "t"},
+		// Index KEY_BLOCK_SIZE — echoed on 5.7, absorbed on 8.0; must round-trip on BOTH.
+		{"key-block-size", "CREATE TABLE t (id INT PRIMARY KEY, a INT, KEY ka (a) KEY_BLOCK_SIZE=4) ENGINE=InnoDB", "t"},
+		// Descending — stored on 8.0, silently ascending on 5.7; round-trips on both.
+		{"descending", "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, KEY ab (a, b DESC))", "t"},
+		// Composite mixed ASC/DESC + prefix together.
+		{"composite-mixed", "CREATE TABLE t (id INT PRIMARY KEY, a INT, s VARCHAR(50), KEY mix (a DESC, s(8)))", "t"},
+		// Invisible — 8.0 only (/*!80000 INVISIBLE */).
+		{"invisible", "CREATE TABLE t (id INT PRIMARY KEY, a INT, KEY va (a) /*!80000 INVISIBLE */)", "t"},
+		// Functional / expression index — 8.0 only.
+		{"functional", "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, KEY fa ((a + 1)), KEY fab ((a + b)))", "t"},
+		// Multi-valued (JSON array) functional index — 8.0.17+ only. The CAST(... AS <type> ARRAY)
+		// key part must parse, deparse with the trailing `array`, and round-trip empty. Cover the
+		// representative cast targets (UNSIGNED/CHAR(n)/DECIMAL(m,n)/DATE) MySQL allows in MV keys.
+		{"mv-unsigned", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.ids' AS UNSIGNED ARRAY))))", "t"},
+		{"mv-char", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.codes' AS CHAR(40) ARRAY))))", "t"},
+		{"mv-decimal", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.amts' AS DECIMAL(10,2) ARRAY))))", "t"},
+		{"mv-date", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.days' AS DATE ARRAY))))", "t"},
+		// Composite MV index: a regular column part combined with an MV (array-cast) part.
+		{"mv-composite", "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(50), j JSON, KEY mv (name, (CAST(j->'$.ids' AS UNSIGNED ARRAY))))", "t"},
+		// OceanBase stores every one of these as json_query(`j`,<path> RETURNING <type> WITHOUT
+		// ARRAY WRAPPER asis error on error null on empty null on mismatch) (multiValuedKeyStoredForm):
+		// the other spellings of the document and its path, and the other types of the element.
+		{"mv-json-extract", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(JSON_EXTRACT(j,'$.ids') AS UNSIGNED ARRAY))))", "t"},
+		{"mv-unquote", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->>'$.ids' AS UNSIGNED ARRAY))))", "t"},
+		{"mv-bare-column", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j AS UNSIGNED ARRAY))))", "t"},
+		{"mv-paren-column", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST((j) AS UNSIGNED ARRAY))))", "t"},
+		{"mv-qualified-column", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(t.j->'$.ids' AS UNSIGNED ARRAY))))", "t"},
+		{"mv-double-quoted-path", `CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->"$.ids" AS UNSIGNED ARRAY))))`, "t"},
+		{"mv-quoted-member-path", `CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$."a b"[0]' AS UNSIGNED ARRAY))))`, "t"},
+		{"mv-signed", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.ids' AS SIGNED ARRAY))))", "t"},
+		{"mv-unsigned-integer", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.ids' AS UNSIGNED INTEGER ARRAY))))", "t"},
+		{"mv-decimal-bare", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.amts' AS DECIMAL ARRAY))))", "t"},
+		{"mv-double", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.amts' AS DOUBLE ARRAY))))", "t"},
+		{"mv-datetime", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.days' AS DATETIME ARRAY))))", "t"},
+		{"mv-datetime-fsp", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.days' AS DATETIME(3) ARRAY))))", "t"},
+		{"mv-time", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.days' AS TIME ARRAY))))", "t"},
+		{"mv-binary", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.codes' AS BINARY(8) ARRAY))))", "t"},
+		{"mv-char-charset", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((CAST(j->'$.codes' AS CHAR(40) CHARSET ascii ARRAY))))", "t"},
+		{"mv-unique", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, UNIQUE KEY mv ((CAST(j->'$.ids' AS UNSIGNED ARRAY))))", "t"},
+		// The stored text, written as a key, makes the same index and reads back the same.
+		{"mv-stored-text", "CREATE TABLE t (id INT PRIMARY KEY, j JSON, KEY mv ((json_query(`j`,'$.ids' RETURNING unsigned WITHOUT ARRAY WRAPPER asis error on error null on empty null on mismatch))))", "t"},
+		// FULLTEXT.
+		{"fulltext", "CREATE TABLE t (id INT PRIMARY KEY, body TEXT, ftcol VARCHAR(200), FULLTEXT KEY ftb (body), FULLTEXT KEY ftc (ftcol))", "t"},
+		// SPATIAL — needs a NOT NULL geometry column. 8.0 supports SPATIAL on InnoDB; 5.7 needs
+		// MyISAM. Prove on 8.0 (InnoDB default) to keep the form simple.
+		{"spatial", "CREATE TABLE t (id INT PRIMARY KEY, g GEOMETRY NOT NULL, SPATIAL KEY sg (g))", "t"},
+		// Mixed bag: PK + unique + secondary + invisible on one table (8.0).
+		{"mixed-all-80", "CREATE TABLE t (id INT NOT NULL, a INT, b INT, c VARCHAR(40), PRIMARY KEY (id), UNIQUE KEY ua (a), KEY kb (b DESC), KEY kc (c(5)) /*!80000 INVISIBLE */)", "t"},
+		// Mixed bag for 5.7 (no DESC/invisible/functional).
+		{"mixed-all-57", "CREATE TABLE t (id INT NOT NULL, a INT, b INT, c VARCHAR(40), PRIMARY KEY (id), UNIQUE KEY ua (a), KEY kb (b), KEY kc (c(5)))", "t"},
+	}
+}
+
+// TestOracle_IndexDiffIdempotence proves gates 1 & 2 for every single-table index form: user DDL
+// vs its engine readback diffs EMPTY, and the stored form self-diffs empty, on every supported
+// version.
+func TestOracle_IndexDiffIdempotence(t *testing.T) {
+	for range oracleVersions() {
+		o := oceanBaseOracle(t)
+		for _, probe := range indexDiffProbes() {
+			t.Run(fmt.Sprintf("%s/%s", o.name, probe.id), gapped(func(t testing.TB) {
+				db := "idx_" + strings.ReplaceAll(probe.id, "-", "_")
+				assertDiffEmptyAgainstReadback(t, o, db, probe.create, probe.table)
+			}))
+		}
+	}
+}
+
+// fkIndexCase is a parent+child schema with a foreign key, used to prove the FK-implicit
+// cross-reference round-trips empty.
+type fkIndexCase struct {
+	id       string
+	childDDL string // table `c`, references table `p`
+}
+
+// fkIndexCases enumerate the FK + index interplay forms. Each builds parent `p` + child `c`,
+// reads BOTH back, reloads as one schema, and the diff must be empty. The cases were chosen
+// for the index MySQL adds for a foreign key and the names it gives it; OceanBase adds
+// none, so each child has the indexes it declares.
+func fkIndexCases() []fkIndexCase {
+	return []fkIndexCase{
+		// Named FK, no index over its column.
+		{"fk-named-implicit", "CREATE TABLE c (id INT PRIMARY KEY, pid INT, CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p(id))"},
+		// Unnamed FK: OceanBase names it `c_OBFK_<time>`, the loader `c_ibfk_1`.
+		{"fk-unnamed-implicit", "CREATE TABLE c (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES p(id))"},
+		// A declared index over the FK's column must round-trip.
+		{"fk-explicit-covering", "CREATE TABLE c (id INT PRIMARY KEY, pid INT, KEY my_idx (pid), CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p(id))"},
+		// Composite FK.
+		{"fk-composite", "CREATE TABLE c (id INT PRIMARY KEY, x INT, y INT, CONSTRAINT fk FOREIGN KEY (x,y) REFERENCES p(a,b))"},
+		// An index named as the FK's column, over another column, beside an unnamed FK.
+		{"fk-backing-name-collision", "CREATE TABLE c (id INT PRIMARY KEY, a INT, pid INT, KEY pid (a), FOREIGN KEY (pid) REFERENCES p(id))"},
+		// FK with a user-chosen constraint name in the loader's `<table>_ibfk_N` shape.
+		{"fk-user-named-ibfk", "CREATE TABLE c (id INT PRIMARY KEY, pid INT, CONSTRAINT c_ibfk_1 FOREIGN KEY (pid) REFERENCES p(id))"},
+	}
+}
+
+// TestOracle_IndexFKColumnChangeNoIndexOps proves that a FK whose COLUMNS change brings no
+// index op with it: the foreign key has no index of its own on either side. Proven via a
+// multi-table schema loaded from real engine readbacks.
+func TestOracle_IndexFKColumnChangeNoIndexOps(t *testing.T) {
+	for range oracleVersions() {
+		o := oceanBaseOracle(t)
+		sc := serverCharsetFor(o.version)
+		n := NormalizerFor(o.version)
+		ctx := context.Background()
+
+		// loadSchema applies parent+child in a throwaway db, then reloads BOTH tables wrapped in a
+		// FIXED logical db name (idxfkc) so that the from/to catalogs share a database identity and
+		// only the child's FK (not the database) differs in the diff.
+		loadSchema := func(execDB, childDDL string) *Catalog {
+			stmts := []string{
+				"DROP DATABASE IF EXISTS " + execDB,
+				fmt.Sprintf("CREATE DATABASE %s DEFAULT CHARSET=%s", execDB, sc),
+				"USE " + execDB,
+				"CREATE TABLE p (a INT NOT NULL PRIMARY KEY, b INT NOT NULL, UNIQUE KEY ub (b))",
+				childDDL,
+			}
+			for _, s := range stmts {
+				if _, err := o.db.ExecContext(ctx, s); err != nil {
+					o.refused(t, err, "setup: %q", s)
+					return nil
+				}
+			}
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "CREATE DATABASE idxfkc DEFAULT CHARSET=%s;\nUSE idxfkc;\n", sc)
+			for _, tbl := range []string{"p", "c"} {
+				var nm, ddl string
+				row := o.db.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE %s.%s", execDB, tbl))
+				if err := row.Scan(&nm, &ddl); err != nil {
+					t.Fatalf("[%s] show create %s: %v", o.name, tbl, err)
+				}
+				sb.WriteString(rehomed(ddl, execDB, "idxfkc") + ";\n")
+			}
+			cat, err := LoadSQL(sb.String())
+			if err != nil {
+				t.Fatalf("[%s] reload: %v\n%s", o.name, err, sb.String())
+			}
+			return cat
+		}
+
+		t.Run(o.name+"/fk-column-change", gapped(func(t testing.TB) {
+			from := loadSchema("idxfkc_a", "CREATE TABLE c (id INT PRIMARY KEY, x INT, y INT, CONSTRAINT fk FOREIGN KEY (x) REFERENCES p(a))")
+			to := loadSchema("idxfkc_b", "CREATE TABLE c (id INT PRIMARY KEY, x INT, y INT, CONSTRAINT fk FOREIGN KEY (y) REFERENCES p(b))")
+			diff := DiffWithNormalizer(from, to, n)
+			plan := GenerateMigrationWithNormalizer(from, to, diff, n)
+			for _, op := range plan.Ops {
+				if op.Type == OpAddIndex || op.Type == OpDropIndex {
+					t.Errorf("[%s] FK column change must emit no index op, got: %s", o.name, op.SQL)
+				}
+			}
+		}))
+	}
+}
+
+// TestOracle_IndexDiffFKImplicit proves that a schema with a foreign key self-diffs empty
+// when loaded from the real engine readbacks of BOTH tables. This is the multi-table analog
+// of the idempotence probe — the single-table harness cannot resolve the FK's referenced
+// table.
+func TestOracle_IndexDiffFKImplicit(t *testing.T) {
+	for range oracleVersions() {
+		o := oceanBaseOracle(t)
+		sc := serverCharsetFor(o.version)
+		n := NormalizerFor(o.version)
+		ctx := context.Background()
+
+		// parent `p` has both a single-col PK (for fk-named/unnamed/explicit) and a composite PK
+		// (for fk-composite); pick the parent matching the child.
+		parentFor := func(id string) string {
+			if id == "fk-composite" {
+				return "CREATE TABLE p (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a,b))"
+			}
+			return "CREATE TABLE p (id INT NOT NULL PRIMARY KEY, name VARCHAR(50))"
+		}
+
+		for _, fc := range fkIndexCases() {
+			t.Run(o.name+"/"+fc.id, gapped(func(t testing.TB) {
+				dbName := "idxfk_" + strings.ReplaceAll(fc.id, "-", "_")
+				stmts := []string{
+					"DROP DATABASE IF EXISTS " + dbName,
+					fmt.Sprintf("CREATE DATABASE %s DEFAULT CHARSET=%s", dbName, sc),
+					"USE " + dbName,
+					parentFor(fc.id),
+					fc.childDDL,
+				}
+				for _, s := range stmts {
+					if _, err := o.db.ExecContext(ctx, s); err != nil {
+						o.refused(t, err, "setup failed: %q", s)
+						return
+					}
+				}
+				// Read both tables back and reload as a single schema.
+				var b strings.Builder
+				fmt.Fprintf(&b, "CREATE DATABASE %s DEFAULT CHARSET=%s;\nUSE %s;\n", dbName, sc, dbName)
+				for _, tbl := range []string{"p", "c"} {
+					var nm, ddl string
+					row := o.db.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE %s.%s", dbName, tbl))
+					if err := row.Scan(&nm, &ddl); err != nil {
+						t.Fatalf("[%s] SHOW CREATE %s: %v", o.name, tbl, err)
+					}
+					b.WriteString(ddl + ";\n")
+				}
+				cat, err := LoadSQL(b.String())
+				if err != nil {
+					t.Fatalf("[%s] reload of FK readback failed: %v\n%s", o.name, err, b.String())
+				}
+				if d := DiffWithNormalizer(cat, cat, n); !d.IsEmpty() {
+					t.Errorf("[%s] FK schema self-diff not empty: %s", o.name, describeDiff(d))
+				}
+			}))
+		}
+	}
+}

@@ -1,0 +1,48 @@
+package catalog
+
+import "strings"
+
+type Database struct {
+	Name       string
+	Charset    string
+	Collation  string
+	Tables     map[string]*Table   // lowered name -> Table
+	Views      map[string]*View
+	Functions  map[string]*Routine // lowered name -> stored function
+	Procedures map[string]*Routine // lowered name -> stored procedure
+	Triggers   map[string]*Trigger // lowered name -> trigger
+	Events     map[string]*Event   // lowered name -> event
+
+	// TiDB-specific: database-level placement policy. Empty when unset.
+	PlacementPolicy string
+
+	// TiDB: database-level TiFlash replica count (0 = not set).
+	// The replica count applies to all tables in the database that
+	// don't override it at the table level (upstream resolution is
+	// executed asynchronously by the placement scheduler, not the
+	// DDL path). Orrery stores it as declared metadata only.
+	TiFlashReplica        int
+	TiFlashLocationLabels []string
+}
+
+func newDatabase(name, charset, collation string) *Database {
+	return &Database{
+		Name:       name,
+		Charset:    charset,
+		Collation:  collation,
+		Tables:     make(map[string]*Table),
+		Views:      make(map[string]*View),
+		Functions:  make(map[string]*Routine),
+		Procedures: make(map[string]*Routine),
+		Triggers:   make(map[string]*Trigger),
+		Events:     make(map[string]*Event),
+	}
+}
+
+func (db *Database) GetTable(name string) *Table {
+	return db.Tables[toLower(name)]
+}
+
+func toLower(s string) string {
+	return strings.ToLower(s)
+}

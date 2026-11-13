@@ -1,0 +1,261 @@
+package catalog
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+// The oracle proof for the partition differ (correctness-protocol.md gates 1 & 2), against
+// OceanBase. Partitioning is the diff-core idempotence gap the
+// breadth node closes: a partitioned table's SHOW CREATE emits a canonical partition clause whose
+// surface form differs from the user DDL (per-partition `ENGINE = ...` echo, 8.0's backtick-quoted
+// lower-cased expression, `PARTITIONS N` defaulting), and diff-core deliberately deferred it, so
+// before this node a partitioned table is NOT idempotent.
+//
+// Two properties are proven mechanically for every partition variant:
+//
+//  1. Idempotence (the spine): a schema in its real stored form (the engine's SHOW CREATE
+//     readback, reloaded) self-diffs empty, AND the user DDL vs the engine's stored form diffs
+//     empty (PartitionChanged=false). A non-empty diff is a partition-canonicalization bug.
+//  2. Real changes ARE detected (gate-2 complement): two genuinely different partition specs
+//     (and partitioned-vs-not) diff with PartitionChanged=true. Without this, a differ that
+//     always returned false would pass the idempotence gate vacuously.
+//
+// The harness reuses assertDiffEmptyAgainstReadback / oceanBaseOracle / serverCharsetFor
+// from the diff oracle tests.
+
+// partitionDiffProbes enumerates the single-table partition FORMS that must round-trip empty: a
+// user-form DDL whose engine-stored partition clause differs (engine echo, expr quoting, default
+// expansion) but must canonicalize equal. Every PARTITION BY kind is covered, on every version
+// that supports it.
+func partitionDiffProbes() []diffProbe {
+	return []diffProbe{
+		// RANGE over an expression — the headline expr-canonicalization case (8.0 backtick-quotes
+		// + lower-cases `year(`dt`)`, 5.7 keeps `YEAR(dt)`, user wrote `YEAR(dt)`).
+		{"range-expr", "CREATE TABLE t (id INT NOT NULL, dt DATE NOT NULL, PRIMARY KEY (id, dt)) PARTITION BY RANGE (YEAR(dt)) (PARTITION p0 VALUES LESS THAN (2010), PARTITION p1 VALUES LESS THAN (2020), PARTITION pmax VALUES LESS THAN MAXVALUE)", "t"},
+		// RANGE COLUMNS (single + multi) — /*!50500*/ comment, double-space `RANGE  COLUMNS`.
+		{"range-columns", "CREATE TABLE t (id INT NOT NULL, a INT NOT NULL, PRIMARY KEY (id,a)) PARTITION BY RANGE COLUMNS(a) (PARTITION p0 VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (MAXVALUE))", "t"},
+		{"range-columns-multi", "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a,b)) PARTITION BY RANGE COLUMNS(a,b) (PARTITION p0 VALUES LESS THAN (10,10), PARTITION p1 VALUES LESS THAN (MAXVALUE,MAXVALUE))", "t"},
+		// LIST over an expression.
+		{"list-expr", "CREATE TABLE t (id INT NOT NULL, c INT NOT NULL, PRIMARY KEY (id,c)) PARTITION BY LIST (c) (PARTITION pa VALUES IN (1,2,3), PARTITION pb VALUES IN (4,5,6))", "t"},
+		// LIST COLUMNS with multi-column tuple values IN ((1,1),(2,2)).
+		{"list-columns-multi", "CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a,b)) PARTITION BY LIST COLUMNS(a,b) (PARTITION p0 VALUES IN ((1,1),(2,2)), PARTITION p1 VALUES IN ((3,3),(4,4)))", "t"},
+		// HASH with PARTITIONS N (auto-gen defs → `PARTITIONS 4`, no per-partition engine echo).
+		{"hash-n", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT) PARTITION BY HASH (id) PARTITIONS 4", "t"},
+		// HASH with explicit named partitions (each echoed with ENGINE = InnoDB).
+		{"hash-explicit", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY HASH (id) (PARTITION pa, PARTITION pb, PARTITION pc)", "t"},
+		// LINEAR HASH.
+		{"linear-hash", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY LINEAR HASH (id) PARTITIONS 4", "t"},
+		// KEY over the PK (no explicit column list → loader fills from PK).
+		{"key-implicit", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT) PARTITION BY KEY () PARTITIONS 3", "t"},
+		// KEY over an explicit column.
+		{"key-explicit", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT) PARTITION BY KEY (id) PARTITIONS 3", "t"},
+		// KEY ALGORITHM=2 — the DEFAULT algorithm, STRIPPED from SHOW CREATE (`KEY (id)`), so the
+		// explicit user form must fold to the stripped stored form (keyAlgorithmDefault fold).
+		{"key-algorithm-2", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT) PARTITION BY KEY ALGORITHM=2 (id) PARTITIONS 3", "t"},
+		// KEY ALGORITHM=1 — the LEGACY algorithm, ECHOED by SHOW CREATE via a /*!50611 ALGORITHM = 1
+		// */ split comment, so it must round-trip WITHOUT being folded.
+		{"key-algorithm-1", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT) PARTITION BY KEY ALGORITHM=1 (id) PARTITIONS 3", "t"},
+		// LINEAR KEY.
+		{"linear-key", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY LINEAR KEY (id) PARTITIONS 2", "t"},
+		// No per-partition COMMENT probe: OceanBase refuses COMMENT on a partition with
+		// 1064 (parser partitionOptionCases), so this tree cannot load one.
+		// Subpartitions via SUBPARTITIONS N (default subpartition names psp).
+		{"subpart-n", "CREATE TABLE t (id INT NOT NULL, d DATE NOT NULL, PRIMARY KEY (id,d)) PARTITION BY RANGE (YEAR(d)) SUBPARTITION BY HASH (id) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (2010), PARTITION p1 VALUES LESS THAN MAXVALUE)", "t"},
+		// Subpartitions with explicit subpartition definitions (named, parenthesized per partition).
+		{"subpart-explicit", "CREATE TABLE t (id INT NOT NULL, d DATE NOT NULL, PRIMARY KEY (id,d)) PARTITION BY RANGE (YEAR(d)) SUBPARTITION BY HASH (id) (PARTITION p0 VALUES LESS THAN (2010) (SUBPARTITION s0a, SUBPARTITION s0b), PARTITION p1 VALUES LESS THAN MAXVALUE (SUBPARTITION s1a, SUBPARTITION s1b))", "t"},
+		// Subpartition BY KEY.
+		{"subpart-key", "CREATE TABLE t (id INT NOT NULL, d DATE NOT NULL, PRIMARY KEY (id,d)) PARTITION BY RANGE (YEAR(d)) SUBPARTITION BY KEY (id) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (2010), PARTITION p1 VALUES LESS THAN MAXVALUE)", "t"},
+		// No MyISAM-partitioned probe: 5.7 echoes ENGINE = MyISAM on each partition, and
+		// OceanBase takes only ENGINE = InnoDB there (parser partitionOptionCases).
+
+		// --- Constant-folded partition bounds (entry partition-constant-folding). The engine folds
+		//     a non-literal RANGE/LIST bound to an integer literal at storage time (verified on both
+		//     5.7 and 8.0); the loader must fold the user form identically or it phantom-diffs. ---
+		// Integer arithmetic in RANGE bounds: 5+5→10, 10*2→20.
+		{"range-bound-arith", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (5+5), PARTITION p1 VALUES LESS THAN (10*2), PARTITION pmax VALUES LESS THAN MAXVALUE)", "t"},
+		// DIV / parenthesized arithmetic (folded values must stay strictly increasing): 100 DIV 3 →
+		// 33, (20+5)*4 → 100.
+		{"range-bound-divmod", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (100 DIV 3), PARTITION p1 VALUES LESS THAN ((20+5)*4), PARTITION pmax VALUES LESS THAN MAXVALUE)", "t"},
+		// TO_DAYS on a literal date in a RANGE bound: TO_DAYS('2020-01-01') → 737790.
+		{"range-bound-todays", "CREATE TABLE t (id INT NOT NULL, dt DATE NOT NULL, PRIMARY KEY (id, dt)) PARTITION BY RANGE (TO_DAYS(dt)) (PARTITION p0 VALUES LESS THAN (TO_DAYS('2020-01-01')), PARTITION p1 VALUES LESS THAN (TO_DAYS('2021-01-01')), PARTITION pmax VALUES LESS THAN MAXVALUE)", "t"},
+		// YEAR on a literal date in a RANGE bound: YEAR('2020-06-15') → 2020.
+		{"range-bound-year-fn", "CREATE TABLE t (id INT NOT NULL, dt DATE NOT NULL, PRIMARY KEY (id, dt)) PARTITION BY RANGE (YEAR(dt)) (PARTITION p0 VALUES LESS THAN (YEAR('2020-06-15')), PARTITION pmax VALUES LESS THAN MAXVALUE)", "t"},
+		// Arithmetic in LIST bounds: 1+1,2+2 → 2,4.
+		{"list-bound-arith", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY LIST (id) (PARTITION p0 VALUES IN (1+1, 2+2), PARTITION p1 VALUES IN (10, 20))", "t"},
+		// RANGE COLUMNS tuple: the integer position folds (5+5→10), the string position stays quoted.
+		{"range-columns-bound-arith", "CREATE TABLE t (a INT NOT NULL, b VARCHAR(10) NOT NULL, PRIMARY KEY (a,b)) PARTITION BY RANGE COLUMNS(a,b) (PARTITION p0 VALUES LESS THAN (5+5, 'm'), PARTITION p1 VALUES LESS THAN (MAXVALUE, MAXVALUE))", "t"},
+		// REGRESSION GUARD: already-literal bounds (the common case) must stay idempotent — folding
+		// must be a no-op on a plain integer literal and on a negative literal.
+		{"range-bound-literal-guard", "CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (-10), PARTITION p1 VALUES LESS THAN (0), PARTITION p2 VALUES LESS THAN (100), PARTITION pmax VALUES LESS THAN MAXVALUE)", "t"},
+	}
+}
+
+// TestOracle_PartitionDiffIdempotence proves gates 1 & 2 for every partition form: the user DDL
+// vs its engine readback diffs EMPTY (PartitionChanged=false), and the stored form self-diffs
+// empty, on every supported version.
+func TestOracle_PartitionDiffIdempotence(t *testing.T) {
+	for range oracleVersions() {
+		o := oceanBaseOracle(t)
+		for _, probe := range partitionDiffProbes() {
+			t.Run(fmt.Sprintf("%s/%s", o.name, probe.id), gapped(func(t testing.TB) {
+				db := "part_" + strings.ReplaceAll(probe.id, "-", "_")
+				assertDiffEmptyAgainstReadback(t, o, db, probe.create, probe.table)
+			}))
+		}
+	}
+}
+
+// partitionChangeCase is a (from, to) pair whose partition specs genuinely differ; the differ
+// must report PartitionChanged=true (and the table as DiffModify). This is the gate-2 complement:
+// proof the differ is not a vacuous always-false.
+type partitionChangeCase struct {
+	id      string
+	fromDDL string
+	toDDL   string
+	table   string
+}
+
+func partitionChangeCases() []partitionChangeCase {
+	return []partitionChangeCase{
+		// Add partitioning to an unpartitioned table.
+		{"add-partitioning",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT) PARTITION BY HASH (id) PARTITIONS 4",
+			"t"},
+		// Remove partitioning.
+		{"remove-partitioning",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT) PARTITION BY HASH (id) PARTITIONS 4",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)",
+			"t"},
+		// Change the partition count.
+		{"change-count",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY HASH (id) PARTITIONS 4",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY HASH (id) PARTITIONS 8",
+			"t"},
+		// Change the partition TYPE (HASH → KEY).
+		{"change-type",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY HASH (id) PARTITIONS 4",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY KEY (id) PARTITIONS 4",
+			"t"},
+		// Change a RANGE boundary.
+		{"change-range-bound",
+			"CREATE TABLE t (id INT NOT NULL, dt DATE NOT NULL, PRIMARY KEY (id, dt)) PARTITION BY RANGE (YEAR(dt)) (PARTITION p0 VALUES LESS THAN (2010), PARTITION pmax VALUES LESS THAN MAXVALUE)",
+			"CREATE TABLE t (id INT NOT NULL, dt DATE NOT NULL, PRIMARY KEY (id, dt)) PARTITION BY RANGE (YEAR(dt)) (PARTITION p0 VALUES LESS THAN (2015), PARTITION pmax VALUES LESS THAN MAXVALUE)",
+			"t"},
+		// Add a partition (RANGE).
+		{"add-range-partition",
+			"CREATE TABLE t (id INT NOT NULL, dt DATE NOT NULL, PRIMARY KEY (id, dt)) PARTITION BY RANGE (YEAR(dt)) (PARTITION p0 VALUES LESS THAN (2010), PARTITION pmax VALUES LESS THAN MAXVALUE)",
+			"CREATE TABLE t (id INT NOT NULL, dt DATE NOT NULL, PRIMARY KEY (id, dt)) PARTITION BY RANGE (YEAR(dt)) (PARTITION p0 VALUES LESS THAN (2010), PARTITION p1 VALUES LESS THAN (2020), PARTITION pmax VALUES LESS THAN MAXVALUE)",
+			"t"},
+		// LINEAR flag flip.
+		{"toggle-linear",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY KEY (id) PARTITIONS 4",
+			"CREATE TABLE t (id INT NOT NULL PRIMARY KEY) PARTITION BY LINEAR KEY (id) PARTITIONS 4",
+			"t"},
+	}
+}
+
+// TestOracle_PartitionChangeDetected proves the gate-2 complement: a real partition-spec change
+// (loaded from the engines' own readbacks) is reported as PartitionChanged=true with the table
+// marked DiffModify. Run from real readbacks so it exercises the same canonical path as the
+// idempotence proof.
+func TestOracle_PartitionChangeDetected(t *testing.T) {
+	for _, version := range oracleVersions() {
+		o := oceanBaseOracle(t)
+		n := NormalizerFor(version)
+		for _, tc := range partitionChangeCases() {
+			t.Run(fmt.Sprintf("%s/%s", o.name, tc.id), gapped(func(t testing.TB) {
+				slug := strings.ReplaceAll(tc.id, "-", "_")
+				fromCat, _, _, ok1 := o.catalogFromReadback(t, "pc_from_"+slug, tc.fromDDL, tc.table)
+				toCat, _, _, ok2 := o.catalogFromReadback(t, "pc_to_"+slug, tc.toDDL, tc.table)
+				if !ok1 || !ok2 {
+					o.refused(t, nil, "could not obtain readbacks for %s", tc.id)
+					return
+				}
+				d := DiffWithNormalizer(fromCat, toCat, n)
+				te := findTable(d, tc.table)
+				if te == nil {
+					t.Fatalf("[%s] %s: expected table %s to be modified, got empty diff", o.name, tc.id, tc.table)
+				}
+				if !te.PartitionChanged {
+					t.Errorf("[%s] %s: expected PartitionChanged=true, got false (table action %s)", o.name, tc.id, te.Action)
+				}
+			}))
+		}
+	}
+}
+
+// TestDiffPartition_SubpartitionTemplate asserts a subpartition template reaches the
+// partition spec the diff compares. canonicalPartitionSpec renders through
+// showPartitioning, and a HASH table with PARTITIONS N used to render as that count alone,
+// which cannot express subpartitions -- so changing a template's entries diffed empty and
+// generated no migration.
+func TestDiffPartition_SubpartitionTemplate(t *testing.T) {
+	ddl := func(subs string) string {
+		return dbDDL + "CREATE TABLE t (a INT, b INT) PARTITION BY HASH(a) PARTITIONS 2 " +
+			"SUBPARTITION BY KEY(b) SUBPARTITION TEMPLATE (" + subs + ")"
+	}
+	two := ddl("SUBPARTITION s0, SUBPARTITION s1")
+	three := ddl("SUBPARTITION s0, SUBPARTITION s1, SUBPARTITION s2")
+
+	if d := DiffWithNormalizer(loadCat(t, two), loadCat(t, three), NormalizerFor(MySQL80)); d.IsEmpty() {
+		t.Error("a two-entry template against a three-entry one diffed empty, so no migration")
+	}
+	if d := DiffWithNormalizer(loadCat(t, two), loadCat(t, two), NormalizerFor(MySQL80)); !d.IsEmpty() {
+		t.Errorf("the same template must be empty, got: %s", describeDiff(d))
+	}
+	// The rendered form has to be loadable, since the spec is compared as text. Each
+	// subpartition carries the name OceanBase gives it, partition name, "s", template
+	// entry, so the names stay unique across the table.
+	rendered := loadCat(t, two).ShowCreateTable("app", "t")
+	if !strings.Contains(rendered, "SUBPARTITION p0ss0") || !strings.Contains(rendered, "SUBPARTITION p1ss1") {
+		t.Errorf("the rendered form states no subpartitions:\n%s", rendered)
+	}
+}
+
+// TestDiffPartition_CountAndListAreOneForm pins that a partition count and the list it
+// stands for compare equal: OceanBase stores `PARTITIONS 4` as p0 ... p3 and prints the
+// list, and `SUBPARTITIONS 2` as a template of two. It needs no engine;
+// TestOracle_PartitionDiffIdempotence asks OceanBase for the stored forms used here.
+func TestDiffPartition_CountAndListAreOneForm(t *testing.T) {
+	const cols = "CREATE TABLE t (id INT NOT NULL, d DATE NOT NULL, PRIMARY KEY (id, d)) "
+	tests := []struct {
+		name            string
+		written, stored string
+		same            bool
+	}{
+		{"HASH by count",
+			"PARTITION BY HASH (id) PARTITIONS 4",
+			"partition by hash(`id`)\n(partition `p0`,\npartition `p1`,\npartition `p2`,\npartition `p3`)", true},
+		{"KEY by count",
+			"PARTITION BY KEY (id) PARTITIONS 3",
+			"partition by key(`id`)\n(partition `p0`,\npartition `p1`,\npartition `p2`)", true},
+		{"subpartitions by count",
+			"PARTITION BY RANGE (YEAR(d)) SUBPARTITION BY HASH (id) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (2010), PARTITION p1 VALUES LESS THAN MAXVALUE)",
+			"partition by range(year(`d`)) subpartition by hash(`id`) subpartition template (\nsubpartition `p0`,\nsubpartition `p1`)\n(partition `p0` values less than (2010),\npartition `p1` values less than (MAXVALUE))", true},
+		{"another count",
+			"PARTITION BY HASH (id) PARTITIONS 3",
+			"partition by hash(`id`)\n(partition `p0`,\npartition `p1`,\npartition `p2`,\npartition `p3`)", false},
+		{"other names",
+			"PARTITION BY HASH (id) PARTITIONS 2",
+			"partition by hash(`id`)\n(partition `a`,\npartition `b`)", false},
+		{"another subpartition count",
+			"PARTITION BY RANGE (YEAR(d)) SUBPARTITION BY HASH (id) SUBPARTITIONS 3 (PARTITION p0 VALUES LESS THAN (2010), PARTITION p1 VALUES LESS THAN MAXVALUE)",
+			"partition by range(year(`d`)) subpartition by hash(`id`) subpartition template (\nsubpartition `p0`,\nsubpartition `p1`)\n(partition `p0` values less than (2010),\npartition `p1` values less than (MAXVALUE))", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			written := loadCat(t, dbDDL+cols+tc.written+";")
+			stored := loadCat(t, dbDDL+cols+tc.stored+";")
+			for _, d := range []*SchemaDiff{Diff(written, stored), Diff(stored, written)} {
+				if d.IsEmpty() != tc.same {
+					t.Errorf("diff empty = %v, want %v: %+v", d.IsEmpty(), tc.same, d.Tables)
+				}
+			}
+		})
+	}
+}

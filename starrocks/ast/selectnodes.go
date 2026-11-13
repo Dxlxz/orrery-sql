@@ -1,0 +1,299 @@
+package ast
+
+// This file holds AST node types for SELECT statement parsing (T1.4).
+
+// ---------------------------------------------------------------------------
+// SELECT statement
+// ---------------------------------------------------------------------------
+
+// WithClause represents a WITH clause preceding a SELECT statement.
+//
+//	WITH [RECURSIVE] cte_name [(col1, col2, ...)] AS (query)
+//	  [, cte_name2 AS (query2)]
+type WithClause struct {
+	Recursive bool   // RECURSIVE keyword present
+	CTEs      []*CTE // one or more CTE definitions
+	Loc       Loc
+}
+
+// Tag implements Node.
+func (n *WithClause) Tag() NodeTag { return T_WithClause }
+
+// Compile-time assertion that *WithClause satisfies Node.
+var _ Node = (*WithClause)(nil)
+
+// CTE is one named entry in a WITH clause:
+//
+//	cte_name [(col1, col2, ...)] AS (query)
+type CTE struct {
+	Name    string   // the CTE alias name
+	Columns []string // optional column aliases; nil/empty if not specified
+	Query   Node     // the inner SELECT statement (*SelectStmt)
+	Loc     Loc
+}
+
+// Tag implements Node.
+func (n *CTE) Tag() NodeTag { return T_CTE }
+
+// Compile-time assertion that *CTE satisfies Node.
+var _ Node = (*CTE)(nil)
+
+// SelectStmt represents a full SELECT statement.
+//
+//	[WITH [RECURSIVE] cte ...]
+//	SELECT [DISTINCT|ALL] select_list
+//	  [FROM table_references]
+//	  [WHERE condition]
+//	  [GROUP BY expr, ...]
+//	  [HAVING condition]
+//	  [QUALIFY condition]
+//	  [ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...]
+//	  [LIMIT count [OFFSET offset]]
+//	  [INTO OUTFILE ...]
+type SelectStmt struct {
+	With     *WithClause        // optional WITH clause (nil if absent)
+	Distinct bool               // DISTINCT keyword present
+	All      bool               // ALL keyword present (explicit, rarely used)
+	Items    []*SelectItem      // SELECT list
+	From     []Node             // FROM clause table references (TableRef or JoinClause)
+	Where    Node               // WHERE expression (nil if absent)
+	GroupBy  []Node             // GROUP BY expressions
+	Having   Node               // HAVING expression (nil if absent)
+	Qualify  Node               // QUALIFY expression (nil if absent)
+	OrderBy  []*OrderByItem     // ORDER BY items
+	Limit    Node               // LIMIT expression (nil if absent)
+	Offset   Node               // OFFSET expression (nil if absent)
+	Into     *IntoOutfileClause // INTO OUTFILE clause (nil if absent)
+	Loc      Loc
+}
+
+// IntoOutfileClause represents an INTO OUTFILE clause for exporting query
+// results to a file (StarRocks supports S3, HDFS, etc.):
+//
+//	INTO OUTFILE 'path'
+//	  [FORMAT AS format_type]
+//	  [PROPERTIES ("key" = "value", ...)]
+type IntoOutfileClause struct {
+	Path       string      // file path (S3, HDFS, or local)
+	Format     string      // format type: CSV, PARQUET, ORC, etc. (empty if not specified)
+	Properties []*Property // PROPERTIES key-value pairs
+	Loc        Loc
+}
+
+// Tag implements Node.
+func (n *IntoOutfileClause) Tag() NodeTag { return T_IntoOutfileClause }
+
+// Compile-time assertion that *IntoOutfileClause satisfies Node.
+var _ Node = (*IntoOutfileClause)(nil)
+
+// Tag implements Node.
+func (n *SelectStmt) Tag() NodeTag { return T_SelectStmt }
+
+// Compile-time assertion that *SelectStmt satisfies Node.
+var _ Node = (*SelectStmt)(nil)
+
+// ---------------------------------------------------------------------------
+// SELECT list item
+// ---------------------------------------------------------------------------
+
+// SelectItem represents one item in the SELECT list:
+//   - expr [AS alias]    — a computed expression with optional alias
+//   - *                  — all columns
+//   - table.*            — all columns from a specific table
+type SelectItem struct {
+	Expr  Node   // the expression; for *, this is nil
+	Alias string // optional alias name; empty if absent
+
+	// Aliased reports whether an explicit alias was present. It is what
+	// distinguishes the engine-valid empty alias (SELECT c AS '') from no
+	// alias at all — Alias alone cannot, since "" is its absent value.
+	Aliased bool
+	Star    bool // true for * or table.*
+	// For table.*, TableName holds the qualifier ObjectName.
+	TableName *ObjectName
+	// For SELECT * EXCEPT (col1, col2, ...) — list of column names to exclude.
+	ExceptColumns []string
+	Loc           Loc
+}
+
+// Tag implements Node.
+func (n *SelectItem) Tag() NodeTag { return T_SelectItem }
+
+// Compile-time assertion that *SelectItem satisfies Node.
+var _ Node = (*SelectItem)(nil)
+
+// ---------------------------------------------------------------------------
+// Table reference
+// ---------------------------------------------------------------------------
+
+// TableRef represents a table reference in the FROM clause.
+//
+//	table_name [AS alias]
+//	db.table_name [AS alias]
+//	catalog.db.table_name [AS alias]
+type TableRef struct {
+	Name  *ObjectName // table name (may be qualified: db.table or catalog.db.table)
+	Alias string      // optional alias; empty if absent
+
+	// Subquery is set when this FROM item is a parenthesized subquery;
+	// Name.Parts[0] mirrors its raw text for legacy consumers.
+	Subquery *SubqueryExpr
+
+	// TabletIDs holds TABLET(id, ...) — a physical-tablet restriction that
+	// appears between the table name and the alias.
+	TabletIDs []int64
+
+	Loc Loc
+}
+
+// Tag implements Node.
+func (n *TableRef) Tag() NodeTag { return T_TableRef }
+
+// Compile-time assertion that *TableRef satisfies Node.
+var _ Node = (*TableRef)(nil)
+
+// InlineTable represents a VALUES table constructor in the FROM clause
+// (StarRocks's #inlineTable relation primary):
+//
+//	(VALUES (expr, ...), (expr, ...), ...) [AS] alias [(col, ...)]
+//
+// The wrapping parens are part of the construct. The alias and the
+// column-alias list are both optional. It is a literal-derived relation — it
+// references no physical table — so the analysis layer must not record it as
+// one.
+type InlineTable struct {
+	Rows          [][]Node // each row is a list of value expressions
+	Alias         string   // optional table alias; empty if absent
+	ColumnAliases []string // optional column-alias list; nil if absent
+	Loc           Loc
+}
+
+// Tag implements Node.
+func (n *InlineTable) Tag() NodeTag { return T_InlineTable }
+
+// Compile-time assertion that *InlineTable satisfies Node.
+var _ Node = (*InlineTable)(nil)
+
+// TableFunctionRef represents a table-function relation primary in the FROM
+// clause (StarRocks's #tableFunction relation primary):
+//
+//	func(args) [AS? alias [(cols)]]      e.g. unnest(t.arr) AS u(elem)
+//
+// The optional LATERAL prefix (StarRocks allows LATERAL before any relation
+// primary; it is most common before a table function such as unnest) is
+// recorded in Lateral. The call reuses FuncCallExpr so the argument
+// expressions stay walkable for lineage. It references no physical table.
+type TableFunctionRef struct {
+	Call          *FuncCallExpr // the table function call, e.g. unnest(t.arr)
+	Alias         string        // optional table alias; empty if absent
+	ColumnAliases []string      // optional column-alias list; nil if absent
+	Lateral       bool          // LATERAL prefix present
+	Loc           Loc
+}
+
+// Tag implements Node.
+func (n *TableFunctionRef) Tag() NodeTag { return T_TableFunctionRef }
+
+// Compile-time assertion that *TableFunctionRef satisfies Node.
+var _ Node = (*TableFunctionRef)(nil)
+
+// ---------------------------------------------------------------------------
+// JOIN clause (basic structure for T1.4; T1.5 will flesh out)
+// ---------------------------------------------------------------------------
+
+// JoinType classifies the kind of join.
+type JoinType int
+
+const (
+	JoinInner     JoinType = iota // [INNER] JOIN
+	JoinLeft                      // LEFT [OUTER] JOIN
+	JoinRight                     // RIGHT [OUTER] JOIN
+	JoinFull                      // FULL [OUTER] JOIN
+	JoinCross                     // CROSS JOIN
+	JoinLeftSemi                  // LEFT SEMI JOIN
+	JoinRightSemi                 // RIGHT SEMI JOIN
+	JoinLeftAnti                  // LEFT ANTI JOIN
+	JoinRightAnti                 // RIGHT ANTI JOIN
+)
+
+// JoinClause represents a JOIN expression in the FROM clause.
+type JoinClause struct {
+	Type    JoinType
+	Left    Node     // left side of the join
+	Right   Node     // right side of the join
+	Natural bool     // NATURAL join modifier
+	On      Node     // ON condition (nil if absent)
+	Using   []string // USING (col1, col2, ...) column names
+	Hints   []string // execution hints, e.g. [shuffle], [broadcast]
+	Loc     Loc
+}
+
+// Tag implements Node.
+func (n *JoinClause) Tag() NodeTag { return T_JoinClause }
+
+// Compile-time assertion that *JoinClause satisfies Node.
+var _ Node = (*JoinClause)(nil)
+
+// ---------------------------------------------------------------------------
+// Set operation (UNION / INTERSECT / EXCEPT / MINUS) — T1.7
+// ---------------------------------------------------------------------------
+
+// SetOperator represents the type of set operation.
+type SetOperator int
+
+const (
+	SetUnion     SetOperator = iota // UNION
+	SetIntersect                    // INTERSECT
+	SetExcept                       // EXCEPT / MINUS
+)
+
+// SetOpStmt represents a set operation between two queries.
+//
+//	left UNION [ALL|DISTINCT] right [ORDER BY ...] [LIMIT count [OFFSET offset]]
+//	left INTERSECT [ALL|DISTINCT] right
+//	left EXCEPT [ALL|DISTINCT] right
+//	left MINUS [ALL|DISTINCT] right  -- MINUS is an alias for EXCEPT in Doris
+//
+// OrderBy, Limit, and Offset are outer-level clauses that apply to the
+// combined result of the set operation, not to any individual branch.
+// They are hoisted from the rightmost unparenthesized leaf during parsing
+// (see parseSetOpTail) so that branch-local clauses inside parenthesized
+// operands remain on the inner SelectStmt.
+type SetOpStmt struct {
+	Op      SetOperator    // the set operator
+	All     bool           // true for ALL quantifier; false means DISTINCT (the default)
+	Left    Node           // SelectStmt, ParenSelect, or another SetOpStmt
+	Right   Node           // SelectStmt, ParenSelect, or another SetOpStmt
+	OrderBy []*OrderByItem // outer ORDER BY applying to the combined result
+	Limit   Node           // outer LIMIT applying to the combined result
+	Offset  Node           // outer OFFSET applying to the combined result
+	Loc     Loc
+}
+
+// ParenSelect wraps a parenthesized query expression: (SELECT ...) or
+// (SELECT ... UNION SELECT ...). It distinguishes branch-local clauses
+// (on the inner statement) from outer clauses (on the enclosing SetOpStmt).
+type ParenSelect struct {
+	Sel Node // the inner SelectStmt, SetOpStmt, or nested ParenSelect
+
+	// Trailing clauses applied to the grouped query from OUTSIDE the parens,
+	// as in (SELECT 1 LIMIT 1) LIMIT 2. Kept on the wrapper so a clause the
+	// inner query already carries is never overwritten.
+	OrderBy []*OrderByItem
+	Limit   Node
+	Offset  Node
+
+	Loc Loc
+}
+
+// Tag implements Node.
+func (n *ParenSelect) Tag() NodeTag { return T_ParenSelect }
+
+// Compile-time assertion that *ParenSelect satisfies Node.
+var _ Node = (*ParenSelect)(nil)
+
+// Tag implements Node.
+func (n *SetOpStmt) Tag() NodeTag { return T_SetOpStmt }
+
+// Compile-time assertion that *SetOpStmt satisfies Node.
+var _ Node = (*SetOpStmt)(nil)

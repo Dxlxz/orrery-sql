@@ -1,0 +1,1001 @@
+package parser
+
+import (
+	"strings"
+
+	"github.com/Dxlxz/orrery-sql/snowflake/ast"
+)
+
+// ---------------------------------------------------------------------------
+// CREATE DATABASE
+// ---------------------------------------------------------------------------
+
+// parseCreateDatabaseStmt parses CREATE [OR REPLACE] [TRANSIENT] DATABASE ...
+// The CREATE keyword and optional OR REPLACE / TRANSIENT modifiers have already
+// been consumed by parseCreateStmt; start is the Loc of the CREATE token.
+func (p *Parser) parseCreateDatabaseStmt(start ast.Loc, orReplace, orAlter, transient bool) (ast.Node, error) {
+	p.advance() // consume DATABASE
+
+	stmt := &ast.CreateDatabaseStmt{
+		OrReplace: orReplace,
+		OrAlter:   orAlter,
+		Transient: transient,
+		Loc:       ast.Loc{Start: start.Start},
+	}
+
+	// IF NOT EXISTS
+	if p.cur.Type == kwIF {
+		next := p.peekNext()
+		if next.Type == kwNOT {
+			p.advance() // consume IF
+			p.advance() // consume NOT
+			if _, err := p.expect(kwEXISTS); err != nil {
+				return nil, err
+			}
+			stmt.IfNotExists = true
+		}
+	}
+
+	// Database name
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+
+	// Optional CLONE source [AT|BEFORE (...)]
+	if p.cur.Type == kwCLONE {
+		clone, err := p.parseCloneSource()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Clone = clone
+	}
+
+	// Optional FROM SHARE <provider_account>.<share_name> — creates the
+	// database from an inbound share.
+	if p.cur.Type == kwFROM && p.peekNext().Type == kwSHARE {
+		p.advance() // consume FROM
+		p.advance() // consume SHARE
+		share, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.FromShare = share
+	}
+
+	// Optional properties
+	if err := p.parseDBSchemaPropsInto(&stmt.Props); err != nil {
+		return nil, err
+	}
+
+	// Optional WITH TAG (...)
+	for p.cur.Type == kwWITH || p.cur.Type == kwTAG {
+		if p.cur.Type == kwWITH {
+			if p.peekNext().Type != kwTAG {
+				break
+			}
+			p.advance() // consume WITH
+		}
+		tags, err := p.parseTagAssignments()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Tags = append(stmt.Tags, tags...)
+	}
+
+	stmt.Loc.End = p.prev.Loc.End
+	return stmt, nil
+}
+
+// ---------------------------------------------------------------------------
+// CREATE SCHEMA
+// ---------------------------------------------------------------------------
+
+// parseCreateSchemaStmt parses CREATE [OR REPLACE] [TRANSIENT] SCHEMA ...
+func (p *Parser) parseCreateSchemaStmt(start ast.Loc, orReplace, orAlter, transient bool) (ast.Node, error) {
+	p.advance() // consume SCHEMA
+
+	stmt := &ast.CreateSchemaStmt{
+		OrReplace: orReplace,
+		OrAlter:   orAlter,
+		Transient: transient,
+		Loc:       ast.Loc{Start: start.Start},
+	}
+
+	// IF NOT EXISTS
+	if p.cur.Type == kwIF {
+		next := p.peekNext()
+		if next.Type == kwNOT {
+			p.advance() // consume IF
+			p.advance() // consume NOT
+			if _, err := p.expect(kwEXISTS); err != nil {
+				return nil, err
+			}
+			stmt.IfNotExists = true
+		}
+	}
+
+	// Schema name
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+
+	// Optional CLONE source [AT|BEFORE (...)]
+	if p.cur.Type == kwCLONE {
+		clone, err := p.parseCloneSource()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Clone = clone
+	}
+
+	// Optional WITH MANAGED ACCESS
+	if p.cur.Type == kwWITH {
+		if p.peekNext().Type == kwMANAGED {
+			p.advance() // consume WITH
+			p.advance() // consume MANAGED
+			if _, err := p.expect(kwACCESS); err != nil {
+				return nil, err
+			}
+			stmt.ManagedAccess = true
+		}
+	}
+
+	// Optional properties
+	if err := p.parseDBSchemaPropsInto(&stmt.Props); err != nil {
+		return nil, err
+	}
+
+	// Optional WITH TAG (...)
+	for p.cur.Type == kwWITH || p.cur.Type == kwTAG {
+		if p.cur.Type == kwWITH {
+			if p.peekNext().Type != kwTAG {
+				break
+			}
+			p.advance() // consume WITH
+		}
+		tags, err := p.parseTagAssignments()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Tags = append(stmt.Tags, tags...)
+	}
+
+	stmt.Loc.End = p.prev.Loc.End
+	return stmt, nil
+}
+
+// ---------------------------------------------------------------------------
+// ALTER dispatch
+// ---------------------------------------------------------------------------
+
+// parseAlterStmt dispatches ALTER ... to the appropriate sub-parser.
+// Handles DATABASE, SCHEMA, VIEW, and MATERIALIZED VIEW; falls back to
+// unsupported for other objects.
+func (p *Parser) parseAlterStmt() (ast.Node, error) {
+	p.advance() // consume ALTER
+
+	switch p.cur.Type {
+	case kwTABLE:
+		return p.parseAlterTableStmt()
+	case kwDATABASE:
+		// ALTER DATABASE ROLE ... (T4.6) vs ALTER DATABASE ... (T2.1). DATABASE ROLE
+		// is disambiguated by the ROLE keyword following DATABASE.
+		if p.peekNext().Type == kwROLE {
+			p.advance() // consume DATABASE
+			return p.parseAlterRoleStmt(true)
+		}
+		return p.parseAlterDatabaseStmt()
+	case kwSCHEMA:
+		return p.parseAlterSchemaStmt()
+	case kwVIEW:
+		return p.parseAlterViewStmt()
+	case kwMATERIALIZED:
+		p.advance() // consume MATERIALIZED
+		return p.parseAlterMaterializedViewStmt()
+	case kwSTAGE:
+		// ALTER STAGE ... (T4.1).
+		return p.parseAlterStageStmt()
+	case kwFILE_FORMAT, kwFILE:
+		// ALTER FILE FORMAT ... (T4.2). FILE FORMAT lexes as one FILE_FORMAT token
+		// or two FILE+FORMAT tokens; both dispatch here.
+		return p.parseAlterFileFormatStmt()
+	case kwPIPE:
+		// ALTER PIPE ... (T4.3).
+		return p.parseAlterPipeStmt()
+	case kwSTREAM:
+		// ALTER STREAM ... (T4.3).
+		return p.parseAlterStreamStmt()
+	case kwTASK:
+		// ALTER TASK ... (T4.3).
+		return p.parseAlterTaskStmt()
+	case kwALERT:
+		// ALTER ALERT ... (T4.3).
+		return p.parseAlterAlertStmt()
+	case kwFUNCTION:
+		// ALTER FUNCTION ... (T4.5).
+		return p.parseAlterFunctionStmt()
+	case kwPROCEDURE:
+		// ALTER PROCEDURE ... (T4.5).
+		return p.parseAlterProcedureStmt()
+	case kwDYNAMIC:
+		// ALTER DYNAMIC TABLE ... (T4.4). The sub-parser consumes DYNAMIC + TABLE.
+		return p.parseAlterDynamicTableStmt()
+	case kwEXTERNAL:
+		// ALTER EXTERNAL { TABLE (T4.4) | VOLUME (T4.7) }. The TABLE sub-parser
+		// consumes EXTERNAL + TABLE. VOLUME is not a reserved keyword, so EXTERNAL
+		// VOLUME lexes as kwEXTERNAL followed by a "VOLUME" identifier.
+		if p.peekNext().Type == kwTABLE {
+			return p.parseAlterExternalTableStmt()
+		}
+		extTok := p.advance() // consume EXTERNAL (anchors Loc.Start)
+		if p.curIsWord("VOLUME") {
+			p.advance() // consume VOLUME
+			return p.parseAlterExternalVolumeStmt(extTok.Loc)
+		}
+		return p.unsupported("ALTER")
+	case kwSEQUENCE:
+		// ALTER SEQUENCE ... (T4.4). (ALTER EVENT TABLE goes through ALTER TABLE.)
+		return p.parseAlterSequenceStmt()
+	case kwWAREHOUSE:
+		// ALTER WAREHOUSE ... (gap-warehouse).
+		return p.parseAlterWarehouseStmt()
+	case kwSTORAGE, kwAPI, kwNOTIFICATION, kwSECURITY, kwINTEGRATION, kwRESOURCE, kwSECRET, kwCONNECTION, kwGIT:
+		// ALTER account-level integration objects (T4.7): { [STORAGE] | API |
+		// NOTIFICATION | SECURITY } INTEGRATION, RESOURCE MONITOR, SECRET,
+		// CONNECTION, GIT REPOSITORY. A bare ALTER INTEGRATION (qualifier omitted)
+		// dispatches here too. parseAlterIntegrationStmt consumes the keyword(s).
+		return p.parseAlterIntegrationStmt()
+	case kwTAG:
+		// ALTER TAG ... (T4.9).
+		return p.parseAlterTagStmt()
+	case kwSEMANTIC:
+		// ALTER SEMANTIC VIEW ... (T4.9). The sub-parser consumes SEMANTIC + VIEW.
+		return p.parseAlterSemanticViewStmt()
+	case kwFAILOVER, kwREPLICATION:
+		// ALTER { FAILOVER | REPLICATION } GROUP ... (T4.8). The sub-parser consumes
+		// the kind keyword + GROUP.
+		return p.parseAlterReplicationGroupStmt()
+	case kwACCOUNT:
+		// ALTER ACCOUNT ... (T4.8). The sub-parser consumes ACCOUNT.
+		return p.parseAlterAccountStmt()
+	case kwSHARE:
+		// ALTER SHARE ... (T4.8).
+		return p.parseAlterShareStmt()
+	case kwROLE:
+		// ALTER ROLE ... (T4.6). DATABASE ROLE is dispatched by the kwDATABASE case.
+		return p.parseAlterRoleStmt(false)
+	case kwUSER:
+		// ALTER USER ... (T4.6).
+		return p.parseAlterUserStmt()
+	case kwMASKING, kwSESSION, kwPASSWORD, kwNETWORK, kwROW:
+		// ALTER NETWORK RULE ... (gap-network-rule) vs the policy objects below.
+		// NETWORK is reserved but RULE is not, so NETWORK RULE lexes as kwNETWORK
+		// followed by a "RULE" identifier; NETWORK POLICY lexes as kwNETWORK followed
+		// by kwPOLICY. The RULE form is dispatched here before the shared policy path.
+		if p.cur.Type == kwNETWORK && p.peekIsWord("RULE") {
+			return p.parseAlterNetworkRuleStmt()
+		}
+		// ALTER SESSION { SET | UNSET } <param> ... (session parameters,
+		// gap-alter-family) vs ALTER SESSION POLICY <name> ... (a policy object).
+		// SESSION followed by SET/UNSET is session parameters; SESSION followed by
+		// POLICY stays on the policy path below.
+		if p.cur.Type == kwSESSION {
+			if next := p.peekNext().Type; next == kwSET || next == kwUNSET {
+				return p.parseAlterSessionStmt()
+			}
+		}
+		// ALTER { MASKING | ROW ACCESS | SESSION | PASSWORD | NETWORK } POLICY ...
+		// (T4.6). Only routed to the policy parser when the kind keyword is actually
+		// followed by POLICY (and, for ROW, ACCESS POLICY); otherwise a same-prefix
+		// non-policy statement (e.g. ALTER SESSION SET ...) is left unsupported here.
+		if p.startsPolicyKeyword() {
+			return p.parseAlterPolicyDispatch()
+		}
+		return p.unsupported("ALTER")
+	default:
+		// AUTHENTICATION is not a reserved keyword, so ALTER AUTHENTICATION POLICY
+		// lexes as an "AUTHENTICATION" identifier followed by POLICY (T4.6).
+		if p.startsPolicyKeyword() {
+			return p.parseAlterPolicyDispatch()
+		}
+		return p.unsupported("ALTER")
+	}
+}
+
+// parseAlterPolicyDispatch consumes the policy-kind keyword(s) + the POLICY
+// keyword and delegates to parseAlterPolicyStmt (T4.6). On entry cur is the
+// first policy-kind word; the caller has confirmed startsPolicyKeyword.
+func (p *Parser) parseAlterPolicyDispatch() (ast.Node, error) {
+	startLoc := p.cur.Loc // policy-kind keyword anchors Loc.Start (ALTER convention)
+	kind, err := p.consumePolicyKeywords()
+	if err != nil {
+		return nil, err
+	}
+	return p.parseAlterPolicyStmt(startLoc, kind)
+}
+
+// ---------------------------------------------------------------------------
+// ALTER DATABASE
+// ---------------------------------------------------------------------------
+
+// parseAlterDatabaseStmt parses ALTER DATABASE ... (all action variants).
+// The ALTER keyword has already been consumed.
+func (p *Parser) parseAlterDatabaseStmt() (ast.Node, error) {
+	altTok := p.advance() // consume DATABASE
+	stmt := &ast.AlterDatabaseStmt{Loc: ast.Loc{Start: altTok.Loc.Start}}
+
+	// Optional IF EXISTS
+	if p.cur.Type == kwIF {
+		if p.peekNext().Type == kwEXISTS {
+			p.advance() // consume IF
+			p.advance() // consume EXISTS
+			stmt.IfExists = true
+		}
+	}
+
+	// Database name
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+
+	// Action branch
+	switch p.cur.Type {
+	case kwRENAME:
+		// RENAME TO new_name
+		p.advance() // consume RENAME
+		if _, err := p.expect(kwTO); err != nil {
+			return nil, err
+		}
+		newName, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Action = ast.AlterDBRename
+		stmt.NewName = newName
+
+	case kwSWAP:
+		// SWAP WITH other_name
+		p.advance() // consume SWAP
+		if _, err := p.expect(kwWITH); err != nil {
+			return nil, err
+		}
+		otherName, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Action = ast.AlterDBSwap
+		stmt.NewName = otherName
+
+	case kwSET:
+		p.advance() // consume SET
+		// Could be SET TAG (...) or SET <properties>
+		if p.cur.Type == kwTAG {
+			tags, err := p.parseTagAssignments()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Action = ast.AlterDBSetTag
+			stmt.Tags = tags
+		} else {
+			props, err := p.parseDBSchemaProps()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Action = ast.AlterDBSet
+			stmt.SetProps = props
+		}
+
+	case kwUNSET:
+		p.advance() // consume UNSET
+		if p.cur.Type == kwTAG {
+			// UNSET TAG ( name, name, ... )
+			names, err := p.parseUnsetTagList()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Action = ast.AlterDBUnsetTag
+			stmt.UnsetTags = names
+		} else {
+			// UNSET property [, property ...]
+			props, err := p.parsePropertyNameList()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Action = ast.AlterDBUnset
+			stmt.UnsetProps = props
+		}
+
+	case kwENABLE:
+		p.advance() // consume ENABLE
+		switch p.cur.Type {
+		case kwREPLICATION:
+			// ENABLE REPLICATION TO ACCOUNTS account_list [IGNORE EDITION CHECK]
+			p.advance() // consume REPLICATION
+			if _, err := p.expect(kwTO); err != nil {
+				return nil, err
+			}
+			if _, err := p.expect(kwACCOUNTS); err != nil {
+				return nil, err
+			}
+			// Skip account identifiers until end / IGNORE
+			for p.cur.Type != tokEOF && p.cur.Type != kwIGNORE && p.cur.Type != ';' {
+				p.advance()
+			}
+			// Optional IGNORE EDITION CHECK
+			if p.cur.Type == kwIGNORE {
+				p.advance() // consume IGNORE
+				p.advance() // consume EDITION
+				p.advance() // consume CHECK
+			}
+			stmt.Action = ast.AlterDBEnableReplication
+		case kwFAILOVER:
+			// ENABLE FAILOVER TO ACCOUNTS account_list
+			p.advance() // consume FAILOVER
+			if _, err := p.expect(kwTO); err != nil {
+				return nil, err
+			}
+			if _, err := p.expect(kwACCOUNTS); err != nil {
+				return nil, err
+			}
+			// Skip account identifiers
+			for p.cur.Type != tokEOF && p.cur.Type != ';' {
+				p.advance()
+			}
+			stmt.Action = ast.AlterDBEnableFailover
+		default:
+			return nil, p.syntaxErrorAtCur()
+		}
+
+	case kwDISABLE:
+		p.advance() // consume DISABLE
+		switch p.cur.Type {
+		case kwREPLICATION:
+			// DISABLE REPLICATION [TO ACCOUNTS account_list]
+			p.advance() // consume REPLICATION
+			if p.cur.Type == kwTO {
+				p.advance() // consume TO
+				if _, err := p.expect(kwACCOUNTS); err != nil {
+					return nil, err
+				}
+				for p.cur.Type != tokEOF && p.cur.Type != ';' {
+					p.advance()
+				}
+			}
+			stmt.Action = ast.AlterDBDisableReplication
+		case kwFAILOVER:
+			// DISABLE FAILOVER [TO ACCOUNTS account_list]
+			p.advance() // consume FAILOVER
+			if p.cur.Type == kwTO {
+				p.advance() // consume TO
+				if _, err := p.expect(kwACCOUNTS); err != nil {
+					return nil, err
+				}
+				for p.cur.Type != tokEOF && p.cur.Type != ';' {
+					p.advance()
+				}
+			}
+			stmt.Action = ast.AlterDBDisableFailover
+		default:
+			return nil, p.syntaxErrorAtCur()
+		}
+
+	case kwREFRESH:
+		p.advance() // consume REFRESH
+		stmt.Action = ast.AlterDBRefresh
+
+	case kwPRIMARY:
+		p.advance() // consume PRIMARY
+		stmt.Action = ast.AlterDBPrimary
+
+	default:
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	stmt.Loc.End = p.prev.Loc.End
+	return stmt, nil
+}
+
+// ---------------------------------------------------------------------------
+// ALTER SCHEMA
+// ---------------------------------------------------------------------------
+
+// parseAlterSchemaStmt parses ALTER SCHEMA ... (all action variants).
+// The ALTER keyword has already been consumed.
+func (p *Parser) parseAlterSchemaStmt() (ast.Node, error) {
+	altTok := p.advance() // consume SCHEMA
+	stmt := &ast.AlterSchemaStmt{Loc: ast.Loc{Start: altTok.Loc.Start}}
+
+	// Optional IF EXISTS
+	if p.cur.Type == kwIF {
+		if p.peekNext().Type == kwEXISTS {
+			p.advance() // consume IF
+			p.advance() // consume EXISTS
+			stmt.IfExists = true
+		}
+	}
+
+	// Schema name
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+
+	// Action branch
+	switch p.cur.Type {
+	case kwRENAME:
+		// RENAME TO new_name
+		p.advance() // consume RENAME
+		if _, err := p.expect(kwTO); err != nil {
+			return nil, err
+		}
+		newName, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Action = ast.AlterSchemaRename
+		stmt.NewName = newName
+
+	case kwSWAP:
+		// SWAP WITH other_name
+		p.advance() // consume SWAP
+		if _, err := p.expect(kwWITH); err != nil {
+			return nil, err
+		}
+		otherName, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Action = ast.AlterSchemaSwap
+		stmt.NewName = otherName
+
+	case kwSET:
+		p.advance() // consume SET
+		if p.cur.Type == kwTAG {
+			tags, err := p.parseTagAssignments()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Action = ast.AlterSchemaSetTag
+			stmt.Tags = tags
+		} else {
+			props, err := p.parseDBSchemaProps()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Action = ast.AlterSchemaSet
+			stmt.SetProps = props
+		}
+
+	case kwUNSET:
+		p.advance() // consume UNSET
+		if p.cur.Type == kwTAG {
+			names, err := p.parseUnsetTagList()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Action = ast.AlterSchemaUnsetTag
+			stmt.UnsetTags = names
+		} else {
+			props, err := p.parsePropertyNameList()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Action = ast.AlterSchemaUnset
+			stmt.UnsetProps = props
+		}
+
+	case kwENABLE:
+		// ENABLE MANAGED ACCESS
+		p.advance() // consume ENABLE
+		if _, err := p.expect(kwMANAGED); err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(kwACCESS); err != nil {
+			return nil, err
+		}
+		stmt.Action = ast.AlterSchemaEnableManagedAccess
+
+	case kwDISABLE:
+		// DISABLE MANAGED ACCESS
+		p.advance() // consume DISABLE
+		if _, err := p.expect(kwMANAGED); err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(kwACCESS); err != nil {
+			return nil, err
+		}
+		stmt.Action = ast.AlterSchemaDisableManagedAccess
+
+	default:
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	stmt.Loc.End = p.prev.Loc.End
+	return stmt, nil
+}
+
+// ---------------------------------------------------------------------------
+// ALTER SESSION (session parameters)
+// ---------------------------------------------------------------------------
+
+// sessionParamCap bounds the open-ended `<param> = <value>` run of an
+// ALTER SESSION SET so a malformed input can never spin.
+const sessionParamCap = 1024
+
+// parseAlterSessionStmt parses ALTER SESSION { SET | UNSET } <session_parameter>
+// ... (session parameters). The ALTER keyword has already been consumed; cur is
+// SESSION. ALTER SESSION POLICY ... is routed to the policy parser by the
+// dispatch in parseAlterStmt, so SESSION here is always followed by SET/UNSET.
+func (p *Parser) parseAlterSessionStmt() (ast.Node, error) {
+	sessTok := p.advance() // consume SESSION (anchors Loc.Start at the object keyword)
+	stmt := &ast.AlterSessionStmt{Loc: ast.Loc{Start: sessTok.Loc.Start}}
+
+	switch p.cur.Type {
+	case kwSET:
+		p.advance() // consume SET
+		opts, err := p.parseSessionParamOptions()
+		if err != nil {
+			return nil, err
+		}
+		if len(opts) == 0 {
+			// SET with nothing settable is a syntax error.
+			return nil, p.syntaxErrorAtCur()
+		}
+		stmt.Action = ast.AlterSessionSet
+		stmt.Options = opts
+
+	case kwUNSET:
+		p.advance() // consume UNSET
+		keys, err := p.parseSessionParamUnsetKeys()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Action = ast.AlterSessionUnset
+		stmt.UnsetKeys = keys
+
+	default:
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	stmt.Loc.End = p.prev.Loc.End
+	return stmt, nil
+}
+
+// parseSessionParamUnsetKeys reads the comma-separated parameter-name list of an
+// ALTER SESSION UNSET. Session parameter names are open-ended: most lex as
+// reserved keywords (LOCK_TIMEOUT, AUTOCOMMIT, ...), so any option word is
+// accepted (not only the closed DB-property set parsePropertyName allows). The
+// names are uppercased; the loop is bounded.
+func (p *Parser) parseSessionParamUnsetKeys() ([]string, error) {
+	var keys []string
+	for i := 0; ; i++ {
+		if i >= sessionParamCap {
+			return nil, p.syntaxErrorAtCur()
+		}
+		if !p.isOptionWord(p.cur.Type) {
+			return nil, p.syntaxErrorAtCur()
+		}
+		keys = append(keys, strings.ToUpper(p.advance().Str))
+		if p.cur.Type == ',' {
+			p.advance() // consume ','
+			continue
+		}
+		break
+	}
+	return keys, nil
+}
+
+// parseSessionParamOptions reads the open-ended `<param> = <value>` run of an
+// ALTER SESSION SET (e.g. AUTOCOMMIT = TRUE, LOCK_TIMEOUT = 3600,
+// DEFAULT_NULL_ORDERING = 'LAST'). Each entry is a CopyOption so any name/value
+// shape (word, number, or string literal) is captured. The loop is bounded and
+// guards against a non-advancing token.
+func (p *Parser) parseSessionParamOptions() ([]*ast.CopyOption, error) {
+	var opts []*ast.CopyOption
+	for i := 0; p.startsCopyOption(); i++ {
+		if i >= sessionParamCap {
+			return nil, p.syntaxErrorAtCur()
+		}
+		before := p.cur.Loc.Start
+		opt, err := p.parseCopyOption()
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, opt)
+		if p.cur.Loc.Start == before && p.cur.Type != tokEOF {
+			// No forward progress on a non-EOF token: abort rather than spin.
+			return nil, p.syntaxErrorAtCur()
+		}
+	}
+	return opts, nil
+}
+
+// ---------------------------------------------------------------------------
+// DROP dispatch
+// ---------------------------------------------------------------------------
+
+// parseDropStmt dispatches DROP ... to the appropriate sub-parser.
+// (parseDropStmt lives in drop.go; it dispatches DATABASE/SCHEMA here.)
+
+// ---------------------------------------------------------------------------
+// DROP DATABASE
+// ---------------------------------------------------------------------------
+
+// parseDropDatabaseStmt parses DROP DATABASE [IF EXISTS] name [CASCADE|RESTRICT].
+// The DROP keyword has already been consumed.
+func (p *Parser) parseDropDatabaseStmt() (ast.Node, error) {
+	dropTok := p.advance() // consume DATABASE
+	stmt := &ast.DropDatabaseStmt{Loc: ast.Loc{Start: dropTok.Loc.Start}}
+
+	// Optional IF EXISTS
+	if p.cur.Type == kwIF {
+		if p.peekNext().Type == kwEXISTS {
+			p.advance() // consume IF
+			p.advance() // consume EXISTS
+			stmt.IfExists = true
+		}
+	}
+
+	// Database name
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+
+	// Optional CASCADE | RESTRICT
+	switch p.cur.Type {
+	case kwCASCADE:
+		p.advance()
+		stmt.Cascade = true
+	case kwRESTRICT:
+		p.advance()
+		stmt.Restrict = true
+	}
+
+	stmt.Loc.End = p.prev.Loc.End
+	return stmt, nil
+}
+
+// ---------------------------------------------------------------------------
+// DROP SCHEMA
+// ---------------------------------------------------------------------------
+
+// parseDropSchemaStmt parses DROP SCHEMA [IF EXISTS] name [CASCADE|RESTRICT].
+// The DROP keyword has already been consumed.
+func (p *Parser) parseDropSchemaStmt() (ast.Node, error) {
+	dropTok := p.advance() // consume SCHEMA
+	stmt := &ast.DropSchemaStmt{Loc: ast.Loc{Start: dropTok.Loc.Start}}
+
+	// Optional IF EXISTS
+	if p.cur.Type == kwIF {
+		if p.peekNext().Type == kwEXISTS {
+			p.advance() // consume IF
+			p.advance() // consume EXISTS
+			stmt.IfExists = true
+		}
+	}
+
+	// Schema name
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+
+	// Optional CASCADE | RESTRICT
+	switch p.cur.Type {
+	case kwCASCADE:
+		p.advance()
+		stmt.Cascade = true
+	case kwRESTRICT:
+		p.advance()
+		stmt.Restrict = true
+	}
+
+	stmt.Loc.End = p.prev.Loc.End
+	return stmt, nil
+}
+
+// ---------------------------------------------------------------------------
+// UNDROP dispatch
+// ---------------------------------------------------------------------------
+
+// (parseUndropStmt lives in drop.go; it dispatches DATABASE/SCHEMA here.)
+
+// ---------------------------------------------------------------------------
+// UNDROP DATABASE
+// ---------------------------------------------------------------------------
+
+// parseUndropDatabaseStmt parses UNDROP DATABASE name.
+// The UNDROP keyword has already been consumed.
+func (p *Parser) parseUndropDatabaseStmt() (ast.Node, error) {
+	undropTok := p.advance() // consume DATABASE
+	stmt := &ast.UndropDatabaseStmt{Loc: ast.Loc{Start: undropTok.Loc.Start}}
+
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+
+	stmt.Loc.End = p.prev.Loc.End
+	return stmt, nil
+}
+
+// ---------------------------------------------------------------------------
+// UNDROP SCHEMA
+// ---------------------------------------------------------------------------
+
+// parseUndropSchemaStmt parses UNDROP SCHEMA name.
+// The UNDROP keyword has already been consumed.
+func (p *Parser) parseUndropSchemaStmt() (ast.Node, error) {
+	undropTok := p.advance() // consume SCHEMA
+	stmt := &ast.UndropSchemaStmt{Loc: ast.Loc{Start: undropTok.Loc.Start}}
+
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+
+	stmt.Loc.End = p.prev.Loc.End
+	return stmt, nil
+}
+
+// ---------------------------------------------------------------------------
+// Property parsing helpers
+// ---------------------------------------------------------------------------
+
+// parseDBSchemaProps parses zero or more optional DATABASE/SCHEMA properties
+// (DATA_RETENTION_TIME_IN_DAYS, MAX_DATA_EXTENSION_TIME_IN_DAYS,
+// DEFAULT_DDL_COLLATION, COMMENT). Returns a new *DBSchemaProps; the pointer
+// fields inside are nil unless the corresponding property was present.
+func (p *Parser) parseDBSchemaProps() (*ast.DBSchemaProps, error) {
+	props := &ast.DBSchemaProps{}
+	if err := p.parseDBSchemaPropsInto(props); err != nil {
+		return nil, err
+	}
+	return props, nil
+}
+
+// parseDBSchemaPropsInto populates *props in-place. Used by CREATE statements
+// that hold DBSchemaProps by value.
+func (p *Parser) parseDBSchemaPropsInto(props *ast.DBSchemaProps) error {
+	for {
+		switch p.cur.Type {
+		case kwDATA_RETENTION_TIME_IN_DAYS:
+			p.advance() // consume DATA_RETENTION_TIME_IN_DAYS
+			if p.cur.Type == '=' {
+				p.advance()
+			}
+			tok, err := p.expect(tokInt)
+			if err != nil {
+				return err
+			}
+			v := tok.Ival
+			props.DataRetention = &v
+
+		case kwMAX_DATA_EXTENSION_TIME_IN_DAYS:
+			p.advance() // consume MAX_DATA_EXTENSION_TIME_IN_DAYS
+			if p.cur.Type == '=' {
+				p.advance()
+			}
+			tok, err := p.expect(tokInt)
+			if err != nil {
+				return err
+			}
+			v := tok.Ival
+			props.MaxDataExt = &v
+
+		case kwDEFAULT_DDL_COLLATION:
+			p.advance() // consume DEFAULT_DDL_COLLATION / DEFAULT_DDL_COLLATION_
+			if p.cur.Type == '=' {
+				p.advance()
+			}
+			tok, err := p.expect(tokString)
+			if err != nil {
+				return err
+			}
+			s := tok.Str
+			props.DefaultDDLCol = &s
+
+		case kwCOMMENT:
+			p.advance() // consume COMMENT
+			if p.cur.Type == '=' {
+				p.advance()
+			}
+			tok, err := p.expect(tokString)
+			if err != nil {
+				return err
+			}
+			s := tok.Str
+			props.Comment = &s
+
+		default:
+			return nil
+		}
+	}
+}
+
+// parsePropertyNameList parses a comma-separated list of property names
+// (identifiers or reserved keywords) for UNSET clauses. Returns the uppercased
+// names. Consumes at least one name.
+func (p *Parser) parsePropertyNameList() ([]string, error) {
+	name, err := p.parsePropertyName()
+	if err != nil {
+		return nil, err
+	}
+	names := []string{name}
+
+	for p.cur.Type == ',' {
+		p.advance() // consume ','
+		name, err = p.parsePropertyName()
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+// parsePropertyName parses a single property name. Property names can be
+// keywords (DATA_RETENTION_TIME_IN_DAYS, COMMENT, etc.) or identifiers.
+func (p *Parser) parsePropertyName() (string, error) {
+	switch p.cur.Type {
+	case kwDATA_RETENTION_TIME_IN_DAYS:
+		p.advance()
+		return "DATA_RETENTION_TIME_IN_DAYS", nil
+	case kwMAX_DATA_EXTENSION_TIME_IN_DAYS:
+		p.advance()
+		return "MAX_DATA_EXTENSION_TIME_IN_DAYS", nil
+	case kwDEFAULT_DDL_COLLATION:
+		p.advance()
+		return "DEFAULT_DDL_COLLATION", nil
+	case kwCOMMENT:
+		p.advance()
+		return "COMMENT", nil
+	case tokIdent:
+		tok := p.advance()
+		return tok.Str, nil
+	default:
+		return "", p.syntaxErrorAtCur()
+	}
+}
+
+// parseUnsetTagList parses TAG ( name [, name ...] ) for UNSET TAG clauses.
+// Consumes the TAG keyword and the parenthesized name list.
+func (p *Parser) parseUnsetTagList() ([]*ast.ObjectName, error) {
+	if _, err := p.expect(kwTAG); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect('('); err != nil {
+		return nil, err
+	}
+
+	var names []*ast.ObjectName
+	for p.cur.Type != ')' && p.cur.Type != tokEOF {
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+		if p.cur.Type == ',' {
+			p.advance() // consume ','
+		} else {
+			break
+		}
+	}
+
+	if _, err := p.expect(')'); err != nil {
+		return nil, err
+	}
+	return names, nil
+}

@@ -1,0 +1,552 @@
+// Package parser — F4 parser entry point and dispatch framework.
+//
+// The Parser struct, Parse function, and ParseBestEffort function defined
+// in this file provide the public recursive-descent parser API for
+// Snowflake SQL. Actual per-statement parsing is stubbed out — F4 ships
+// only the framework. Each concrete statement type (SELECT, INSERT,
+// CREATE, etc.) is added by Tier 1+ DAG nodes that replace specific
+// dispatch cases in parseStmt below.
+//
+// See docs/specs/2026-04-09-snowflake-parser-entry-design.md
+// for the design rationale.
+package parser
+
+import (
+	"strings"
+
+	"github.com/Dxlxz/orrery-sql/snowflake/ast"
+)
+
+// Parser is a recursive-descent parser for Snowflake SQL. It operates
+// on a single segment of input (one top-level statement produced by
+// F3's Split) at a time; callers should use Parse or ParseBestEffort
+// instead of constructing Parsers directly.
+type Parser struct {
+	lexer *Lexer
+	input string // the segment text (used for error reporting and raw-source slicing)
+	base  int    // byte offset of input within the original source; absolute token
+	// Locs are input-relative + base. Used to slice input by Loc.
+	cur     Token        // current token
+	prev    Token        // previous token (for error context)
+	nextBuf Token        // buffered lookahead token
+	hasNext bool         // whether nextBuf is valid
+	errors  []ParseError // collected errors for best-effort mode
+	// inConnectBy is true while parsing a CONNECT BY condition, where PRIOR
+	// is a prefix operator rather than a (non-reserved) identifier. Gating
+	// PRIOR on this flag avoids mis-parsing a column literally named "prior"
+	// in ordinary expression positions.
+	inConnectBy bool
+	// scriptDepth bounds Snowflake Scripting block / control-flow nesting
+	// (T7.1). It is incremented on entry to every nested scripting construct and
+	// checked against maxScriptDepth so a pathologically deep (or adversarial)
+	// body cannot blow the Go stack. See scripting.go.
+	scriptDepth int
+	depth       int // nesting depth of the productions being parsed (see enterNesting)
+}
+
+// advance consumes the current token and moves to the next one.
+// Returns the token that was just consumed (the new "previous" token).
+func (p *Parser) advance() Token {
+	p.prev = p.cur
+	if p.hasNext {
+		p.cur = p.nextBuf
+		p.hasNext = false
+	} else {
+		p.cur = p.lexer.NextToken()
+	}
+	return p.prev
+}
+
+// repositionLexer resets the lexer to the given LOCAL (unshifted) byte offset
+// and re-primes p.cur from there, discarding any buffered lookahead and the
+// previous current token. It is used by clauses (such as MATCH_RECOGNIZE's
+// PATTERN body) that consume a run of input by raw byte scanning rather than
+// token-by-token, and then need the token stream to resume at a known point.
+func (p *Parser) repositionLexer(localPos int) {
+	p.lexer.pos = localPos
+	p.hasNext = false
+	p.cur = p.lexer.NextToken()
+}
+
+// peek returns the current token without consuming it.
+func (p *Parser) peek() Token {
+	return p.cur
+}
+
+// peekNext returns the token AFTER the current one without consuming it
+// (one-token lookahead beyond cur). Used to disambiguate based on the
+// token following the current position.
+func (p *Parser) peekNext() Token {
+	if !p.hasNext {
+		p.nextBuf = p.lexer.NextToken()
+		p.hasNext = true
+	}
+	return p.nextBuf
+}
+
+// match tries each given token type; if cur matches any, it is consumed
+// and returned with ok=true. Used for optional tokens.
+func (p *Parser) match(types ...int) (Token, bool) {
+	for _, t := range types {
+		if p.cur.Type == t {
+			return p.advance(), true
+		}
+	}
+	return Token{}, false
+}
+
+// expect consumes the current token if it matches the expected type.
+// Otherwise returns a ParseError describing the mismatch.
+func (p *Parser) expect(tokenType int) (Token, error) {
+	if p.cur.Type == tokenType {
+		return p.advance(), nil
+	}
+	return Token{}, p.syntaxErrorAtCur()
+}
+
+// syntaxErrorAtCur returns a *ParseError describing a syntax error at
+// the current token position. If cur is tokEOF, the message says "at
+// end of input"; otherwise "at or near X".
+func (p *Parser) syntaxErrorAtCur() *ParseError {
+	var msg string
+	if p.cur.Type == tokEOF {
+		msg = "syntax error at end of input"
+	} else {
+		text := p.cur.Str
+		if text == "" {
+			text = TokenName(p.cur.Type)
+		}
+		msg = "syntax error at or near " + text
+	}
+	return &ParseError{
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: msg,
+	}
+}
+
+// skipToNextStatement advances the parser past the current erroneous
+// statement to the next ; at depth 0 within the current segment, or to
+// tokEOF. Always consumes at least one token to guarantee progress.
+//
+// Because Parse uses F3.Split to pre-segment the input, each segment
+// usually contains one statement — skipToNextStatement's typical behavior
+// inside a segment is to advance to EOF.
+func (p *Parser) skipToNextStatement() {
+	// Always consume at least one token to avoid infinite loops.
+	if p.cur.Type != tokEOF {
+		p.advance()
+	}
+	depth := 0
+	for p.cur.Type != tokEOF {
+		switch p.cur.Type {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case ';':
+			if depth == 0 {
+				p.advance()
+				return
+			}
+		}
+		p.advance()
+	}
+}
+
+// unsupported emits a "statement type X not yet supported" ParseError at
+// the current token, advances to the next statement boundary, and
+// returns (nil, err). Used by every stubbed dispatch case in F4.
+//
+// Tier 1+ DAG nodes REPLACE individual dispatch cases with real parse
+// functions. Those real functions do NOT call unsupported — they consume
+// tokens themselves and produce real AST nodes.
+func (p *Parser) unsupported(stmtName string) (ast.Node, error) {
+	err := &ParseError{
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: stmtName + " statement parsing is not yet supported",
+	}
+	p.skipToNextStatement()
+	return nil, err
+}
+
+// unknownStatementError reports a statement that starts with a token
+// the dispatch switch doesn't recognize. It is called from the default
+// branch of parseStmt.
+func (p *Parser) unknownStatementError() *ParseError {
+	if p.cur.Type == tokEOF {
+		return &ParseError{
+			Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+			Message: "syntax error at end of input",
+		}
+	}
+	tokText := p.cur.Str
+	if tokText == "" {
+		tokText = TokenName(p.cur.Type)
+	}
+	return &ParseError{
+		Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+		Message: "unknown or unsupported statement starting with " + tokText,
+	}
+}
+
+// parseStmt parses one top-level statement. It dispatches on the first
+// keyword. For stubs-only F4, every dispatch case calls the unsupported
+// helper that appends a "not yet supported" ParseError and returns
+// (nil, err).
+//
+// Tier 1+ DAG nodes REPLACE specific cases with real implementations.
+// The dispatch switch itself is not expected to change — only the
+// bodies of individual case branches.
+//
+// EXECUTE (IMMEDIATE / TASK) is absent from F2's keyword table, so it is
+// dispatched from the default branch by its uppercased identifier text
+// (alongside LS / RM) rather than from a keyword case here.
+//
+// Other keywords NOT in this switch (SAVEPOINT, WHILE, REPEAT, LET, LOOP,
+// BREAK) are currently absent from F2's keyword table because they're either
+// missing from the legacy grammar or defined via non-standard ANTLR rule forms.
+// When Tier 7 Snowflake Scripting support lands, F2 gains those constants and
+// this switch gains matching cases.
+func (p *Parser) parseStmt() (ast.Node, error) {
+	if err := p.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer p.leaveNesting()
+	switch p.cur.Type {
+	// DDL (6 cases)
+	case kwCREATE:
+		return p.parseCreateStmt()
+	case kwALTER:
+		return p.parseAlterStmt()
+	case kwDROP:
+		return p.parseDropStmt()
+	case kwUNDROP:
+		return p.parseUndropStmt()
+	case kwTRUNCATE:
+		return p.parseTruncateStmt()
+	case kwCOMMENT:
+		return p.parseCommentStmt()
+
+	// DML (12 cases)
+	case kwSELECT:
+		return p.parseQueryExpr()
+	case '(':
+		// Parenthesized query expression at top level, e.g. (SELECT 1) UNION (SELECT 2).
+		// Delegate to parseQueryExpr which handles the leading '('.
+		return p.parseQueryExpr()
+	case kwWITH:
+		return p.parseWithQueryExpr()
+	case kwINSERT:
+		return p.parseInsertStmt()
+	case kwUPDATE:
+		return p.parseUpdateStmt()
+	case kwDELETE:
+		return p.parseDeleteStmt()
+	case kwMERGE:
+		return p.parseMergeStmt()
+	case kwCOPY:
+		return p.parseCopyStmt()
+	case kwPUT:
+		return p.parsePutStmt()
+	case kwGET:
+		return p.parseGetStmt()
+	case kwLIST:
+		return p.parseListStmt(false)
+	case kwREMOVE:
+		return p.parseRemoveStmt(false)
+	case kwCALL:
+		return p.parseCallStmt()
+
+	// DCL (2 cases)
+	case kwGRANT:
+		return p.parseGrantStmt()
+	case kwREVOKE:
+		return p.parseRevokeStmt()
+
+	// TCL (4 cases)
+	case kwBEGIN:
+		// BEGIN is overloaded: a TCL transaction opener
+		// (BEGIN [WORK|TRANSACTION] [NAME ...]) versus a Snowflake Scripting
+		// block (BEGIN <stmts> [EXCEPTION ...] END). Disambiguate on the token
+		// after BEGIN: WORK / TRANSACTION / NAME / ; / EOF → TCL; anything else
+		// opens a scripting block. See beginIsTransaction.
+		if p.beginIsTransaction() {
+			return p.parseBeginStmt()
+		}
+		return p.parseScriptBlock()
+	case kwSTART:
+		return p.parseStartTransactionStmt()
+	case kwCOMMIT:
+		return p.parseCommitStmt()
+	case kwROLLBACK:
+		return p.parseRollbackStmt()
+
+	// Info / inspection (5 cases)
+	case kwSHOW:
+		return p.parseShowStmt()
+	case kwDESCRIBE:
+		return p.parseDescribeStmt(false)
+	case kwDESC:
+		return p.parseDescribeStmt(true)
+	case kwEXPLAIN:
+		return p.parseExplainStmt()
+	case kwUSE:
+		return p.parseUseStmt()
+
+	// Session (2 cases)
+	case kwSET:
+		return p.parseSetStmt()
+	case kwUNSET:
+		return p.parseUnsetStmt()
+
+	// Snowflake Scripting (T7.1). A top-level DECLARE opens a scripting block
+	// (DECLARE <decls> BEGIN <stmts> ... END). The remaining scripting
+	// keywords introduce individual scripting statements; Snowflake itself
+	// only accepts them inside a block, but orrery parses them structurally at
+	// the top level too (a lenient superset, flagged in the divergence ledger)
+	// so best-effort parsing of partial / extracted bodies still yields an AST.
+	case kwDECLARE:
+		return p.parseScriptBlock()
+	case kwIF, kwCASE, kwFOR, kwRETURN, kwCONTINUE,
+		kwSCRIPT_WHILE, kwSCRIPT_LOOP, kwSCRIPT_REPEAT, kwSCRIPT_LET,
+		kwSCRIPT_BREAK, kwSCRIPT_EXIT, kwSCRIPT_ITERATE, kwSCRIPT_RAISE,
+		kwSCRIPT_OPEN, kwSCRIPT_CLOSE, kwFETCH:
+		return p.parseScriptStatement()
+
+	default:
+		// LS and RM are the documented aliases of LIST and REMOVE. EXECUTE
+		// (IMMEDIATE / TASK) is likewise absent from the keyword table.
+		// Snowflake's lexer (and orrery's) does not reserve any of them, so they
+		// arrive as plain identifiers and are dispatched here by uppercased text.
+		if p.cur.Type == tokIdent {
+			switch strings.ToUpper(p.cur.Str) {
+			case "LS":
+				return p.parseListStmt(true)
+			case "RM":
+				return p.parseRemoveStmt(true)
+			case "EXECUTE":
+				return p.parseExecuteStmt()
+			}
+		}
+		return nil, p.unknownStatementError()
+	}
+}
+
+// parseTopStmt parses one top-level statement and applies the Snowflake
+// result-pipe operator `->>` when it follows:
+//
+//	<source-stmt> ->> <query>
+//
+// The source statement (typically a SHOW / metadata command) runs and exposes
+// its result set to the right-hand query as `$1`. `->>` is a top-level-only
+// construct in Snowflake, so it is recognized here — at the genuine statement
+// entry (parseSingle) — and NOT inside nested statement contexts (procedure
+// bodies, EXECUTE IMMEDIATE, pipe/task/dynamic-table bodies, scripting), all of
+// which call parseStmt directly and are therefore unaffected. Chained pipes
+// (`a ->> b ->> c`) nest left-associatively.
+func (p *Parser) parseTopStmt() (ast.Node, error) {
+	// Capture the start offset from the first token: the source statement may be
+	// a node type (e.g. *ShowStmt) that ast.NodeLoc does not cover, so we cannot
+	// rely on NodeLoc(stmt) for the wrapper's start.
+	startOff := p.cur.Loc.Start
+	stmt, err := p.parseStmt()
+	if err != nil {
+		return nil, err
+	}
+	for p.cur.Type == tokFlow {
+		p.advance() // consume '->>'
+		query, qerr := p.parseQueryExpr()
+		if qerr != nil {
+			return nil, qerr
+		}
+		stmt = &ast.ResultScanStmt{
+			Source: stmt,
+			Query:  query,
+			Loc:    ast.Loc{Start: startOff, End: p.prev.Loc.End},
+		}
+	}
+	return stmt, nil
+}
+
+// ParseResult holds the outcome of a best-effort parse. File contains
+// all successfully-parsed statements (empty for stubs-only F4); Errors
+// contains every ParseError encountered plus any LexErrors promoted
+// from the underlying Lexer.
+type ParseResult struct {
+	File   *ast.File
+	Errors []ParseError
+}
+
+// Parse is the strict entry point: returns the first error if any
+// statement fails. Callers that want partial results should use
+// ParseBestEffort instead.
+//
+// Strictness includes trailing-token rejection: after each statement
+// parses, the next token must be `;` or end-of-segment. Inputs like
+// `SELECT * FFROM users` (where the parser consumes only the valid
+// `SELECT *` prefix) therefore fail with "syntax error at or near FFROM"
+// instead of silently dropping the rest.
+//
+// The returned *ast.File always reflects whatever statements parsed
+// successfully before the first error — even in the error case, the
+// File may be non-empty.
+func Parse(input string) (*ast.File, error) {
+	result := ParseStrict(input)
+	if len(result.Errors) > 0 {
+		return result.File, &result.Errors[0]
+	}
+	return result.File, nil
+}
+
+// ParseStrict runs the same segmentation and per-statement parsing as
+// ParseBestEffort, but applies the strict trailing-token check: a
+// statement followed by anything other than `;` or end-of-segment gets a
+// "syntax error at or near <token>" ParseError at the first stray token.
+// All errors across all statements are collected (per-statement
+// reporting), so diagnostics callers see every offending statement, not
+// just the first.
+//
+// This is the entry point for diagnostics.Analyze and any consumer that
+// must REJECT garbage suffixes rather than tolerate them.
+func ParseStrict(input string) *ParseResult {
+	return parseAll(input, true)
+}
+
+// ParseBestEffort runs F3's Split to segment the input, then parses each
+// segment. Errors from individual segments are collected; all
+// successfully-parsed statements are appended to the result File.
+//
+// Unlike Parse / ParseStrict, ParseBestEffort TOLERATES unconsumed
+// trailing tokens after a successfully-parsed statement prefix: partial
+// or in-progress input such as `SELECT a FROM` + stray fragments still
+// yields whatever prefix parsed. Completion and other partial-input
+// callers depend on this tolerance — do not add the strict
+// trailing-token check here.
+func ParseBestEffort(input string) *ParseResult {
+	return parseAll(input, false)
+}
+
+// parseAll is the shared implementation behind ParseStrict and
+// ParseBestEffort: Split the input, parse each segment, collect nodes and
+// errors. strictTrailing selects whether parseSegment rejects unconsumed
+// trailing tokens.
+func parseAll(input string, strictTrailing bool) *ParseResult {
+	file := &ast.File{Loc: ast.Loc{Start: 0, End: len(input)}}
+	result := &ParseResult{File: file}
+
+	for _, seg := range Split(input) {
+		node, errs := parseSegment(seg.Text, seg.ByteStart, strictTrailing)
+		if node != nil {
+			file.Stmts = append(file.Stmts, node)
+		}
+		result.Errors = append(result.Errors, errs...)
+	}
+
+	// Split drops segments that lex to nothing, and with them their lex
+	// errors: Parse("/* unterminated") produced zero segments and zero
+	// errors. Strict mode lexes the whole input once more and promotes any
+	// error the per-segment parses did not already report (matched by
+	// position; segment offsets are absolute).
+	if strictTrailing {
+		lx := NewLexer(input)
+		for lx.NextToken().Type != tokEOF {
+		}
+		if lexErrs := lx.Errors(); len(lexErrs) > 0 {
+			// Matched through a set: scanning result.Errors once per lex
+			// error was quadratic in the number of errors.
+			reported := make(map[int]bool, len(result.Errors)+len(lexErrs))
+			for _, e := range result.Errors {
+				reported[e.Position] = true
+			}
+			for _, le := range lexErrs {
+				if reported[le.Loc.Start] {
+					continue
+				}
+				reported[le.Loc.Start] = true
+				result.Errors = append(result.Errors, ParseError{Position: le.Loc.Start, End: le.Loc.End, Message: le.Msg})
+			}
+		}
+	}
+
+	return result
+}
+
+// parseSingle parses one segment (one top-level statement) into a single
+// ast.Node with the STRICT trailing-token check enabled. It is the
+// internal single-statement entry used by tests (including the
+// whole-corpus closure gate, so every corpus statement also proves it
+// leaves no unconsumed tokens behind).
+func parseSingle(segText string, baseOffset int) (ast.Node, []ParseError) {
+	return parseSegment(segText, baseOffset, true)
+}
+
+// parseSegment parses one segment (one top-level statement) into a single
+// ast.Node. Returns (node, errors) where node may be nil if the segment
+// failed to parse and errors is the list of ParseErrors encountered,
+// including any LexErrors promoted from the underlying Lexer.
+//
+// segText is the statement text (without the trailing ; delimiter); it
+// comes from F3.Segment.Text. baseOffset is the byte offset of segText
+// within the original input — passed to NewLexerWithOffset so token Loc
+// values are absolute.
+//
+// strictTrailing controls the trailing-token check: when true, a
+// successfully-parsed statement must be followed by `;` or end-of-segment;
+// any other token produces a "syntax error at or near <token>" ParseError
+// at the stray token's position (the historical behavior — silently
+// ignoring the unconsumed tail, e.g. `SELECT * FFROM users` parsing clean
+// as `SELECT *` — is preserved only for the best-effort path).
+func parseSegment(segText string, baseOffset int, strictTrailing bool) (ast.Node, []ParseError) {
+	p := &Parser{
+		lexer: NewLexerWithOffset(segText, baseOffset),
+		input: segText,
+		base:  baseOffset,
+	}
+	p.advance() // prime cur with the first token
+
+	var result ast.Node
+	if p.cur.Type != tokEOF {
+		first := p.cur.Loc
+		node, err := p.parseTopStmt()
+		if err == nil && treeTooHigh(node, p.prev.Loc.End-first.Start) {
+			node, err = nil, nestedTooDeeply(first)
+		}
+		if err != nil {
+			if pe, ok := err.(*ParseError); ok {
+				p.errors = append(p.errors, *pe)
+			} else {
+				p.errors = append(p.errors, ParseError{
+					Position: p.cur.Loc.Start, End: p.cur.Loc.End,
+					Message: err.Error(),
+				})
+			}
+		} else if strictTrailing {
+			// The statement parsed cleanly: the only legal continuations
+			// are end-of-segment or a `;` statement terminator (Split
+			// strips the terminator, so EOF is the common case; `;` shows
+			// up when callers hand un-split text to the parser).
+			// Anything else is a trailing run the parser used to drop
+			// silently — report it at the first stray token, then recover
+			// to the next statement boundary so the rest of the tail
+			// (including any lex errors in it) is still scanned.
+			for p.cur.Type == ';' {
+				p.advance()
+			}
+			if p.cur.Type != tokEOF {
+				p.errors = append(p.errors, *p.syntaxErrorAtCur())
+				p.skipToNextStatement()
+			}
+		}
+		result = node
+	}
+
+	// Promote any lex errors into ParseErrors. The Lexer's Errors()
+	// getter returns positions already shifted by baseOffset.
+	for _, le := range p.lexer.Errors() {
+		p.errors = append(p.errors, ParseError{Position: le.Loc.Start, End: le.Loc.End, Message: le.Msg})
+	}
+
+	return result, p.errors
+}

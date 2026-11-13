@@ -1,0 +1,565 @@
+// Package parser - declare_set.go implements T-SQL DECLARE and SET statement parsing.
+package parser
+
+import (
+	"fmt"
+	"strings"
+
+	nodes "github.com/Dxlxz/orrery-sql/mssql/ast"
+)
+
+// setOptions defines the valid option names for SET <option> ON/OFF/value statements.
+// This combines:
+//   - Predicate SET options (from SqlScriptDOM PredicateSetOptionsHelper — 25 options)
+//   - General SET commands (from SqlScriptDOM GeneralSetCommandTypeHelper — 7 options)
+//   - SET ROWCOUNT / SET TEXTSIZE / SET STATISTICS (keyword-based)
+var setOptions = newOptionSet(
+	// Registered keywords that are valid SET options:
+	kwNOCOUNT,    // SET NOCOUNT ON/OFF
+	kwXACT_ABORT, // SET XACT_ABORT ON/OFF
+	kwROWCOUNT,   // SET ROWCOUNT n
+	kwTEXTSIZE,   // SET TEXTSIZE n
+	kwSTATISTICS, // SET STATISTICS IO/TIME/PROFILE/XML ON/OFF
+	kwLANGUAGE,   // SET LANGUAGE ...
+).withIdents(
+	// Predicate SET options (scanned as identifiers):
+	"QUOTED_IDENTIFIER",
+	"CONCAT_NULL_YIELDS_NULL",
+	"CURSOR_CLOSE_ON_COMMIT",
+	"ARITHABORT",
+	"ARITHIGNORE",
+	"FMTONLY",
+	"NOEXEC",
+	"NUMERIC_ROUNDABORT",
+	"PARSEONLY",
+	"ANSI_DEFAULTS",
+	"ANSI_NULL_DFLT_OFF",
+	"ANSI_NULL_DFLT_ON",
+	"ANSI_NULLS",
+	"ANSI_PADDING",
+	"ANSI_WARNINGS",
+	"FORCEPLAN",
+	"SHOWPLAN_ALL",
+	"SHOWPLAN_TEXT",
+	"SHOWPLAN_XML",
+	"IMPLICIT_TRANSACTIONS",
+	"REMOTE_PROC_TRANSACTIONS",
+	"DISABLE_DEF_CNST_CHK",
+	"NO_BROWSETABLE",
+	// General SET commands (scanned as identifiers):
+	"DATEFORMAT",
+	"DATEFIRST",
+	"DEADLOCK_PRIORITY",
+	"LOCK_TIMEOUT",
+	"QUERY_GOVERNOR_COST_LIMIT",
+	"CONTEXT_INFO",
+)
+
+// setOnOffListOptions are the setOptions that may share one ON or OFF with
+// others in a list: SET ANSI_NULLS, QUOTED_IDENTIFIER OFF. SQL Server 2022
+// rejects SHOWPLAN_ALL, SHOWPLAN_TEXT, and SHOWPLAN_XML in a list ("The SET
+// SHOWPLAN statements must be the only statements in the batch") and does not
+// recognize DISABLE_DEF_CNST_CHK, so neither is listed here.
+var setOnOffListOptions = newOptionSet(
+	kwNOCOUNT,
+	kwXACT_ABORT,
+).withIdents(
+	"QUOTED_IDENTIFIER",
+	"CONCAT_NULL_YIELDS_NULL",
+	"CURSOR_CLOSE_ON_COMMIT",
+	"ARITHABORT",
+	"ARITHIGNORE",
+	"FMTONLY",
+	"NOEXEC",
+	"NUMERIC_ROUNDABORT",
+	"PARSEONLY",
+	"ANSI_DEFAULTS",
+	"ANSI_NULL_DFLT_OFF",
+	"ANSI_NULL_DFLT_ON",
+	"ANSI_NULLS",
+	"ANSI_PADDING",
+	"ANSI_WARNINGS",
+	"FORCEPLAN",
+	"IMPLICIT_TRANSACTIONS",
+	"REMOTE_PROC_TRANSACTIONS",
+	"NO_BROWSETABLE",
+)
+
+// setStatisticsOptions are the options of SET STATISTICS, which may also be
+// listed: SET STATISTICS IO, TIME ON.
+var setStatisticsOptions = newOptionSet(
+	kwTIME,
+	kwXML,
+).withIdents(
+	"IO",
+	"PROFILE",
+)
+
+// parseDeclareStmt parses a DECLARE statement.
+//
+// BNF: mssql/parser/bnf/declare-local-variable-transact-sql.bnf
+//
+//	DECLARE
+//	{
+//	  { @local_variable [AS] data_type [ = value ] }
+//	  | { @cursor_variable_name CURSOR }
+//	  | { @table_variable_name [AS] TABLE ( { <column_definition> | <table_constraint> | <table_index> } [ , ...n ] ) }
+//	} [ , ...n ]
+func (p *Parser) parseDeclareStmt() (*nodes.DeclareStmt, error) {
+	loc := p.pos()
+	p.advance() // consume DECLARE
+
+	// Completion: after DECLARE → @ variable
+	if p.collectMode() {
+		p.addRuleCandidate("@variable")
+		return nil, errCollecting
+	}
+
+	stmt := &nodes.DeclareStmt{
+		Loc: nodes.Loc{Start: loc, End: -1},
+	}
+
+	var vars []nodes.Node
+	for {
+		vd, err := p.parseVariableDecl()
+		if err != nil {
+			return nil, err
+		}
+		if vd == nil {
+			break
+		}
+		vars = append(vars, vd)
+		if _, ok := p.match(','); !ok {
+			break
+		}
+	}
+	stmt.Variables = &nodes.List{Items: vars}
+
+	stmt.Loc.End = p.prevEnd()
+	return stmt, nil
+}
+
+// parseVariableDecl parses a single variable declaration.
+//
+// BNF: mssql/parser/bnf/declare-local-variable-transact-sql.bnf
+//
+//	@local_variable [AS] data_type [ = value ]
+//	| @cursor_variable_name CURSOR
+//	| @table_variable_name [AS] TABLE ( { <column_definition> | <table_constraint> | <table_index> } [ , ...n ] )
+func (p *Parser) parseVariableDecl() (*nodes.VariableDecl, error) {
+	if p.cur.Type != tokVARIABLE {
+		return nil, nil
+	}
+
+	loc := p.pos()
+	vd := &nodes.VariableDecl{
+		Name: p.cur.Str,
+		Loc:  nodes.Loc{Start: loc, End: -1},
+	}
+	p.advance() // consume @var
+
+	// Completion: after DECLARE @v → type_name
+	if p.collectMode() {
+		p.addRuleCandidate("type_name")
+		return nil, errCollecting
+	}
+
+	// Optional AS keyword
+	p.match(kwAS)
+
+	// TABLE type
+	if p.cur.Type == kwTABLE {
+		p.advance()
+		vd.IsTable = true
+		if p.cur.Type == '(' {
+			p.advance()
+			var cols []nodes.Node
+			for p.cur.Type != ')' && p.cur.Type != tokEOF {
+				// Near-CREATE TABLE element grammar: a table variable body
+				// takes column definitions, UNNAMED table constraints
+				// (PRIMARY KEY/UNIQUE/CHECK — the CONSTRAINT name prefix is
+				// rejected by the engine in this context, verified on SQL
+				// Server 2019: Msg 156), and indexes.
+				if p.cur.Type == kwPRIMARY ||
+					p.cur.Type == kwUNIQUE || p.cur.Type == kwCHECK {
+					constraint, err := p.parseTableConstraint()
+					if err != nil {
+						return nil, err
+					}
+					if constraint != nil {
+						cols = append(cols, constraint)
+					}
+				} else if p.cur.Type == kwINDEX {
+					idx, err := p.parseInlineTableIndex()
+					if err != nil {
+						return nil, err
+					}
+					if idx != nil {
+						cols = append(cols, idx)
+					}
+				} else {
+					col, err := p.parseColumnDef()
+					if err != nil {
+						return nil, err
+					}
+					if col != nil {
+						cols = append(cols, col)
+					}
+				}
+				if _, ok := p.match(','); !ok {
+					break
+				}
+			}
+			if _, err := p.expect(')'); err != nil {
+				return nil, err
+			}
+			vd.TableDef = &nodes.List{Items: cols}
+		}
+		vd.Loc.End = p.prevEnd()
+		return vd, nil
+	}
+
+	// CURSOR type
+	if p.cur.Type == kwCURSOR {
+		p.advance()
+		vd.IsCursor = true
+		vd.Loc.End = p.prevEnd()
+		return vd, nil
+	}
+
+	// Data type
+	dt, err := p.parseDataType()
+	if err != nil {
+		return nil, err
+	}
+	if dt == nil {
+		return nil, p.newParseError(p.cur.Loc, "expected data type in variable declaration")
+	}
+	vd.DataType = dt
+
+	// Optional default value
+	if p.cur.Type == '=' {
+		p.advance()
+		var err error
+		vd.Default, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	vd.Loc.End = p.prevEnd()
+	return vd, nil
+}
+
+// parseSetStmt parses a SET statement.
+//
+// BNF: mssql/parser/bnf/set-transact-sql.bnf
+//
+//	SET @local_variable { = | += | -= | *= | /= | %= | &= | ^= | |= } expression
+//	SET @local_variable.property_name = expression
+//	SET @local_variable = CURSOR [ FORWARD_ONLY | SCROLL ] ... FOR select_statement
+//
+// BNF: mssql/parser/bnf/set-transaction-isolation-level-transact-sql.bnf
+//
+//	SET TRANSACTION ISOLATION LEVEL
+//	    { READ UNCOMMITTED | READ COMMITTED | REPEATABLE READ | SNAPSHOT | SERIALIZABLE }
+//
+// SET session options:
+//
+//	SET { option_name } { ON | OFF | value }
+//	SET option_name [ , ...n ] { ON | OFF }
+//	SET IDENTITY_INSERT table_name { ON | OFF }
+//	SET STATISTICS { IO | TIME | PROFILE | XML } [ , ...n ] { ON | OFF }
+func (p *Parser) parseSetStmt() (nodes.StmtNode, error) {
+	loc := p.pos()
+	p.advance() // consume SET
+
+	// Completion: after SET → @variable, session option keywords
+	if p.collectMode() {
+		p.addRuleCandidate("@variable")
+		p.addTokenCandidate(kwNOCOUNT)
+		p.addTokenCandidate(kwXACT_ABORT)
+		return nil, errCollecting
+	}
+
+	if p.cur.Type == tokVARIABLE {
+		// SET @var { = | += | -= | *= | /= | %= | &= | ^= | |= } expr
+		stmt := &nodes.SetStmt{
+			Loc: nodes.Loc{Start: loc, End: -1},
+		}
+		stmt.Variable = p.cur.Str
+		p.advance()
+		// Completion: after SET @v = → expression context
+		if p.cur.Type == '=' {
+			p.advance()
+			if p.collectMode() {
+				p.addRuleCandidate("columnref")
+				p.addRuleCandidate("func_name")
+				return nil, errCollecting
+			}
+			val, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				return nil, p.newParseError(p.cur.Loc, "expected expression after SET =")
+			}
+			stmt.Value = val
+			stmt.Loc.End = p.prevEnd()
+			return stmt, nil
+		}
+		// Check for compound assignment operators or simple =
+		if op := p.isCompoundAssign(); op != "" {
+			stmt.Operator = op
+			p.advance()
+			val, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				return nil, p.newParseError(p.cur.Loc, "expected expression after SET assignment operator")
+			}
+			stmt.Value = val
+		} else if _, err := p.expect('='); err == nil {
+			val, err2 := p.parseExpr()
+			if err2 != nil {
+				return nil, err2
+			}
+			if val == nil {
+				return nil, p.newParseError(p.cur.Loc, "expected expression after SET =")
+			}
+			stmt.Value = val
+		}
+		stmt.Loc.End = p.prevEnd()
+		return stmt, nil
+	}
+
+	// SET session option
+	stmt, err := p.parseSetOptionStmt(loc)
+	return stmt, err
+}
+
+// parseSetOptionStmt parses SET session option statements.
+//
+// BNF: mssql/parser/bnf/set-transact-sql.bnf
+// BNF: mssql/parser/bnf/set-transaction-isolation-level-transact-sql.bnf
+// BNF: mssql/parser/bnf/set-ansi-defaults-transact-sql.bnf (predicateSetStatement)
+// BNF: mssql/parser/bnf/set-statistics-transact-sql.bnf (setStatisticsStatement)
+//
+//	SET TRANSACTION ISOLATION LEVEL
+//	    { READ UNCOMMITTED | READ COMMITTED | REPEATABLE READ | SNAPSHOT | SERIALIZABLE }
+//	SET IDENTITY_INSERT table_name { ON | OFF }
+//	SET { option_name } { ON | OFF | value }
+//	SET option_name [ , ...n ] { ON | OFF }
+//	SET STATISTICS { IO | TIME | PROFILE | XML } [ , ...n ] { ON | OFF }
+//
+// The list form is the one the indexed views reference uses:
+// https://learn.microsoft.com/en-us/sql/relational-databases/views/create-indexed-views
+func (p *Parser) parseSetOptionStmt(loc int) (*nodes.SetOptionStmt, error) {
+	stmt := &nodes.SetOptionStmt{
+		Loc: nodes.Loc{Start: loc, End: -1},
+	}
+
+	// TRANSACTION ISOLATION LEVEL
+	if p.cur.Type == kwTRANSACTION {
+		p.advance() // consume TRANSACTION
+		// ISOLATION
+		if p.cur.Type == kwISOLATION {
+			p.advance()
+		}
+		// LEVEL
+		if p.cur.Type == kwLEVEL {
+			p.advance()
+		}
+		// isolation level name: READ UNCOMMITTED / READ COMMITTED / REPEATABLE READ / SNAPSHOT / SERIALIZABLE
+		stmt.Option = "TRANSACTION ISOLATION LEVEL"
+		valLoc := p.pos()
+		var level string
+		if p.cur.Type == kwREAD {
+			p.advance() // consume READ
+			if p.cur.Type == kwUNCOMMITTED {
+				p.advance()
+				level = "READ UNCOMMITTED"
+			} else if p.cur.Type == kwCOMMITTED {
+				p.advance()
+				level = "READ COMMITTED"
+			} else {
+				level = "READ"
+			}
+		} else if p.cur.Type == kwREPEATABLE {
+			p.advance() // consume REPEATABLE
+			if p.cur.Type == kwREAD {
+				p.advance()
+			}
+			level = "REPEATABLE READ"
+		} else if p.cur.Type == kwSERIALIZABLE {
+			p.advance()
+			level = "SERIALIZABLE"
+		} else if p.cur.Type == kwSNAPSHOT {
+			p.advance()
+			level = "SNAPSHOT"
+		}
+		stmt.Value = &nodes.ColumnRef{Column: level, Loc: nodes.Loc{Start: valLoc, End: p.prevEnd()}}
+		stmt.Options = []string{stmt.Option}
+		stmt.Loc.End = p.prevEnd()
+		return stmt, nil
+	}
+
+	// IDENTITY_INSERT table ON|OFF
+	if p.cur.Type == kwIDENTITY_INSERT {
+		p.advance() // consume IDENTITY_INSERT
+		stmt.Option = "IDENTITY_INSERT"
+		// table name
+		tableRef, _ := p.parseTableRef()
+		// ON or OFF
+		var onoff string
+		if p.cur.Type == kwON {
+			onoff = "ON"
+			p.advance()
+		} else if p.cur.Type == kwOFF {
+			onoff = "OFF"
+			p.advance()
+		}
+		valLoc := p.pos()
+		// Store "table ON/OFF" as option value
+		var tableName string
+		if tableRef != nil {
+			if tableRef.Schema != "" {
+				tableName = tableRef.Schema + "." + tableRef.Object
+			} else {
+				tableName = tableRef.Object
+			}
+		}
+		stmt.Value = &nodes.ColumnRef{Column: tableName + " " + onoff, Loc: nodes.Loc{Start: valLoc, End: -1}}
+		stmt.Options = []string{stmt.Option}
+		stmt.Loc.End = p.prevEnd()
+		return stmt, nil
+	}
+
+	// SET OFFSETS keyword_list { ON | OFF }
+	// BNF: mssql/parser/bnf/set-offsets-transact-sql.bnf
+	//
+	//	SET OFFSETS keyword_list { ON | OFF }
+	//	keyword_list: SELECT, FROM, ORDER, COMPUTE, TABLE, PROCEDURE, STATEMENT, PARAM, EXECUTE
+	if p.cur.Type == kwOFFSETS {
+		p.advance() // consume OFFSETS
+		stmt.Option = "OFFSETS"
+		// Collect comma-separated keyword list
+		var keywords []string
+		for {
+			if p.cur.Type == kwON || p.cur.Type == kwOFF {
+				break
+			}
+			if p.cur.Type == ';' || p.cur.Type == tokEOF || p.cur.Type == kwGO {
+				break
+			}
+			if p.cur.Type == ',' {
+				p.advance()
+				continue
+			}
+			keywords = append(keywords, strings.ToUpper(p.cur.Str))
+			p.advance()
+		}
+		if len(keywords) > 0 {
+			stmt.Option = "OFFSETS " + strings.Join(keywords, ", ")
+		}
+		if p.cur.Type == kwON {
+			onLoc := p.pos()
+			p.advance()
+			stmt.Value = &nodes.ColumnRef{Column: "ON", Loc: nodes.Loc{Start: onLoc, End: -1}}
+		} else if p.cur.Type == kwOFF {
+			offLoc := p.pos()
+			p.advance()
+			stmt.Value = &nodes.ColumnRef{Column: "OFF", Loc: nodes.Loc{Start: offLoc, End: -1}}
+		}
+		stmt.Options = []string{stmt.Option}
+		stmt.Loc.End = p.prevEnd()
+		return stmt, nil
+	}
+
+	// Generic option name — validated against setOptions
+	if !p.isValidOption(setOptions) {
+		return nil, p.newParseError(p.cur.Loc, "expected SET option name")
+	}
+	name := p.cur
+	listOptions, listPrefix := setOnOffListOptions, ""
+	stmt.Option = strings.ToUpper(p.cur.Str)
+	p.advance()
+
+	// STATISTICS IO|TIME|PROFILE|XML (multi-word option)
+	if stmt.Option == "STATISTICS" && p.isIdentLike() {
+		name = p.cur
+		listOptions, listPrefix = setStatisticsOptions, "STATISTICS "
+		stmt.Option = stmt.Option + " " + strings.ToUpper(p.cur.Str)
+		p.advance()
+	}
+	stmt.Options = []string{stmt.Option}
+
+	// SET option_name, option_name [, ...] { ON | OFF }
+	if p.cur.Type == ',' {
+		if !p.isSetListOption(name, listOptions) {
+			return nil, p.newParseError(name.Loc, fmt.Sprintf("SET %s cannot be listed with other options", stmt.Option))
+		}
+		for p.cur.Type == ',' {
+			p.advance() // consume ,
+			if !p.isSetListOption(p.cur, listOptions) {
+				return nil, p.syntaxErrorAtCur()
+			}
+			stmt.Options = append(stmt.Options, listPrefix+strings.ToUpper(p.cur.Str))
+			p.advance()
+		}
+		onOff := p.parseSetOnOff()
+		if onOff == nil {
+			return nil, p.syntaxErrorAtCur()
+		}
+		stmt.Value = onOff
+		stmt.Loc.End = p.prevEnd()
+		return stmt, nil
+	}
+
+	if onOff := p.parseSetOnOff(); onOff != nil {
+		stmt.Value = onOff
+	} else if p.cur.Type != ';' && p.cur.Type != tokEOF && p.cur.Type != kwGO {
+		// Could be SET ROWCOUNT n, SET LANGUAGE ..., SET DATEFORMAT ..., etc.
+		var err error
+		stmt.Value, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	stmt.Loc.End = p.prevEnd()
+	return stmt, nil
+}
+
+// isSetListOption reports whether tok names an option of opts that may appear
+// in a list of SET options. SQL Server does not accept a delimited name there:
+// it rejects SET ANSI_NULLS, [QUOTED_IDENTIFIER] ON.
+func (p *Parser) isSetListOption(tok Token, opts optionSet) bool {
+	if !p.isValidOptionToken(opts, tok) {
+		return false
+	}
+	if tok.Type == tokIDENT && tok.Loc >= 0 && tok.Loc < len(p.source) {
+		if c := p.source[tok.Loc]; c == '[' || c == '"' {
+			return false
+		}
+	}
+	return true
+}
+
+// parseSetOnOff consumes ON or OFF and returns it as a ColumnRef, or returns
+// nil when the current token is neither.
+func (p *Parser) parseSetOnOff() *nodes.ColumnRef {
+	var value string
+	switch p.cur.Type {
+	case kwON:
+		value = "ON"
+	case kwOFF:
+		value = "OFF"
+	default:
+		return nil
+	}
+	loc := p.pos()
+	p.advance()
+	return &nodes.ColumnRef{Column: value, Loc: nodes.Loc{Start: loc, End: p.prevEnd()}}
+}

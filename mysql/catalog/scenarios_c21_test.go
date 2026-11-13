@@ -1,0 +1,539 @@
+package catalog
+
+import (
+	"strings"
+	"testing"
+
+	nodes "github.com/Dxlxz/orrery-sql/mysql/ast"
+	"github.com/Dxlxz/orrery-sql/mysql/parser"
+)
+
+// TestScenario_C21 covers section C21 (Parser-level implicit defaults) from
+// SCENARIOS-mysql-implicit-behavior.md. Each subtest asserts that both real
+// MySQL 8.0 and the orrery AST / catalog agree on the default value that the
+// grammar fills in when the user omits a clause.
+//
+// Some of these scenarios are inherently parser-AST-level (JOIN type, ORDER
+// direction, LIMIT offset, INSERT column list) so they assert against the
+// parsed AST directly rather than via the catalog. DDL-level defaults
+// (DEFAULT NULL, FK actions, CREATE INDEX USING, CREATE VIEW ALGORITHM, ENGINE)
+// assert against both the container oracle and orrery's catalog.
+//
+// Failures are recorded in mysql/catalog/scenarios_bug_queue/c21.md.
+func TestScenario_C21(t *testing.T) {
+	mc, cleanup := scenarioContainer(t)
+	defer cleanup()
+
+	// --- 21.1 DEFAULT without value on nullable column -> DEFAULT NULL ----
+	t.Run("21_1_default_null_on_nullable", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		ddl := `CREATE TABLE t (a INT DEFAULT NULL);
+CREATE TABLE t2 (c INT);`
+		runOnBoth(t, mc, c, ddl)
+
+		// Oracle: column a has COLUMN_DEFAULT NULL, IS_NULLABLE YES.
+		var aDefault *string
+		var aNullable string
+		oracleScan(t, mc,
+			`SELECT COLUMN_DEFAULT, IS_NULLABLE FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t' AND COLUMN_NAME='a'`,
+			&aDefault, &aNullable)
+		if aDefault != nil {
+			t.Errorf("oracle: expected COLUMN_DEFAULT NULL for t.a, got %q", *aDefault)
+		}
+		assertStringEq(t, "oracle t.a IS_NULLABLE", aNullable, "YES")
+
+		// Oracle: column c (no DEFAULT clause at all) also has DEFAULT NULL.
+		var cDefault *string
+		var cNullable string
+		oracleScan(t, mc,
+			`SELECT COLUMN_DEFAULT, IS_NULLABLE FROM information_schema.COLUMNS
+               WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t2' AND COLUMN_NAME='c'`,
+			&cDefault, &cNullable)
+		if cDefault != nil {
+			t.Errorf("oracle: expected COLUMN_DEFAULT NULL for t2.c, got %q", *cDefault)
+		}
+		assertStringEq(t, "oracle t2.c IS_NULLABLE", cNullable, "YES")
+
+		// orrery: t.a explicit DEFAULT NULL — orrery should model this as Nullable
+		// true and either Default == nil or Default pointing at "NULL".
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+		} else {
+			col := tbl.GetColumn("a")
+			if col == nil {
+				t.Errorf("orrery: column t.a missing")
+			} else {
+				assertBoolEq(t, "orrery t.a nullable", col.Nullable, true)
+				if col.Default != nil && strings.ToUpper(*col.Default) != "NULL" {
+					t.Errorf("orrery: t.a Default = %q, want nil or NULL", *col.Default)
+				}
+			}
+		}
+
+		// orrery: t2.c — no DEFAULT clause at all. Expect Nullable true and
+		// Default == nil (orrery does not synthesize a "NULL" literal).
+		tbl2 := c.GetDatabase("testdb").GetTable("t2")
+		if tbl2 == nil {
+			t.Errorf("orrery: table t2 missing")
+		} else {
+			col := tbl2.GetColumn("c")
+			if col == nil {
+				t.Errorf("orrery: column t2.c missing")
+			} else {
+				assertBoolEq(t, "orrery t2.c nullable", col.Nullable, true)
+				if col.Default != nil && strings.ToUpper(*col.Default) != "NULL" {
+					t.Errorf("orrery: t2.c Default = %q, want nil (no clause)", *col.Default)
+				}
+			}
+		}
+	})
+
+	// --- 21.2 Bare JOIN -> INNER JOIN (JoinInner) --------------------------
+	t.Run("21_2_join_type_default_inner", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+		// Create tables so the container also accepts the SELECT.
+		runOnBoth(t, mc, c, `CREATE TABLE t1 (a INT); CREATE TABLE t2 (a INT);`)
+
+		cases := []struct {
+			name string
+			sql  string
+		}{
+			{"bare_JOIN", "SELECT * FROM t1 JOIN t2 ON t1.a = t2.a"},
+			{"INNER_JOIN", "SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.a"},
+			{"CROSS_JOIN", "SELECT * FROM t1 CROSS JOIN t2"},
+		}
+		for _, tc := range cases {
+			// Oracle: just ensure MySQL accepts it.
+			if _, err := mc.db.ExecContext(mc.ctx, "USE testdb; "+tc.sql); err != nil {
+				t.Errorf("oracle %s: %v", tc.name, err)
+			}
+
+			// orrery AST: parse and inspect JoinClause.Type.
+			jt, ok := c21FirstJoinType(t, tc.sql)
+			if !ok {
+				continue
+			}
+			// Grammar-level normalization: bare JOIN and INNER JOIN should both
+			// map to JoinInner. CROSS JOIN also maps to JoinInner per yacc but
+			// orrery tracks JoinCross distinctly for deparse fidelity, which is
+			// acceptable — assert that the bare forms collapse.
+			if tc.name == "CROSS_JOIN" {
+				if jt != nodes.JoinInner && jt != nodes.JoinCross {
+					t.Errorf("orrery %s: JoinType = %d, want JoinInner or JoinCross", tc.name, jt)
+				}
+			} else {
+				if jt != nodes.JoinInner {
+					t.Errorf("orrery %s: JoinType = %d, want JoinInner(%d)", tc.name, jt, nodes.JoinInner)
+				}
+			}
+		}
+	})
+
+	// --- 21.3 ORDER BY without direction -> tri-state ---------------------
+	t.Run("21_3_order_by_no_direction", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT);`)
+
+		// Oracle: MySQL accepts both; we cannot read ORDER_NOT_RELEVANT from
+		// info_schema directly, so just verify both parse.
+		for _, s := range []string{
+			"SELECT * FROM t ORDER BY a",
+			"SELECT * FROM t ORDER BY a ASC",
+		} {
+			if _, err := mc.db.ExecContext(mc.ctx, "USE testdb; "+s); err != nil {
+				t.Errorf("oracle %q: %v", s, err)
+			}
+		}
+
+		bare := c21FirstOrderByItem(t, "SELECT * FROM t ORDER BY a")
+		asc := c21FirstOrderByItem(t, "SELECT * FROM t ORDER BY a ASC")
+		if bare == nil || asc == nil {
+			return
+		}
+		assertBoolEq(t, "orrery bare ORDER BY Desc", bare.Desc, false)
+		assertBoolEq(t, "orrery ORDER BY ASC Desc", asc.Desc, false)
+		if bare.Direction != nodes.OrderDirectionDefault {
+			t.Errorf("orrery bare ORDER BY Direction = %d, want OrderDirectionDefault", bare.Direction)
+		}
+		if asc.Direction != nodes.OrderDirectionAsc {
+			t.Errorf("orrery ORDER BY ASC Direction = %d, want OrderDirectionAsc", asc.Direction)
+		}
+	})
+
+	// --- 21.4 LIMIT N without OFFSET -> opt_offset NULL -------------------
+	t.Run("21_4_limit_without_offset", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT);`)
+
+		// Oracle: verify both accept.
+		for _, s := range []string{
+			"SELECT * FROM t LIMIT 10",
+			"SELECT * FROM t LIMIT 10 OFFSET 0",
+		} {
+			if _, err := mc.db.ExecContext(mc.ctx, "USE testdb; "+s); err != nil {
+				t.Errorf("oracle %q: %v", s, err)
+			}
+		}
+
+		// orrery AST: LIMIT 10 -> Offset should be nil; LIMIT 10 OFFSET 0 ->
+		// Offset should be non-nil.
+		limBare := c21FirstLimit(t, "SELECT * FROM t LIMIT 10")
+		limOff := c21FirstLimit(t, "SELECT * FROM t LIMIT 10 OFFSET 0")
+		if limBare == nil {
+			t.Errorf("orrery: LIMIT 10 produced no Limit node")
+		} else if limBare.Offset != nil {
+			t.Errorf("orrery: LIMIT 10 Offset = %v, want nil", limBare.Offset)
+		}
+		if limOff == nil {
+			t.Errorf("orrery: LIMIT 10 OFFSET 0 produced no Limit node")
+		} else if limOff.Offset == nil {
+			t.Errorf("orrery: LIMIT 10 OFFSET 0 Offset = nil, want non-nil (Item_uint(0))")
+		}
+	})
+
+	// --- 21.5 FK ON DELETE omitted -> FK_OPTION_UNDEF ---------------------
+	t.Run("21_5_fk_on_delete_omitted_undef", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		ddl := `CREATE TABLE parent (id INT PRIMARY KEY);
+CREATE TABLE child (p INT, FOREIGN KEY (p) REFERENCES parent(id));`
+		runOnBoth(t, mc, c, ddl)
+
+		// Oracle: information_schema.REFERENTIAL_CONSTRAINTS reports
+		// DELETE_RULE and UPDATE_RULE as "NO ACTION" (rendering of UNDEF).
+		var deleteRule, updateRule string
+		oracleScan(t, mc,
+			`SELECT DELETE_RULE, UPDATE_RULE FROM information_schema.REFERENTIAL_CONSTRAINTS
+              WHERE CONSTRAINT_SCHEMA='testdb' AND TABLE_NAME='child'`,
+			&deleteRule, &updateRule)
+		assertStringEq(t, "oracle DELETE_RULE", deleteRule, "NO ACTION")
+		assertStringEq(t, "oracle UPDATE_RULE", updateRule, "NO ACTION")
+
+		// orrery catalog: the FK constraint's OnDelete/OnUpdate should render as
+		// "NO ACTION" (via refActionToString mapping RefActNone -> "NO ACTION").
+		tbl := c.GetDatabase("testdb").GetTable("child")
+		if tbl == nil {
+			t.Errorf("orrery: table child missing")
+			return
+		}
+		var fk *Constraint
+		for _, con := range tbl.Constraints {
+			if con.Type == ConForeignKey {
+				fk = con
+				break
+			}
+		}
+		if fk == nil {
+			t.Errorf("orrery: FK constraint missing on child")
+			return
+		}
+		// Orrery maps UNDEF -> "NO ACTION" which matches the info_schema
+		// rendering. Any value distinct from NO ACTION is a bug.
+		assertStringEq(t, "orrery FK OnDelete", fk.OnDelete, "NO ACTION")
+		assertStringEq(t, "orrery FK OnUpdate", fk.OnUpdate, "NO ACTION")
+	})
+
+	// --- 21.6 FK ON DELETE present, ON UPDATE omitted ---------------------
+	t.Run("21_6_fk_on_update_independent_undef", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		ddl := `CREATE TABLE parent (id INT PRIMARY KEY);
+CREATE TABLE child (p INT, FOREIGN KEY (p) REFERENCES parent(id) ON DELETE CASCADE);`
+		runOnBoth(t, mc, c, ddl)
+
+		// Oracle: DELETE_RULE=CASCADE, UPDATE_RULE=NO ACTION (not inherited).
+		var deleteRule, updateRule string
+		oracleScan(t, mc,
+			`SELECT DELETE_RULE, UPDATE_RULE FROM information_schema.REFERENTIAL_CONSTRAINTS
+              WHERE CONSTRAINT_SCHEMA='testdb' AND TABLE_NAME='child'`,
+			&deleteRule, &updateRule)
+		assertStringEq(t, "oracle DELETE_RULE", deleteRule, "CASCADE")
+		assertStringEq(t, "oracle UPDATE_RULE", updateRule, "NO ACTION")
+
+		tbl := c.GetDatabase("testdb").GetTable("child")
+		if tbl == nil {
+			t.Errorf("orrery: table child missing")
+			return
+		}
+		var fk *Constraint
+		for _, con := range tbl.Constraints {
+			if con.Type == ConForeignKey {
+				fk = con
+				break
+			}
+		}
+		if fk == nil {
+			t.Errorf("orrery: FK constraint missing")
+			return
+		}
+		assertStringEq(t, "orrery FK OnDelete", fk.OnDelete, "CASCADE")
+		assertStringEq(t, "orrery FK OnUpdate", fk.OnUpdate, "NO ACTION")
+	})
+
+	// --- 21.7 CREATE INDEX without USING -> nullptr (engine picks) --------
+	t.Run("21_7_index_no_using_clause", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		ddl := `CREATE TABLE t (a INT, KEY k (a));
+CREATE TABLE t_b (a INT, KEY kb (a) USING BTREE);`
+		runOnBoth(t, mc, c, ddl)
+
+		// Oracle: information_schema.STATISTICS.INDEX_TYPE is "BTREE" for both
+		// on InnoDB — engine fills in the default. We check only that both
+		// resolve to "BTREE" (InnoDB default), confirming the engine-fill.
+		var t1Type, t2Type string
+		oracleScan(t, mc,
+			`SELECT INDEX_TYPE FROM information_schema.STATISTICS
+              WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t' AND INDEX_NAME='k'`,
+			&t1Type)
+		oracleScan(t, mc,
+			`SELECT INDEX_TYPE FROM information_schema.STATISTICS
+              WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t_b' AND INDEX_NAME='kb'`,
+			&t2Type)
+		assertStringEq(t, "oracle index k type", t1Type, "BTREE")
+		assertStringEq(t, "oracle index kb type", t2Type, "BTREE")
+
+		// orrery: the parser should preserve the distinction (no USING -> empty,
+		// USING BTREE -> "BTREE"). The engine default resolution is the
+		// catalog's job, not the parser's — but orrery may collapse both.
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		tbl2 := c.GetDatabase("testdb").GetTable("t_b")
+		if tbl == nil || tbl2 == nil {
+			t.Errorf("orrery: missing tables t/t_b")
+			return
+		}
+		var kType, kbType string
+		for _, idx := range tbl.Indexes {
+			if idx.Name == "k" {
+				kType = idx.IndexType
+			}
+		}
+		for _, idx := range tbl2.Indexes {
+			if idx.Name == "kb" {
+				kbType = idx.IndexType
+			}
+		}
+		// orrery grammar: no USING clause should leave IndexType empty. If orrery
+		// defaults to "BTREE" at parse time, that's a bug (loses the info
+		// needed to deparse faithfully).
+		if kType != "" {
+			t.Errorf("orrery: index k IndexType = %q, want \"\" (no USING clause)", kType)
+		}
+		assertStringEq(t, "orrery index kb IndexType", kbType, "BTREE")
+	})
+
+	// --- 21.8 INSERT without column list -> empty Columns -----------------
+	t.Run("21_8_insert_no_column_list", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT, b INT, c INT);`)
+
+		// Oracle: both forms accepted.
+		for _, s := range []string{
+			"INSERT INTO t VALUES (1, 2, 3)",
+			"INSERT INTO t (a, b, c) VALUES (4, 5, 6)",
+		} {
+			if _, err := mc.db.ExecContext(mc.ctx, "USE testdb; "+s); err != nil {
+				t.Errorf("oracle %q: %v", s, err)
+			}
+		}
+
+		// orrery AST: INSERT without column list -> Columns is nil / empty.
+		bare := c21FirstInsert(t, "INSERT INTO t VALUES (1, 2, 3)")
+		full := c21FirstInsert(t, "INSERT INTO t (a, b, c) VALUES (4, 5, 6)")
+		if bare == nil || full == nil {
+			return
+		}
+		if len(bare.Columns) != 0 {
+			t.Errorf("orrery: INSERT without column list produced %d columns, want 0",
+				len(bare.Columns))
+		}
+		if len(full.Columns) != 3 {
+			t.Errorf("orrery: INSERT with explicit column list produced %d columns, want 3",
+				len(full.Columns))
+		}
+	})
+
+	// --- 21.9 CREATE VIEW without ALGORITHM -> UNDEFINED ------------------
+	t.Run("21_9_view_no_algorithm_undefined", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT);`)
+
+		// Three forms that all resolve to ALGORITHM=UNDEFINED.
+		runOnBoth(t, mc, c, `CREATE VIEW v1 AS SELECT 1 AS x;`)
+		runOnBoth(t, mc, c, `CREATE ALGORITHM=UNDEFINED VIEW v2 AS SELECT 1 AS x;`)
+
+		// Oracle: information_schema.VIEWS has no ALGORITHM column in MySQL
+		// 8.0; use SHOW CREATE VIEW which renders the algorithm verbatim.
+		// Both forms should contain ALGORITHM=UNDEFINED.
+		for _, name := range []string{"v1", "v2"} {
+			create := oracleShow(t, mc, "SHOW CREATE VIEW "+name)
+			if !strings.Contains(strings.ToUpper(create), "ALGORITHM=UNDEFINED") {
+				t.Errorf("oracle %s: SHOW CREATE VIEW missing ALGORITHM=UNDEFINED: %s",
+					name, create)
+			}
+		}
+
+		// orrery: View.Algorithm should either be "" (default) or "UNDEFINED"
+		// for v1 (no explicit clause), and "UNDEFINED" for v2.
+		db := c.GetDatabase("testdb")
+		v1 := db.Views["v1"]
+		v2 := db.Views["v2"]
+		if v1 == nil {
+			t.Errorf("orrery: view v1 missing")
+		} else if v1.Algorithm != "" && !strings.EqualFold(v1.Algorithm, "UNDEFINED") {
+			t.Errorf("orrery: v1 Algorithm = %q, want \"\" or UNDEFINED", v1.Algorithm)
+		}
+		if v2 == nil {
+			t.Errorf("orrery: view v2 missing")
+		} else if !strings.EqualFold(v2.Algorithm, "UNDEFINED") {
+			t.Errorf("orrery: v2 Algorithm = %q, want UNDEFINED", v2.Algorithm)
+		}
+	})
+
+	// --- 21.10 CREATE TABLE without ENGINE -> post-parse fill ------------
+	t.Run("21_10_create_table_no_engine", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t_noeng (a INT);`)
+		runOnBoth(t, mc, c, `CREATE TABLE t_eng (a INT) ENGINE=InnoDB;`)
+
+		// Oracle: both resolve to "InnoDB" via session default.
+		var e1, e2 string
+		oracleScan(t, mc,
+			`SELECT ENGINE FROM information_schema.TABLES
+              WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t_noeng'`,
+			&e1)
+		oracleScan(t, mc,
+			`SELECT ENGINE FROM information_schema.TABLES
+              WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t_eng'`,
+			&e2)
+		assertStringEq(t, "oracle t_noeng engine", e1, "InnoDB")
+		assertStringEq(t, "oracle t_eng engine", e2, "InnoDB")
+
+		// orrery: parser must leave Table.Engine empty when no ENGINE clause.
+		// Post-parse fill (from a session variable) is a catalog-layer job and
+		// orrery may or may not do it. We assert the distinction: t_noeng should
+		// NOT silently default to "InnoDB" at parse time.
+		tNo := c.GetDatabase("testdb").GetTable("t_noeng")
+		tEx := c.GetDatabase("testdb").GetTable("t_eng")
+		if tNo == nil || tEx == nil {
+			t.Errorf("orrery: missing t_noeng or t_eng")
+			return
+		}
+		// The spec says parser should leave engine NULL. If orrery fills
+		// "InnoDB" at parse time, that's a parser-vs-catalog-layer mix-up.
+		if strings.EqualFold(tNo.Engine, "InnoDB") {
+			t.Errorf("orrery: t_noeng Engine is prematurely filled with InnoDB " +
+				"(parser should leave it empty; session-var fill is a post-parse step)")
+		}
+		if !strings.EqualFold(tEx.Engine, "InnoDB") {
+			t.Errorf("orrery: t_eng Engine = %q, want InnoDB (explicit)", tEx.Engine)
+		}
+	})
+}
+
+// --- section-local helpers -------------------------------------------------
+
+// c21FirstJoinType parses a SELECT query and returns the JoinType of the
+// first JoinClause found in the FROM list. Uses t.Errorf (not Fatal) so the
+// subtest keeps running.
+func c21FirstJoinType(t *testing.T, sql string) (nodes.JoinType, bool) {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Errorf("orrery parse %q: %v", sql, err)
+		return 0, false
+	}
+	if len(stmts.Items) == 0 {
+		t.Errorf("orrery parse %q: no statements", sql)
+		return 0, false
+	}
+	sel, ok := stmts.Items[0].(*nodes.SelectStmt)
+	if !ok {
+		t.Errorf("orrery parse %q: expected SelectStmt, got %T", sql, stmts.Items[0])
+		return 0, false
+	}
+	for _, te := range sel.From {
+		if jc, ok := te.(*nodes.JoinClause); ok {
+			return jc.Type, true
+		}
+	}
+	t.Errorf("orrery parse %q: no JoinClause in FROM list", sql)
+	return 0, false
+}
+
+// c21FirstOrderByItem parses a SELECT and returns the first ORDER BY item.
+func c21FirstOrderByItem(t *testing.T, sql string) *nodes.OrderByItem {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Errorf("orrery parse %q: %v", sql, err)
+		return nil
+	}
+	if len(stmts.Items) == 0 {
+		t.Errorf("orrery parse %q: no statements", sql)
+		return nil
+	}
+	sel, ok := stmts.Items[0].(*nodes.SelectStmt)
+	if !ok {
+		t.Errorf("orrery parse %q: expected SelectStmt, got %T", sql, stmts.Items[0])
+		return nil
+	}
+	if len(sel.OrderBy) == 0 {
+		t.Errorf("orrery parse %q: no ORDER BY items", sql)
+		return nil
+	}
+	return sel.OrderBy[0]
+}
+
+// c21FirstLimit parses a SELECT and returns its Limit node (or nil).
+func c21FirstLimit(t *testing.T, sql string) *nodes.Limit {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Errorf("orrery parse %q: %v", sql, err)
+		return nil
+	}
+	if len(stmts.Items) == 0 {
+		return nil
+	}
+	sel, ok := stmts.Items[0].(*nodes.SelectStmt)
+	if !ok {
+		t.Errorf("orrery parse %q: expected SelectStmt, got %T", sql, stmts.Items[0])
+		return nil
+	}
+	return sel.Limit
+}
+
+// c21FirstInsert parses an INSERT and returns the InsertStmt node.
+func c21FirstInsert(t *testing.T, sql string) *nodes.InsertStmt {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Errorf("orrery parse %q: %v", sql, err)
+		return nil
+	}
+	if len(stmts.Items) == 0 {
+		t.Errorf("orrery parse %q: no statements", sql)
+		return nil
+	}
+	ins, ok := stmts.Items[0].(*nodes.InsertStmt)
+	if !ok {
+		t.Errorf("orrery parse %q: expected InsertStmt, got %T", sql, stmts.Items[0])
+		return nil
+	}
+	return ins
+}

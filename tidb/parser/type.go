@@ -1,0 +1,903 @@
+package parser
+
+import (
+	"strconv"
+	"strings"
+
+	nodes "github.com/Dxlxz/orrery-sql/tidb/ast"
+)
+
+// parseDataType parses a MySQL data type specification.
+//
+// Ref: https://dev.mysql.com/doc/refman/8.0/en/data-types.html
+//
+//	data_type:
+//	    numeric_type
+//	    | string_type
+//	    | date_time_type
+//	    | blob_type
+//	    | enum_type
+//	    | set_type
+//	    | json_type
+//	    | bit_type
+//	    | binary_type
+//
+//	numeric_type:
+//	    (INT | INTEGER | TINYINT | SMALLINT | MEDIUMINT | BIGINT) [(length)] [UNSIGNED] [ZEROFILL]
+//	    | (FLOAT | DOUBLE) [(length [, decimals])] [UNSIGNED] [ZEROFILL]
+//	    | DOUBLE PRECISION [(length [, decimals])] [UNSIGNED] [ZEROFILL]
+//	    | (DECIMAL | NUMERIC) [(length [, decimals])] [UNSIGNED] [ZEROFILL]
+//	    | (BOOL | BOOLEAN)
+//
+//	string_type:
+//	    (CHAR | VARCHAR) [(length)] [CHARACTER SET charset] [COLLATE collation]
+//	    | (TEXT | TINYTEXT | MEDIUMTEXT | LONGTEXT) [CHARACTER SET charset] [COLLATE collation]
+//
+//	date_time_type:
+//	    DATE | TIME [(fsp)] | DATETIME [(fsp)] | TIMESTAMP [(fsp)] | YEAR [(length)]
+//
+//	blob_type:
+//	    BLOB | TINYBLOB | MEDIUMBLOB | LONGBLOB
+//
+//	binary_type:
+//	    BINARY [(length)] | VARBINARY (length)
+//
+//	bit_type:
+//	    BIT [(length)]
+//
+//	enum_type:
+//	    ENUM (value_list)
+//
+//	set_type:
+//	    SET (value_list)
+//
+//	json_type:
+//	    JSON
+func (p *Parser) parseDataType() (*nodes.DataType, error) {
+	start := p.pos()
+	dt := &nodes.DataType{Loc: nodes.Loc{Start: start}}
+
+	switch p.cur.Type {
+	// Integer types
+	case kwINT, kwINTEGER:
+		dt.Name = "INT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+
+	case kwTINYINT:
+		dt.Name = "TINYINT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+
+	case kwSMALLINT:
+		dt.Name = "SMALLINT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+
+	case kwMEDIUMINT:
+		dt.Name = "MEDIUMINT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+
+	case kwBIGINT:
+		dt.Name = "BIGINT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+
+	// Float types
+	case kwFLOAT:
+		dt.Name = "FLOAT"
+		p.advance()
+		if err := p.parseOptionalPrecision(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+
+	case kwDOUBLE:
+		dt.Name = "DOUBLE"
+		p.advance()
+		// DOUBLE PRECISION is a synonym
+		if p.cur.Type == kwPRECISION {
+			p.advance()
+		}
+		if err := p.parseDoublePrecision(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+
+	case kwREAL:
+		// REAL → DOUBLE synonym
+		dt.Name = "DOUBLE"
+		p.advance()
+		if err := p.parseDoublePrecision(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+
+	// Decimal types
+	case kwDECIMAL, kwNUMERIC:
+		if p.cur.Type == kwDECIMAL {
+			dt.Name = "DECIMAL"
+		} else {
+			dt.Name = "NUMERIC"
+		}
+		p.advance()
+		if err := p.parseOptionalPrecision(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+
+	case kwDEC, kwFIXED:
+		// DEC and FIXED → DECIMAL synonyms
+		dt.Name = "DECIMAL"
+		p.advance()
+		if err := p.parseOptionalPrecision(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+
+	// VECTOR [<FLOAT>] [(dimension)], TiDB's own. The element type comes before the
+	// dimension and FLOAT is the only one the action takes: VECTOR<DOUBLE> reads in
+	// the grammar and its action answers 1064, as v8.5.5 does for VECTOR<INT> and
+	// VECTOR(5)<FLOAT>. The type carries no modifiers either: UNSIGNED, BINARY and
+	// CHARSET after it are 1064, while the COLLATE of a column definition is not.
+	//
+	// Ref: `"VECTOR" OptVectorElementType OptFieldLen` and OptVectorElementType in
+	// TiDB v8.5.5 pkg/parser/parser.y.
+	case kwVECTOR:
+		dt.Name = "VECTOR"
+		p.advance()
+		if p.cur.Type == '<' {
+			p.advance()
+			if _, err := p.expect(kwFLOAT); err != nil {
+				return nil, err
+			}
+			if _, err := p.expect('>'); err != nil {
+				return nil, err
+			}
+		}
+		// A dimension past 64 bits lexes as a decimal, which is no LengthNum: v8.5.5
+		// answers 1064 for VECTOR(99999999999999999999) and parses VECTOR(16384) and
+		// refuses it later with 1105.
+		if p.cur.Type == '(' {
+			if next := p.peekNext(); next.Type == tokICONST {
+				if _, err := strconv.ParseUint(next.Str, 10, 64); err != nil {
+					return nil, p.syntaxErrorAtTok(next)
+				}
+			}
+		}
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+
+	// Boolean
+	case kwBOOL, kwBOOLEAN:
+		dt.Name = "BOOLEAN"
+		p.advance()
+		// BooleanType FieldOpts (parser.y:12919, v8.5.5): `BOOL UNSIGNED` is a
+		// column.
+		p.parseUnsignedZerofill(dt)
+
+	// Character string types. CHAR and CHARACTER name the same type, and
+	// VARYING after either makes it VARCHAR, as the one word VARCHARACTER
+	// does: https://dev.mysql.com/doc/refman/8.0/en/char.html. Every spelling
+	// of VARCHAR carries a length and every spelling of CHAR may leave it out,
+	// so TiDB takes `char` and `varchar(1)` but rejects `varchar`.
+	case kwCHAR, kwCHARACTER:
+		dt.Name = "CHAR"
+		p.advance()
+		if p.cur.Type == kwVARYING {
+			dt.Name = "VARCHAR"
+			p.advance()
+			if err := p.parseRequiredLength(dt); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := p.parseOptionalLength(dt); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.parseCharsetCollate(dt); err != nil {
+			return nil, err
+		}
+
+	case kwVARCHAR, kwVARCHARACTER:
+		dt.Name = "VARCHAR"
+		p.advance()
+		if err := p.parseRequiredLength(dt); err != nil {
+			return nil, err
+		}
+		if err := p.parseCharsetCollate(dt); err != nil {
+			return nil, err
+		}
+
+	case kwTEXT:
+		dt.Name = "TEXT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		if err := p.parseTextCharsetOpt(dt); err != nil {
+			return nil, err
+		}
+
+	case kwTINYTEXT:
+		dt.Name = "TINYTEXT"
+		p.advance()
+		if err := p.parseTextCharsetOpt(dt); err != nil {
+			return nil, err
+		}
+
+	case kwMEDIUMTEXT:
+		dt.Name = "MEDIUMTEXT"
+		p.advance()
+		if err := p.parseTextCharsetOpt(dt); err != nil {
+			return nil, err
+		}
+
+	case kwLONGTEXT:
+		dt.Name = "LONGTEXT"
+		p.advance()
+		if err := p.parseTextCharsetOpt(dt); err != nil {
+			return nil, err
+		}
+
+	// Date/time types
+	case kwDATE:
+		dt.Name = "DATE"
+		p.advance()
+
+	case kwTIME:
+		dt.Name = "TIME"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil { // fsp
+			return nil, err
+		}
+
+	case kwDATETIME:
+		dt.Name = "DATETIME"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil { // fsp
+			return nil, err
+		}
+
+	case kwTIMESTAMP:
+		dt.Name = "TIMESTAMP"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil { // fsp
+			return nil, err
+		}
+
+	// YEAR, and SQL_TSI_YEAR which names the same type: the spelling
+	// TIMESTAMPADD takes for its unit is a type name too
+	// (https://dev.mysql.com/doc/refman/8.0/en/date-and-time-type-syntax.html).
+	// Both carry an optional display width and the numeric modifiers, so
+	// `YEAR ZEROFILL` and `SQL_TSI_YEAR(4) ZEROFILL` are columns; neither takes
+	// a charset, so `YEAR(4) BINARY` is not.
+	case kwYEAR, kwSQL_TSI_YEAR:
+		dt.Name = "YEAR"
+		p.advance()
+		// DateAndTimeType's action answers 1818, ErrInvalidYearColumnLength, for any
+		// length but 4.
+		yearLength := p.cur.Type == '('
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		if yearLength && dt.Length != 4 {
+			return nil, &ParseError{Message: "Supports only YEAR or YEAR(4) column", Position: p.prev.Loc}
+		}
+		p.parseUnsignedZerofill(dt)
+
+	// Blob types
+	case kwBLOB:
+		dt.Name = "BLOB"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+
+	case kwTINYBLOB:
+		dt.Name = "TINYBLOB"
+		p.advance()
+
+	case kwMEDIUMBLOB:
+		dt.Name = "MEDIUMBLOB"
+		p.advance()
+
+	case kwLONGBLOB:
+		dt.Name = "LONGBLOB"
+		p.advance()
+
+	// Binary types
+	case kwBINARY:
+		dt.Name = "BINARY"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+
+	case kwVARBINARY:
+		dt.Name = "VARBINARY"
+		p.advance()
+		if err := p.parseRequiredLength(dt); err != nil {
+			return nil, err
+		}
+
+	// Bit type
+	case kwBIT:
+		dt.Name = "BIT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+
+	// ENUM type
+	case kwENUM:
+		dt.Name = "ENUM"
+		p.advance()
+		vals, err := p.parseStringValueList()
+		if err != nil {
+			return nil, err
+		}
+		dt.EnumValues = vals
+		if err := p.parseTextCharsetOpt(dt); err != nil {
+			return nil, err
+		}
+
+	// SET type (the SQL SET data type, not the SET statement keyword)
+	case kwSET:
+		// We must be careful: SET is also a statement keyword.
+		// In data type context, SET is followed by '('.
+		if p.peekNext().Type != '(' {
+			return nil, &ParseError{
+				Message:  "expected data type",
+				Position: p.cur.Loc,
+			}
+		}
+		dt.Name = "SET"
+		p.advance()
+		vals, err := p.parseStringValueList()
+		if err != nil {
+			return nil, err
+		}
+		dt.EnumValues = vals
+		if err := p.parseTextCharsetOpt(dt); err != nil {
+			return nil, err
+		}
+
+	// JSON type
+	case kwJSON:
+		dt.Name = "JSON"
+		p.advance()
+
+	// No spatial types: TiDB v8.5.5's parser.y has no GEOMETRY, POINT,
+	// LINESTRING, POLYGON, MULTI* or GEOMETRYCOLLECTION type, and the server
+	// answers 1064 for each as a column type and as a CAST target. The words
+	// stay unreserved keywords and read as names.
+
+	// SERIAL → BIGINT UNSIGNED AUTO_INCREMENT UNIQUE
+	case kwSERIAL:
+		dt.Name = p.cur.Str
+		p.advance()
+
+	// NATIONAL CHAR / NATIONAL VARCHAR, in the same spellings the bare types
+	// take. TiDB's grammar reads NATIONAL, NCHAR and NVARCHAR as spellings of
+	// CHAR and VARCHAR and sets no charset (NCharType and NVarcharType in
+	// v8.5.5 parser.y): the column takes the table's charset, where MySQL
+	// gives it utf8mb3.
+	case kwNATIONAL:
+		p.advance()
+		if p.cur.Type == kwCHAR || p.cur.Type == kwCHARACTER {
+			dt.Name = "CHAR"
+			p.advance()
+			if p.cur.Type == kwVARYING {
+				dt.Name = "VARCHAR"
+				p.advance()
+				if err := p.parseRequiredLength(dt); err != nil {
+					return nil, err
+				}
+			} else {
+				if err := p.parseOptionalLength(dt); err != nil {
+					return nil, err
+				}
+			}
+			if err := p.parseCharsetCollate(dt); err != nil {
+				return nil, err
+			}
+		} else if p.cur.Type == kwVARCHAR || p.cur.Type == kwVARCHARACTER {
+			dt.Name = "VARCHAR"
+			p.advance()
+			if err := p.parseRequiredLength(dt); err != nil {
+				return nil, err
+			}
+			if err := p.parseCharsetCollate(dt); err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, &ParseError{
+				Message:  "expected CHAR or VARCHAR after NATIONAL",
+				Position: p.cur.Loc,
+			}
+		}
+
+	// NCHAR → CHAR, and NCHAR VARCHAR / VARCHARACTER / VARYING → VARCHAR, with
+	// no charset of their own (see NATIONAL above).
+	case kwNCHAR:
+		p.advance()
+		if p.cur.Type == kwVARCHAR || p.cur.Type == kwVARCHARACTER || p.cur.Type == kwVARYING {
+			dt.Name = "VARCHAR"
+			p.advance()
+			if err := p.parseRequiredLength(dt); err != nil {
+				return nil, err
+			}
+		} else {
+			dt.Name = "CHAR"
+			if err := p.parseOptionalLength(dt); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.parseCharsetCollate(dt); err != nil {
+			return nil, err
+		}
+
+	// NVARCHAR → VARCHAR, with no charset of its own (see NATIONAL above).
+	case kwNVARCHAR:
+		dt.Name = "VARCHAR"
+		p.advance()
+		if err := p.parseRequiredLength(dt); err != nil {
+			return nil, err
+		}
+		if err := p.parseCharsetCollate(dt); err != nil {
+			return nil, err
+		}
+
+	case kwINT1:
+		dt.Name = "TINYINT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+	case kwINT2:
+		dt.Name = "SMALLINT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+	case kwINT3:
+		dt.Name = "MEDIUMINT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+	case kwINT4:
+		dt.Name = "INT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+	case kwINT8:
+		dt.Name = "BIGINT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+	case kwMIDDLEINT:
+		dt.Name = "MEDIUMINT"
+		p.advance()
+		if err := p.parseOptionalLength(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+	case kwFLOAT4:
+		dt.Name = "FLOAT"
+		p.advance()
+		if err := p.parseOptionalPrecision(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+	case kwFLOAT8:
+		dt.Name = "DOUBLE"
+		p.advance()
+		if err := p.parseDoublePrecision(dt); err != nil {
+			return nil, err
+		}
+		p.parseUnsignedZerofill(dt)
+	case kwLONG:
+		// LONG and the VARCHAR spellings of it -- LONG VARCHAR, LONG
+		// VARCHARACTER, LONG CHAR VARYING, LONG CHARACTER VARYING -- are
+		// MEDIUMTEXT; LONG VARBINARY is MEDIUMBLOB. None of them carries a
+		// length. CHAR and CHARACTER after LONG are ambiguous, because
+		// `long char set utf8` is LONG with a charset clause, so the type
+		// claims either only when VARYING follows it.
+		p.advance()
+		switch {
+		case p.cur.Type == kwVARCHAR || p.cur.Type == kwVARCHARACTER:
+			p.advance()
+			dt.Name = "MEDIUMTEXT"
+			if err := p.parseTextCharsetOpt(dt); err != nil {
+				return nil, err
+			}
+		case (p.cur.Type == kwCHAR || p.cur.Type == kwCHARACTER) && p.peekNext().Type == kwVARYING:
+			p.advance()
+			p.advance()
+			dt.Name = "MEDIUMTEXT"
+			if err := p.parseTextCharsetOpt(dt); err != nil {
+				return nil, err
+			}
+		case p.cur.Type == kwVARBINARY:
+			p.advance()
+			dt.Name = "MEDIUMBLOB"
+		default:
+			dt.Name = "MEDIUMTEXT"
+			if err := p.parseTextCharsetOpt(dt); err != nil {
+				return nil, err
+			}
+		}
+
+	default:
+		if p.cur.Type == tokEOF {
+			return nil, p.syntaxErrorAtCur()
+		}
+		return nil, &ParseError{
+			Message:  "expected data type",
+			Position: p.cur.Loc,
+		}
+	}
+
+	dt.Loc.End = p.prev.End
+	return dt, nil
+}
+
+// parseRequiredLength parses the length a VARCHAR-shaped type must carry.
+// TiDB takes CHAR with a length or without one but VARCHAR only with one, in
+// every spelling: `varcharacter(1)`, `char varying(50)` and `nchar
+// varying(50)` are accepted and those three without a length are not. The LONG
+// forms carry no length at all, so they do not come here.
+func (p *Parser) parseRequiredLength(dt *nodes.DataType) error {
+	if p.cur.Type != '(' {
+		return &ParseError{
+			Message:  "expected a length for " + dt.Name,
+			Position: p.cur.Loc,
+		}
+	}
+	p.advance()
+	if p.cur.Type != tokICONST {
+		return &ParseError{
+			Message:  "expected a length for " + dt.Name,
+			Position: p.cur.Loc,
+		}
+	}
+	dt.Length = int(p.cur.Ival)
+	p.advance()
+	if p.cur.Type != ')' {
+		return &ParseError{
+			Message:  "expected ) after the length for " + dt.Name,
+			Position: p.cur.Loc,
+		}
+	}
+	p.advance()
+	return nil
+}
+
+// parseOptionalLength parses the `(length)` a type may leave out. The
+// parentheses are optional; what goes between them is not. Every engine answers
+// 1064 for `int()`, `year()` and `datetime()` as surely as for `varchar()`, and
+// for a length that never closes, so once `(` is there the rest is a length
+// that must carry a number and end at `)`.
+func (p *Parser) parseOptionalLength(dt *nodes.DataType) error {
+	if p.cur.Type != '(' {
+		return nil
+	}
+	return p.parseRequiredLength(dt)
+}
+
+// parseDoublePrecision parses the precision of a type that is DOUBLE. It takes M and D
+// together or neither: NumericType's action answers 1149, ErrSyntax, for `DOUBLE(10)`
+// under the server's default strict setting, which FLOAT is free of.
+//
+// Ref: FloatingPointType FloatOpt FieldOpts in TiDB v8.5.5 pkg/parser/parser.y.
+func (p *Parser) parseDoublePrecision(dt *nodes.DataType) error {
+	if p.cur.Type != '(' {
+		return nil
+	}
+	start := p.cur.Loc
+	hasScale, err := p.parsePrecisionAndScale(dt)
+	if err != nil {
+		return err
+	}
+	if !hasScale {
+		return &ParseError{Message: "DOUBLE takes both a precision and a scale", Position: start}
+	}
+	return nil
+}
+
+// parseOptionalPrecision parses the `(precision[, scale])` the approximate and
+// exact numeric types may leave out. As with a length, the parentheses are
+// optional and their contents are not: the engines answer 1064 for
+// `decimal(10,)`, `decimal(,2)` and `float(10,)`, so a precision that opens
+// must carry a number, a scale that follows a comma must too, and the whole
+// must close.
+func (p *Parser) parseOptionalPrecision(dt *nodes.DataType) error {
+	if p.cur.Type != '(' {
+		return nil
+	}
+	_, err := p.parsePrecisionAndScale(dt)
+	return err
+}
+
+// parsePrecisionAndScale reads from the `(`, and reports whether a scale was written: DECIMAL(10,0)
+// has one and DECIMAL(10) does not, though dt.Scale is 0 for both.
+func (p *Parser) parsePrecisionAndScale(dt *nodes.DataType) (hasScale bool, err error) {
+	p.advance()
+	if p.cur.Type != tokICONST {
+		return false, &ParseError{
+			Message:  "expected a precision for " + dt.Name,
+			Position: p.cur.Loc,
+		}
+	}
+	dt.Length = int(p.cur.Ival)
+	p.advance()
+	if p.cur.Type == ',' {
+		p.advance()
+		if p.cur.Type != tokICONST {
+			return false, &ParseError{
+				Message:  "expected a scale for " + dt.Name,
+				Position: p.cur.Loc,
+			}
+		}
+		dt.Scale = int(p.cur.Ival)
+		dt.HasScale = true
+		hasScale = true
+		p.advance()
+	}
+	if p.cur.Type != ')' {
+		return false, &ParseError{
+			Message:  "expected ) after the precision for " + dt.Name,
+			Position: p.cur.Loc,
+		}
+	}
+	p.advance()
+	return hasScale, nil
+}
+
+// parseUnsignedZerofill parses TiDB's FieldOpts (parser.y:13472, v8.5.5): any
+// run of SIGNED, UNSIGNED and ZEROFILL in any order, so `INT SIGNED UNSIGNED` and
+// `YEAR ZEROFILL ZEROFILL` are columns. The actions set a flag for each UNSIGNED or
+// ZEROFILL and clear none, so SIGNED changes nothing.
+func (p *Parser) parseUnsignedZerofill(dt *nodes.DataType) {
+	for {
+		switch p.cur.Type {
+		case kwSIGNED:
+		case kwUNSIGNED:
+			dt.Unsigned = true
+		case kwZEROFILL:
+			dt.Zerofill = true
+		default:
+			return
+		}
+		p.advance()
+	}
+}
+
+// parseTextCharsetOpt reads OptCharsetWithOptBinary (parser.y:13370, v8.5.5), what
+// a TEXT type, ENUM, SET, LONG and LONG VARCHAR take where the other string types
+// take a charset clause: ASCII for latin1, UNICODE for ucs2 and BYTE for binary,
+// each in place of the clause, or the clause itself. A COLLATE may follow either.
+func (p *Parser) parseTextCharsetOpt(dt *nodes.DataType) error {
+	var cs string
+	switch p.cur.Type {
+	case kwASCII:
+		cs = "latin1"
+	case kwUNICODE:
+		cs = "ucs2"
+	case kwBYTE:
+		cs = "binary"
+	default:
+		return p.parseCharsetCollate(dt)
+	}
+	p.advance()
+	dt.Charset = cs
+	if _, ok := p.match(kwCOLLATE); ok {
+		name, err := p.parseCollationName()
+		if err != nil {
+			return err
+		}
+		dt.Collate = name
+	}
+	return nil
+}
+
+// parseCharsetCollate parses optional CHARACTER SET / CHARSET clauses, the
+// standalone BINARY modifier (e.g. CHAR(10) BINARY), and an optional COLLATE.
+// CHARACTER SET and BINARY may appear in any order, but COLLATE comes LAST:
+// TiDB accepts `CHARACTER SET x BINARY COLLATE y` and `BINARY COLLATE y` but
+// REJECTS `COLLATE y BINARY` and `CHARACTER SET x COLLATE y BINARY` (BINARY
+// after COLLATE). So charset/BINARY are consumed in a loop, then a single
+// trailing COLLATE — a BINARY after COLLATE is left for the caller to reject.
+//
+// Only the character types (CHAR/VARCHAR/TEXT/ENUM/SET/NCHAR/...) call this, so
+// BINARY is naturally not accepted on BLOB/VARBINARY, matching TiDB.
+//
+// Each name is required and is a CharsetName or CollationName, `StringName |
+// binaryType` (parser.y): an identifier, a string literal or the reserved word
+// BINARY. `CHAR CHARSET 'binary'` and `TEXT COLLATE "utf8mb4_bin"` parse on TiDB
+// v8.5.5, and `TEXT COLLATE` and `VARCHAR(3) CHARSET NOT NULL` are 1064s.
+func (p *Parser) parseCharsetCollate(dt *nodes.DataType) error {
+	// Each of CHARACTER SET and the standalone BINARY modifier may appear at most
+	// once; a repeat is left for the caller to reject (TiDB rejects e.g.
+	// `BINARY BINARY` and `CHARACTER SET x CHARACTER SET y`). Note that
+	// `CHARACTER SET binary BINARY` is still valid — the first `binary` is the
+	// charset name, the second is the modifier.
+	charsetSeen := false
+	binarySeen := false
+charsetBinary:
+	for {
+		switch p.cur.Type {
+		case kwCHARSET:
+			if charsetSeen {
+				break charsetBinary
+			}
+			charsetSeen = true
+			p.advance()
+			name, err := p.parseCharsetName()
+			if err != nil {
+				return err
+			}
+			dt.Charset = name
+		case kwCHARACTER, kwCHAR:
+			// CHARACTER SET x, and MySQL's two-word CHAR SET x, which is what
+			// `long char set utf8` carries. Neither token is consumed unless
+			// SET follows it: a trailing CHARACTER is not a charset clause
+			// with the name left off, and TiDB rejects `long character`.
+			if charsetSeen || p.peekNext().Type != kwSET {
+				break charsetBinary
+			}
+			charsetSeen = true
+			p.advance()
+			p.advance()
+			name, err := p.parseCharsetName()
+			if err != nil {
+				return err
+			}
+			dt.Charset = name
+		case kwBINARY:
+			if binarySeen {
+				break charsetBinary
+			}
+			binarySeen = true
+			p.advance()
+			dt.Binary = true
+		default:
+			break charsetBinary
+		}
+	}
+
+	// COLLATE collation_name — must come after any CHARACTER SET / BINARY.
+	if _, ok := p.match(kwCOLLATE); ok {
+		name, err := p.parseCollationName()
+		if err != nil {
+			return err
+		}
+		dt.Collate = name
+	}
+	return nil
+}
+
+// parseStringValueList parses a parenthesized list of string literals: ('a', 'b', 'c')
+func (p *Parser) parseStringValueList() ([]string, error) {
+	if _, err := p.expect('('); err != nil {
+		return nil, err
+	}
+
+	var vals []string
+	for {
+		switch p.cur.Type {
+		case tokSCONST:
+			vals = append(vals, p.cur.Str)
+			p.advance()
+		case tokXCONST, tokBCONST:
+			// A member may be written as a hex or bit literal, in either
+			// spelling: `ENUM(0x61, 'b')` and `ENUM(x'61')` both name the
+			// member `a` (https://dev.mysql.com/doc/refman/8.0/en/hexadecimal-literals.html,
+			// .../bit-value-literals.html — in string context both are their
+			// bytes). The member is the bytes, not the text that wrote them, so
+			// it is decoded here: leaving `0x61` to a consumer would have the
+			// catalog report `enum('0x61')` and a deparse write a different
+			// table than the one the engine built.
+			val, err := p.decodeByteLiteral(p.cur)
+			if err != nil {
+				return nil, err
+			}
+			vals = append(vals, val)
+			p.advance()
+		default:
+			return nil, &ParseError{
+				Message:  "expected string literal in value list",
+				Position: p.cur.Loc,
+			}
+		}
+		if p.cur.Type != ',' {
+			break
+		}
+		p.advance() // consume ','
+	}
+
+	if _, err := p.expect(')'); err != nil {
+		return nil, err
+	}
+	return vals, nil
+}
+
+// decodeByteLiteral reads the bytes a hex or bit literal holds.
+//
+// Which spelling wrote it is read from the source text, not from the token's
+// own text: an unquoted literal keeps its `0x` or `0b` prefix in the text the
+// lexer hands over, and a quoted one keeps only what stood between the quotes.
+// The text alone cannot tell them apart, because the contents of a quoted hex
+// literal can themselves begin with `0b` -- reading that as a prefix decoded
+// `x` + `0b61` as the member `a` instead of the two bytes 0x0b 0x61. The byte
+// at the token's own position settles it: `0` opens the unquoted spelling, and
+// `x`, `X`, `b` or `B` the quoted one.
+//
+// Digits that do not fill whole bytes are padded on the left, so `0x6` is one
+// byte, 0x06, and so is a quoted bit literal holding a single 1. The one
+// exception is the quoted hex spelling, whose digit count must be even: three
+// hex digits in quotes is a 1064 where `0x616` is a number, which is the rule
+// https://dev.mysql.com/doc/refman/8.0/en/hexadecimal-literals.html states. A
+// quoted literal with nothing between its quotes is a member with no bytes in
+// it, the empty string. MySQL 8.0, MariaDB 11.8.8 and TiDB v8.5.5 all answer
+// this way.
+func (p *Parser) decodeByteLiteral(tok Token) (string, error) {
+	base, group := 16, 2
+	if tok.Type == tokBCONST {
+		base, group = 2, 8
+	}
+
+	digits := tok.Str
+	if p.inputText(tok.Loc, tok.Loc+1) == "0" {
+		// The unquoted spelling. The lexer only makes this token when at least
+		// one digit of the base follows the prefix; anything else is a name.
+		if len(digits) < 3 {
+			return "", &ParseError{Message: "malformed byte literal", Position: tok.Loc}
+		}
+		digits = digits[2:]
+	} else if tok.Type == tokXCONST && len(digits)%group != 0 {
+		return "", &ParseError{
+			Message:  "hexadecimal literal with an odd number of digits",
+			Position: tok.Loc,
+		}
+	}
+	if r := len(digits) % group; r != 0 {
+		digits = strings.Repeat("0", group-r) + digits
+	}
+
+	out := make([]byte, 0, len(digits)/group)
+	for i := 0; i < len(digits); i += group {
+		b, err := strconv.ParseUint(digits[i:i+group], base, 8)
+		if err != nil {
+			return "", &ParseError{Message: "malformed byte literal", Position: tok.Loc}
+		}
+		out = append(out, byte(b))
+	}
+	return string(out), nil
+}

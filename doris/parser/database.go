@@ -1,0 +1,346 @@
+package parser
+
+import (
+	"github.com/Dxlxz/orrery-sql/doris/ast"
+)
+
+// parseCreateDatabase parses:
+//
+//	CREATE (DATABASE | SCHEMA) [IF NOT EXISTS] db_name
+//	    [PROPERTIES ("key"="value", ...)]
+//
+// The CREATE keyword has already been consumed by the caller; cur is
+// DATABASE or SCHEMA.
+func (p *Parser) parseCreateDatabase() (ast.Node, error) {
+	startLoc := p.prev.Loc // loc of CREATE token
+
+	// Consume DATABASE or SCHEMA
+	p.advance()
+
+	stmt := &ast.CreateDatabaseStmt{}
+
+	// Optional IF NOT EXISTS
+	if p.cur.Kind == kwIF {
+		p.advance() // consume IF
+		if _, err := p.expect(kwNOT); err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(kwEXISTS); err != nil {
+			return nil, err
+		}
+		stmt.IfNotExists = true
+	}
+
+	// Database name — accepts a plain identifier (or non-reserved keyword as name)
+	name, err := p.parseMultipartIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+
+	// Optional PROPERTIES clause
+	if p.cur.Kind == kwPROPERTIES {
+		props, err := p.parseProperties()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Properties = props
+	}
+
+	stmt.Loc = startLoc.Merge(ast.NodeLoc(stmt.Name))
+	return stmt, nil
+}
+
+// parseAlterDatabase parses:
+//
+//	ALTER DATABASE db_name RENAME [TO] new_name
+//	ALTER DATABASE db_name SET PROPERTIES ("key"="value", ...)
+//	ALTER DATABASE db_name SET QUOTA ...  (quota value consumed as best-effort)
+//
+// The ALTER keyword has already been consumed; cur is DATABASE.
+func (p *Parser) parseAlterDatabase() (ast.Node, error) {
+	startLoc := p.prev.Loc // loc of ALTER token
+
+	// Consume DATABASE
+	p.advance()
+
+	stmt := &ast.AlterDatabaseStmt{}
+
+	// Database name
+	name, err := p.parseMultipartIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+
+	endLoc := ast.NodeLoc(name)
+
+	switch p.cur.Kind {
+	case kwRENAME:
+		p.advance() // consume RENAME
+		// Optional TO keyword
+		p.match(kwTO)
+		newName, err := p.parseMultipartIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		stmt.NewName = newName
+		endLoc = ast.NodeLoc(newName)
+
+	case kwSET:
+		p.advance() // consume SET
+		if p.cur.Kind == kwPROPERTIES {
+			props, err := p.parseProperties()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Properties = props
+			if len(props) > 0 {
+				endLoc = ast.NodeLoc(props[len(props)-1])
+			}
+		} else if p.cur.Kind == kwQUOTA || p.cur.Kind == kwDATA || p.cur.Kind == kwREPLICA {
+			// Consume the rest of the SET [DATA|REPLICA] QUOTA clause as a
+			// best-effort skip. Quota value can be a number + unit (e.g., 10GB).
+			p.advance() // consume DATA/REPLICA/QUOTA keyword
+			if p.cur.Kind == kwQUOTA {
+				p.advance() // consume QUOTA after DATA/REPLICA
+			}
+			if p.cur.Kind != tokEOF && p.cur.Kind != int(';') {
+				p.advance() // consume the quota value token
+			}
+		} else {
+			return nil, p.syntaxErrorAtCur()
+		}
+
+	default:
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	stmt.Loc = startLoc.Merge(endLoc)
+	return stmt, nil
+}
+
+// parseDropDatabase parses:
+//
+//	DROP (DATABASE | SCHEMA) [IF EXISTS] db_name [FORCE]
+//
+// The DROP keyword has already been consumed; cur is DATABASE or SCHEMA.
+func (p *Parser) parseDropDatabase() (ast.Node, error) {
+	startLoc := p.prev.Loc // loc of DROP token
+
+	// Consume DATABASE or SCHEMA
+	p.advance()
+
+	stmt := &ast.DropDatabaseStmt{}
+
+	// Optional IF EXISTS
+	if p.cur.Kind == kwIF {
+		p.advance() // consume IF
+		if _, err := p.expect(kwEXISTS); err != nil {
+			return nil, err
+		}
+		stmt.IfExists = true
+	}
+
+	// Database name
+	name, err := p.parseMultipartIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+
+	endLoc := ast.NodeLoc(name)
+
+	// Optional FORCE
+	if p.cur.Kind == kwFORCE {
+		endLoc = p.cur.Loc
+		p.advance()
+		stmt.Force = true
+	}
+
+	stmt.Loc = startLoc.Merge(endLoc)
+	return stmt, nil
+}
+
+// parseProperties parses:
+//
+//	PROPERTIES ("key"="value" [, "key"="value" ...])
+//
+// cur must be kwPROPERTIES on entry; it is consumed here.
+func (p *Parser) parseProperties() ([]*ast.Property, error) {
+	p.advance() // consume PROPERTIES
+
+	if _, err := p.expect(int('(')); err != nil {
+		return nil, err
+	}
+
+	return p.parsePropertyItems(p.parseStringProperty)
+}
+
+// parsePropertyItems parses the body of a property list -- the grammar's
+//
+//	propertyItemList : propertyItem (COMMA propertyItem)*
+//
+// -- from the first item through the closing ')', which it consumes. cur must
+// be on the first item's first token, the caller having consumed the '('.
+//
+// So the list carries at least one item, items are comma-separated, and it
+// does not end on a comma. The engine refuses all three departures --
+// PROPERTIES(), PROPERTIES("k"="v" "k2"="v2") and PROPERTIES("k"="v",) --
+// in every clause that takes a property list, container-verified across
+// CREATE TABLE / DATABASE / CATALOG / RESOURCE / WORKLOAD GROUP /
+// STORAGE VAULT / FILE / MATERIALIZED VIEW, EXPORT, ALTER TABLE ... SET,
+// ALTER CATALOG, ROUTINE LOAD's job and data-source lists, and
+// ADMIN SET FRONTEND CONFIG. Each of those clauses had its own copy of this
+// loop treating the comma as optional, so each accepted statements the engine
+// rejects; the shape lives here once instead.
+//
+// parseItem reads one item. The clauses differ in what they take for a key
+// and a value, not in the shape of the list.
+func (p *Parser) parsePropertyItems(parseItem func() (*ast.Property, error)) ([]*ast.Property, error) {
+	var props []*ast.Property
+	for {
+		if p.cur.Kind == int(')') || p.cur.Kind == tokEOF {
+			// An empty list, or one that ended on its separator. The grammar
+			// wants an item here, and this is where the engine reports it.
+			return nil, p.syntaxErrorAtCur()
+		}
+		item, err := parseItem()
+		if err != nil {
+			return nil, err
+		}
+		props = append(props, item)
+		if p.cur.Kind != int(',') {
+			// No separator, so the list ends here: a second item with nothing
+			// between them is left to expect(')') to refuse.
+			break
+		}
+		p.advance() // consume ','
+	}
+
+	if _, err := p.expect(int(')')); err != nil {
+		return nil, err
+	}
+
+	return props, nil
+}
+
+// parseStringProperty reads one "key"="value" item, both sides string
+// literals. This is the common propertyItem: the engine's own propertyKey and
+// propertyValue are `identifier | constant`, which is wider, but widening it
+// is a change of its own and refusing the extra forms fails closed.
+func (p *Parser) parseStringProperty() (*ast.Property, error) {
+	startLoc := p.cur.Loc
+
+	if p.cur.Kind != tokString {
+		return nil, p.syntaxErrorAtCur()
+	}
+	key := p.cur.Str
+	p.advance()
+
+	if _, err := p.expect(int('=')); err != nil {
+		return nil, err
+	}
+
+	if p.cur.Kind != tokString {
+		return nil, p.syntaxErrorAtCur()
+	}
+	val := p.cur.Str
+	endLoc := p.cur.Loc
+	p.advance()
+
+	return &ast.Property{
+		Key:   key,
+		Value: val,
+		Loc:   ast.Loc{Start: startLoc.Start, End: endLoc.End},
+	}, nil
+}
+
+// parsePropertyItem reads one property item in the grammar's full form:
+//
+//	propertyItem  : key=propertyKey EQ value=propertyValue
+//	propertyKey   : identifier | constant
+//	propertyValue : identifier | constant
+//
+// (DorisParser.g4). Most clauses take parseStringProperty instead, which is
+// narrower and fails closed. This one is for the lists that used to be
+// skipped unread -- a partition's inline properties and EXPORT's WITH BROKER
+// list -- where the narrower item would now refuse statements the engine
+// takes and this parser used to accept: (replication_num = "1"), ("k" = 1),
+// ("k" = HDD), ("k" = [1]) and ("k" = DATE "2020-01-01") all parse there,
+// while ("k" = SELECT), ("k" = a.b), ("k" = 1+1) and ("k" = +1) do not
+// (container-verified).
+//
+// A string keeps its unquoted text; any other key or value keeps its source
+// text.
+func (p *Parser) parsePropertyItem() (*ast.Property, error) {
+	startLoc := p.cur.Loc
+	key, _, err := p.parsePropertyAtom()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(int('=')); err != nil {
+		return nil, err
+	}
+	val, endLoc, err := p.parsePropertyAtom()
+	if err != nil {
+		return nil, err
+	}
+	return &ast.Property{
+		Key:   key,
+		Value: val,
+		Loc:   ast.Loc{Start: startLoc.Start, End: endLoc.End},
+	}, nil
+}
+
+// parsePropertyAtom reads one propertyKey or propertyValue: an identifier
+// (including a non-reserved keyword) or a constant.
+//
+//	constant : NULL | (DATE | DATEV1 | DATEV2 | TIMESTAMP) STRING_LITERAL
+//	         | number | booleanValue | STRING_LITERAL | VARBINARY_LITERAL
+//	         | arrayLiteral | mapLiteral | structLiteral | PLACEHOLDER
+//	number   : SUBTRACT? INTEGER_VALUE | SUBTRACT? (EXPONENT_VALUE | DECIMAL_VALUE)
+func (p *Parser) parsePropertyAtom() (string, ast.Loc, error) {
+	start := p.cur.Loc
+	switch p.cur.Kind {
+	case tokString:
+		tok := p.advance()
+		return tok.Str, tok.Loc, nil
+	case tokInt, tokFloat, tokHexLiteral, tokBitLiteral, tokPlaceholder,
+		kwNULL, kwTRUE, kwFALSE:
+		tok := p.advance()
+		return p.sourceText(tok.Loc), tok.Loc, nil
+	case int('-'):
+		if next := p.peekNext().Kind; next != tokInt && next != tokFloat {
+			p.advance() // consume '-'
+			return "", ast.Loc{}, p.syntaxErrorAtCur()
+		}
+		p.advance() // consume '-'
+		tok := p.advance()
+		loc := ast.Loc{Start: start.Start, End: tok.Loc.End}
+		return p.sourceText(loc), loc, nil
+	case int('['), int('{'):
+		lit, err := p.parseCollectionConstant()
+		if err != nil {
+			return "", ast.Loc{}, err
+		}
+		loc := ast.NodeLoc(lit)
+		return p.sourceText(loc), loc, nil
+	case kwDATE, kwDATEV1, kwDATEV2, kwTIMESTAMP:
+		// A typed constant when a string follows; otherwise the keyword is
+		// an identifier (DATE and the others are non-reserved).
+		if p.peekNext().Kind == tokString {
+			p.advance() // consume the type keyword
+			tok := p.advance()
+			loc := ast.Loc{Start: start.Start, End: tok.Loc.End}
+			return p.sourceText(loc), loc, nil
+		}
+	}
+	return p.parseIdentifier()
+}
+
+// sourceText returns the input text loc covers. Loc values are absolute, so
+// the segment's base offset comes off before indexing the segment's text.
+func (p *Parser) sourceText(loc ast.Loc) string {
+	return p.input[loc.Start-p.baseOffset : loc.End-p.baseOffset]
+}

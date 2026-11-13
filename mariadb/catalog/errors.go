@@ -1,0 +1,556 @@
+package catalog
+
+import "fmt"
+
+type Error struct {
+	Code     int
+	SQLState string
+	Message  string
+}
+
+func (e *Error) Error() string {
+	return fmt.Sprintf("ERROR %d (%s): %s", e.Code, e.SQLState, e.Message)
+}
+
+const (
+	ErrDupDatabase                       = 1007
+	ErrUnknownDatabase                   = 1049
+	ErrDupTable                          = 1050
+	ErrUnknownTable                      = 1051
+	ErrNonUniqTable                      = 1066
+	ErrUpdateTableUsed                   = 1093
+	ErrCantReopenTable                   = 1137
+	ErrWrongObject                       = 1347
+	ErrRowIsReferenced                   = 1451
+	ErrIsAView                           = 1965
+	ErrTableMustHaveColumns              = 1113
+	ErrDupColumn                         = 1060
+	ErrDupKeyName                        = 1061
+	ErrDupEntry                          = 1062
+	ErrMultiplePriKey                    = 1068
+	ErrInvalidDefault                    = 1067
+	ErrIncorrectTableDefinition          = 1075
+	ErrNoSuchTable                       = 1146
+	ErrNoSuchColumn                      = 1054
+	ErrNoDatabaseSelected                = 1046
+	ErrCantRemoveAllFields               = 1090
+	ErrDupIndex                          = 1831
+	ErrCantCreateTable                   = 1005
+	ErrCantDropKey                       = 1091
+	ErrCheckConstraintViolated           = 3819
+	ErrFKCannotDropParent                = 3730
+	ErrNoSuchFunction                    = 1305
+	ErrNoSuchProcedure                   = 1305
+	ErrDupFunction                       = 1304
+	ErrDupProcedure                      = 1304
+	ErrNoSuchTrigger                     = 1360
+	ErrDupTrigger                        = 1359
+	ErrNoSuchEvent                       = 1539
+	ErrTriggerInWrongSchema              = 1435
+	ErrDupEvent                          = 1537
+	ErrUnsupportedGeneratedStorageChange = 3106
+	ErrDependentByGenCol                 = 3108
+	ErrWrongArguments                    = 1210
+	ErrWrongNameForIndex                 = 1280
+	ErrInvalidOnUpdate                   = 1294
+	ErrTooBigPrecision                   = 1426
+	// The window-reference errors, measured on mariadb:11.8.8.
+	ErrWindowNoSuchWindow         = 4009
+	ErrWindowDuplicateName        = 4010
+	ErrWindowRefWithPartition     = 4011
+	ErrWindowRefHasOrder          = 4012
+	ErrWindowRefHasFrame          = 4013
+	ErrFKDupName                  = 1826
+	ErrCheckConstraintNotAllowed  = 3815
+	ErrCheckConstraintDupName     = 3822
+	ErrWrongSystemVersioning      = 4123
+	ErrRowColumnWrongType         = 4110
+	ErrNotSystemVersioned         = 4124
+	ErrAlterOnSystemVersioned     = 4119
+	ErrDuplicateRowColumn         = 4134
+	ErrAlreadySystemVersioned     = 4135
+	ErrTruncateSystemVersioned    = 4137
+	ErrMissingSystemVersioning    = 4125
+	ErrPeriodWrongColumns         = 4126
+	ErrWrongPartitionType         = 4113
+	ErrWrongSystemTimePartitions  = 4128
+	ErrValuesOnlyForRange         = 1480
+	ErrMultipleAppPeriods         = 4154
+	ErrColumnSpecifiedTwice       = 1110
+	ErrIncorrectColumnSpecifier   = 1063
+	ErrPeriodNotFound             = 4156
+	ErrKeyPartZeroLength          = 1391
+	ErrKeyColumnDoesNotExist      = 1072
+	ErrKeyIncludesPeriodColumn    = 4170
+	ErrPeriodFieldsDifferentTypes = 4153
+	ErrKeyDoesNotExist            = 1176
+	ErrPKIndexCantBeIgnored       = 4174
+)
+
+var sqlStateMap = map[int]string{
+	ErrDupDatabase:                       "HY000",
+	ErrUnknownDatabase:                   "42000",
+	ErrDupTable:                          "42S01",
+	ErrUnknownTable:                      "42S02",
+	ErrNonUniqTable:                      "42000",
+	ErrUpdateTableUsed:                   "HY000",
+	ErrCantReopenTable:                   "HY000",
+	ErrWrongObject:                       "HY000",
+	ErrRowIsReferenced:                   "23000",
+	ErrIsAView:                           "42S02",
+	ErrTableMustHaveColumns:              "42000",
+	ErrDupColumn:                         "42S21",
+	ErrDupKeyName:                        "42000",
+	ErrDupEntry:                          "23000",
+	ErrMultiplePriKey:                    "42000",
+	ErrInvalidDefault:                    "42000",
+	ErrIncorrectTableDefinition:          "42000",
+	ErrNoSuchTable:                       "42S02",
+	ErrNoSuchColumn:                      "42S22",
+	ErrNoDatabaseSelected:                "3D000",
+	ErrCantRemoveAllFields:               "42000",
+	ErrDupIndex:                          "42000",
+	ErrCantCreateTable:                   "HY000",
+	ErrCantDropKey:                       "42000",
+	ErrCheckConstraintViolated:           "HY000",
+	ErrFKCannotDropParent:                "HY000",
+	ErrNoSuchFunction:                    "42000",
+	ErrDupFunction:                       "HY000",
+	ErrNoSuchEvent:                       "HY000",
+	ErrTriggerInWrongSchema:              "HY000",
+	ErrDupEvent:                          "HY000",
+	ErrUnsupportedGeneratedStorageChange: "HY000",
+	ErrDependentByGenCol:                 "HY000",
+	ErrWrongSystemVersioning:             "HY000",
+	ErrRowColumnWrongType:                "HY000",
+	ErrNotSystemVersioned:                "HY000",
+	ErrAlterOnSystemVersioned:            "HY000",
+	ErrDuplicateRowColumn:                "HY000",
+	ErrAlreadySystemVersioned:            "HY000",
+	ErrTruncateSystemVersioned:           "HY000",
+	ErrMissingSystemVersioning:           "HY000",
+	ErrPeriodWrongColumns:                "HY000",
+	ErrWrongPartitionType:                "HY000",
+	ErrWrongSystemTimePartitions:         "HY000",
+	ErrValuesOnlyForRange:                "HY000",
+	ErrMultipleAppPeriods:                "HY000",
+	ErrColumnSpecifiedTwice:              "42000",
+	ErrIncorrectColumnSpecifier:          "42000",
+	ErrPeriodNotFound:                    "HY000",
+	ErrKeyPartZeroLength:                 "HY000",
+	ErrKeyColumnDoesNotExist:             "42000",
+	ErrKeyIncludesPeriodColumn:           "HY000",
+	ErrPeriodFieldsDifferentTypes:        "HY000",
+	ErrWrongArguments:                    "HY000",
+	ErrWrongNameForIndex:                 "42000",
+	ErrInvalidOnUpdate:                   "HY000",
+	ErrTooBigPrecision:                   "42000",
+	ErrFKDupName:                         "HY000",
+	ErrCheckConstraintNotAllowed:         "HY000",
+	ErrCheckConstraintDupName:            "HY000",
+	ErrKeyDoesNotExist:                   "42000",
+	ErrPKIndexCantBeIgnored:              "HY000",
+}
+
+func sqlState(code int) string {
+	if s, ok := sqlStateMap[code]; ok {
+		return s
+	}
+	return "HY000"
+}
+
+func errDupDatabase(name string) error {
+	return &Error{Code: ErrDupDatabase, SQLState: sqlState(ErrDupDatabase),
+		Message: fmt.Sprintf("Can't create database '%s'; database exists", name)}
+}
+
+func errUnknownDatabase(name string) error {
+	return &Error{Code: ErrUnknownDatabase, SQLState: sqlState(ErrUnknownDatabase),
+		Message: fmt.Sprintf("Unknown database '%s'", name)}
+}
+
+func errNoDatabaseSelected() error {
+	return &Error{Code: ErrNoDatabaseSelected, SQLState: sqlState(ErrNoDatabaseSelected),
+		Message: "No database selected"}
+}
+
+func errDupTable(name string) error {
+	return &Error{Code: ErrDupTable, SQLState: sqlState(ErrDupTable),
+		Message: fmt.Sprintf("Table '%s' already exists", name)}
+}
+
+func errNoSuchTable(db, name string) error {
+	return &Error{Code: ErrNoSuchTable, SQLState: sqlState(ErrNoSuchTable),
+		Message: fmt.Sprintf("Table '%s.%s' doesn't exist", db, name)}
+}
+
+func errDupColumn(name string) error {
+	return &Error{Code: ErrDupColumn, SQLState: sqlState(ErrDupColumn),
+		Message: fmt.Sprintf("Duplicate column name '%s'", name)}
+}
+
+func errDupKeyName(name string) error {
+	return &Error{Code: ErrDupKeyName, SQLState: sqlState(ErrDupKeyName),
+		Message: fmt.Sprintf("Duplicate key name '%s'", name)}
+}
+
+func errWrongNameForIndex(name string) error {
+	return &Error{Code: ErrWrongNameForIndex, SQLState: sqlState(ErrWrongNameForIndex),
+		Message: fmt.Sprintf("Incorrect index name '%s'", name)}
+}
+
+func errMultiplePriKey() error {
+	return &Error{Code: ErrMultiplePriKey, SQLState: sqlState(ErrMultiplePriKey),
+		Message: "Multiple primary key defined"}
+}
+
+// errKeyDoesNotExist is MariaDB's answer to an ALTER INDEX that names no index
+// of the table (1176, verified on 11.8.8).
+func errKeyDoesNotExist(key, table string) error {
+	return &Error{Code: ErrKeyDoesNotExist, SQLState: sqlState(ErrKeyDoesNotExist),
+		Message: fmt.Sprintf("Key '%s' doesn't exist in table '%s'", key, table)}
+}
+
+// errPKIndexCantBeIgnored is MariaDB's answer to an ignored primary key,
+// explicit or implicit (4174, verified on 11.8.8).
+func errPKIndexCantBeIgnored() error {
+	return &Error{Code: ErrPKIndexCantBeIgnored, SQLState: sqlState(ErrPKIndexCantBeIgnored),
+		Message: "A primary key cannot be marked as IGNORE"}
+}
+
+func errInvalidDefault(name string) error {
+	return &Error{Code: ErrInvalidDefault, SQLState: sqlState(ErrInvalidDefault),
+		Message: fmt.Sprintf("Invalid default value for '%s'", name)}
+}
+
+func errIncorrectAutoIncrementDefinition() error {
+	return &Error{Code: ErrIncorrectTableDefinition, SQLState: sqlState(ErrIncorrectTableDefinition),
+		Message: "Incorrect table definition; there can be only one auto column and it must be defined as a key"}
+}
+
+func errInvalidOnUpdate(name string) error {
+	return &Error{Code: ErrInvalidOnUpdate, SQLState: sqlState(ErrInvalidOnUpdate),
+		Message: fmt.Sprintf("Invalid ON UPDATE clause for '%s' column", name)}
+}
+
+func errTooBigPrecision(precision int, typ string) error {
+	return &Error{Code: ErrTooBigPrecision, SQLState: sqlState(ErrTooBigPrecision),
+		Message: fmt.Sprintf("Too big precision %d specified for '%s'. Maximum is 6.", precision, typ)}
+}
+
+// The window-reference errors. Every message is the server's own, read off
+// mariadb:11.8.8.
+func errWindowNoSuchWindow(name string) error {
+	return &Error{Code: ErrWindowNoSuchWindow, SQLState: sqlState(ErrWindowNoSuchWindow),
+		Message: fmt.Sprintf("Window specification with name '%s' is not defined", name)}
+}
+
+func errWindowDuplicateName(name string) error {
+	return &Error{Code: ErrWindowDuplicateName, SQLState: sqlState(ErrWindowDuplicateName),
+		Message: fmt.Sprintf("Multiple window specifications with the same name '%s'", name)}
+}
+
+func errWindowRefWithPartition(name string) error {
+	return &Error{Code: ErrWindowRefWithPartition, SQLState: sqlState(ErrWindowRefWithPartition),
+		Message: fmt.Sprintf("Window specification referencing another one '%s' cannot contain partition list", name)}
+}
+
+func errWindowRefHasOrder(name string) error {
+	return &Error{Code: ErrWindowRefHasOrder, SQLState: sqlState(ErrWindowRefHasOrder),
+		Message: fmt.Sprintf("Referenced window specification '%s' already contains order list", name)}
+}
+
+func errWindowRefHasFrame(name string) error {
+	return &Error{Code: ErrWindowRefHasFrame, SQLState: sqlState(ErrWindowRefHasFrame),
+		Message: fmt.Sprintf("Referenced window specification '%s' cannot contain window frame", name)}
+}
+
+func errNoSuchColumn(name, context string) error {
+	return &Error{Code: ErrNoSuchColumn, SQLState: sqlState(ErrNoSuchColumn),
+		Message: fmt.Sprintf("Unknown column '%s' in '%s'", name, context)}
+}
+
+func errUnknownTable(db, name string) error {
+	return &Error{Code: ErrUnknownTable, SQLState: sqlState(ErrUnknownTable),
+		Message: fmt.Sprintf("Unknown table '%s.%s'", db, name)}
+}
+
+// The six errors below are the ones CREATE OR REPLACE TABLE and CREATE
+// TABLE ... LIKE raise in MariaDB; messages as mariadb:11.8.8 prints them.
+
+func errNonUniqTable(name string) error {
+	return &Error{Code: ErrNonUniqTable, SQLState: sqlState(ErrNonUniqTable),
+		Message: fmt.Sprintf("Not unique table/alias: '%s'", name)}
+}
+
+func errUpdateTableUsed(name, operation string) error {
+	return &Error{Code: ErrUpdateTableUsed, SQLState: sqlState(ErrUpdateTableUsed),
+		Message: fmt.Sprintf("Table '%s' is specified twice, both as a target for '%s' and as a separate source for data", name, operation)}
+}
+
+func errCantReopenTable(alias string) error {
+	return &Error{Code: ErrCantReopenTable, SQLState: sqlState(ErrCantReopenTable),
+		Message: fmt.Sprintf("Can't reopen table: '%s'", alias)}
+}
+
+func errWrongObject(db, name, kind string) error {
+	return &Error{Code: ErrWrongObject, SQLState: sqlState(ErrWrongObject),
+		Message: fmt.Sprintf("'%s.%s' is not of type '%s'", db, name, kind)}
+}
+
+// errRowIsReferenced is what MariaDB reports when CREATE OR REPLACE TABLE
+// would drop a table another table's foreign key references.
+func errRowIsReferenced() error {
+	return &Error{Code: ErrRowIsReferenced, SQLState: sqlState(ErrRowIsReferenced),
+		Message: "Cannot delete or update a parent row: a foreign key constraint fails"}
+}
+
+func errIsAView(db, name string) error {
+	return &Error{Code: ErrIsAView, SQLState: sqlState(ErrIsAView),
+		Message: fmt.Sprintf("'%s.%s' is a view", db, name)}
+}
+
+// errTableMustHaveColumns is CREATE TABLE of a definition without columns.
+func errTableMustHaveColumns() error {
+	return &Error{Code: ErrTableMustHaveColumns, SQLState: sqlState(ErrTableMustHaveColumns),
+		Message: "A table must have at least 1 column"}
+}
+
+func errFKCannotDropParent(table, fkName, refTable string) error {
+	return &Error{Code: ErrFKCannotDropParent, SQLState: sqlState(ErrFKCannotDropParent),
+		Message: fmt.Sprintf("Cannot drop table '%s' referenced by a foreign key constraint '%s' on table '%s'", table, fkName, refTable)}
+}
+
+// errCantDropKey reports 1091 for a DROP of something that is not there.
+// MariaDB names what was being dropped and backticks it:
+// "Can't DROP COLUMN `x`; check that it exists", and the same for INDEX,
+// FOREIGN KEY and CONSTRAINT. MySQL 8.0 writes one message for all of them,
+// "Can't DROP 'x'; check that column/key exists". Measured on mariadb:11.8.8.
+func errCantDropKey(kind, name string) error {
+	return &Error{Code: ErrCantDropKey, SQLState: sqlState(ErrCantDropKey),
+		Message: fmt.Sprintf("Can't DROP %s `%s`; check that it exists", kind, name)}
+}
+
+func errCantRemoveAllFields() error {
+	return &Error{Code: ErrCantRemoveAllFields, SQLState: sqlState(ErrCantRemoveAllFields),
+		Message: "You can't delete all columns with ALTER TABLE; use DROP TABLE instead"}
+}
+
+// errFKIncorrectlyFormed reports the one error MariaDB gives for a foreign key
+// it cannot form, whatever the reason: a missing referenced table, a referenced
+// table with no index over the referenced columns, or column types that do not
+// match. MySQL 8.0 distinguishes them as 1824, 1822 and 3780 with a message
+// naming the cause. Measured on mariadb:11.8.8: all three, and the
+// ALTER TABLE ADD FOREIGN KEY form too, answer
+//
+//	ERROR 1005 (HY000): Can't create table `<db>`.`<table>` (errno: 150
+//	"Foreign key constraint is incorrectly formed")
+func errFKIncorrectlyFormed(db, table string) error {
+	return &Error{Code: ErrCantCreateTable, SQLState: sqlState(ErrCantCreateTable),
+		Message: fmt.Sprintf("Can't create table `%s`.`%s` (errno: 150 "+
+			"\"Foreign key constraint is incorrectly formed\")", db, table)}
+}
+
+func errFKDupName(name string) error {
+	return &Error{Code: ErrFKDupName, SQLState: sqlState(ErrFKDupName),
+		Message: fmt.Sprintf("Duplicate foreign key constraint name '%s'", name)}
+}
+
+func errCheckConstraintDupName(name string) error {
+	return &Error{Code: ErrCheckConstraintDupName, SQLState: sqlState(ErrCheckConstraintDupName),
+		Message: fmt.Sprintf("Duplicate check constraint name '%s'.", name)}
+}
+
+func errCheckConstraintNotAllowed(name string) error {
+	return &Error{Code: ErrCheckConstraintNotAllowed, SQLState: sqlState(ErrCheckConstraintNotAllowed),
+		Message: fmt.Sprintf("An expression of a check constraint '%s' contains disallowed function.", name)}
+}
+
+func errDupFunction(name string) error {
+	return &Error{Code: ErrDupFunction, SQLState: sqlState(ErrDupFunction),
+		Message: fmt.Sprintf("FUNCTION %s already exists", name)}
+}
+
+func errDupProcedure(name string) error {
+	return &Error{Code: ErrDupProcedure, SQLState: sqlState(ErrDupProcedure),
+		Message: fmt.Sprintf("PROCEDURE %s already exists", name)}
+}
+
+func errNoSuchFunction(name string) error {
+	return &Error{Code: ErrNoSuchFunction, SQLState: sqlState(ErrNoSuchFunction),
+		Message: fmt.Sprintf("FUNCTION %s does not exist", name)}
+}
+
+func errNoSuchProcedure(db, name string) error {
+	return &Error{Code: ErrNoSuchProcedure, SQLState: sqlState(ErrNoSuchProcedure),
+		Message: fmt.Sprintf("PROCEDURE %s.%s does not exist", db, name)}
+}
+
+func errDupTrigger(name string) error {
+	return &Error{Code: ErrDupTrigger, SQLState: sqlState(ErrDupTrigger),
+		Message: fmt.Sprintf("Trigger already exists")}
+}
+
+func errNoSuchTrigger(db, name string) error {
+	return &Error{Code: ErrNoSuchTrigger, SQLState: sqlState(ErrNoSuchTrigger),
+		Message: fmt.Sprintf("Trigger does not exist")}
+}
+
+func errDupEvent(name string) error {
+	return &Error{Code: ErrDupEvent, SQLState: sqlState(ErrDupEvent),
+		Message: fmt.Sprintf("Event '%s' already exists", name)}
+}
+
+func errTriggerInWrongSchema() error {
+	return &Error{Code: ErrTriggerInWrongSchema, SQLState: sqlState(ErrTriggerInWrongSchema), Message: "Trigger in wrong schema"}
+}
+
+func errNoSuchEvent(db, name string) error {
+	return &Error{Code: ErrNoSuchEvent, SQLState: sqlState(ErrNoSuchEvent),
+		Message: fmt.Sprintf("Unknown event '%s'", name)}
+}
+
+func errUnsupportedGeneratedStorageChange(col, table string) error {
+	return &Error{Code: ErrUnsupportedGeneratedStorageChange, SQLState: sqlState(ErrUnsupportedGeneratedStorageChange),
+		Message: fmt.Sprintf("'Changing the STORED status' is not supported for generated columns.")}
+}
+
+func errMissingSystemVersioning(table string) error {
+	return &Error{Code: ErrMissingSystemVersioning, SQLState: sqlState(ErrMissingSystemVersioning),
+		Message: fmt.Sprintf("Wrong parameters for `%s`: missing 'WITH SYSTEM VERSIONING'", table)}
+}
+
+func errPeriodWrongColumns(rowStart, rowEnd string) error {
+	return &Error{Code: ErrPeriodWrongColumns, SQLState: sqlState(ErrPeriodWrongColumns),
+		Message: fmt.Sprintf("PERIOD FOR SYSTEM_TIME must use columns `%s` and `%s`", rowStart, rowEnd)}
+}
+
+func errMissingRowStart(table string) error {
+	return &Error{Code: ErrMissingSystemVersioning, SQLState: sqlState(ErrMissingSystemVersioning),
+		Message: fmt.Sprintf("Wrong parameters for `%s`: missing 'AS ROW START'", table)}
+}
+
+func errMissingPeriod(table string) error {
+	return &Error{Code: ErrMissingSystemVersioning, SQLState: sqlState(ErrMissingSystemVersioning),
+		Message: fmt.Sprintf("Wrong parameters for `%s`: missing 'PERIOD FOR SYSTEM_TIME'", table)}
+}
+
+func errWrongPartitionType(byType string) error {
+	return &Error{Code: ErrWrongPartitionType, SQLState: sqlState(ErrWrongPartitionType),
+		Message: fmt.Sprintf("Wrong partition type `SYSTEM_TIME` for partitioning by `%s`", byType)}
+}
+
+func errWrongSystemTimePartitions(table string) error {
+	return &Error{Code: ErrWrongSystemTimePartitions, SQLState: sqlState(ErrWrongSystemTimePartitions),
+		Message: fmt.Sprintf("Wrong partitions for `%s`: must have at least one HISTORY and exactly one last CURRENT", table)}
+}
+
+func errValuesOnlyForRange() error {
+	return &Error{Code: ErrValuesOnlyForRange, SQLState: sqlState(ErrValuesOnlyForRange),
+		Message: "Only RANGE PARTITIONING can use VALUES LESS THAN in partition definition"}
+}
+
+func errMultipleAppPeriods() error {
+	return &Error{Code: ErrMultipleAppPeriods, SQLState: sqlState(ErrMultipleAppPeriods),
+		Message: "Cannot specify more than one application-time period"}
+}
+
+// errKeyPartZeroLength reports a key part declared with an explicit zero-length
+// prefix, e.g. `KEY (c(0))`. MariaDB rejects this with 1391 on every key path
+// and column type; a zero-length prefix is distinct from no prefix at all.
+func errKeyPartZeroLength(name string) error {
+	return &Error{Code: ErrKeyPartZeroLength, SQLState: sqlState(ErrKeyPartZeroLength),
+		Message: fmt.Sprintf("Key part '%s' length cannot be 0", name)}
+}
+
+// errKeyColumnDoesNotExist reports a key referencing a name that is not a column
+// (a nonexistent column, or a period name used as an ordinary key part). 1072.
+func errKeyColumnDoesNotExist(name string) error {
+	return &Error{Code: ErrKeyColumnDoesNotExist, SQLState: sqlState(ErrKeyColumnDoesNotExist),
+		Message: fmt.Sprintf("Key column '%s' doesn't exist in table", name)}
+}
+
+// errKeyIncludesPeriodColumn reports an application-time period column used as an
+// ordinary part of a WITHOUT OVERLAPS key. 4170.
+func errKeyIncludesPeriodColumn(keyName, colName string) error {
+	return &Error{Code: ErrKeyIncludesPeriodColumn, SQLState: sqlState(ErrKeyIncludesPeriodColumn),
+		Message: fmt.Sprintf("Key `%s` cannot explicitly include column `%s`", keyName, colName)}
+}
+
+func errColumnSpecifiedTwice(col string) error {
+	return &Error{Code: ErrColumnSpecifiedTwice, SQLState: sqlState(ErrColumnSpecifiedTwice),
+		Message: fmt.Sprintf("Column '%s' specified twice", col)}
+}
+
+// errCantDropPeriod reports DROP PERIOD for a period that does not exist. 1091.
+func errCantDropPeriod(name string) error {
+	return &Error{Code: ErrCantDropKey, SQLState: sqlState(ErrCantDropKey),
+		Message: fmt.Sprintf("Can't DROP PERIOD `%s`; check that it exists", name)}
+}
+
+// errPeriodFieldsDifferentTypes reports that a period's start and end columns
+// have different types — they must match exactly, including precision. 4153.
+func errPeriodFieldsDifferentTypes(name string) error {
+	return &Error{Code: ErrPeriodFieldsDifferentTypes, SQLState: sqlState(ErrPeriodFieldsDifferentTypes),
+		Message: fmt.Sprintf("Fields of PERIOD FOR `%s` have different types", name)}
+}
+
+func errPeriodNotFound(name string) error {
+	return &Error{Code: ErrPeriodNotFound, SQLState: sqlState(ErrPeriodNotFound),
+		Message: fmt.Sprintf("Period `%s` is not found in table", name)}
+}
+
+func errIncorrectColumnSpecifier(col string) error {
+	return &Error{Code: ErrIncorrectColumnSpecifier, SQLState: sqlState(ErrIncorrectColumnSpecifier),
+		Message: fmt.Sprintf("Incorrect column specifier for column '%s'", col)}
+}
+
+func errNotSystemVersioned(table string) error {
+	return &Error{Code: ErrNotSystemVersioned, SQLState: sqlState(ErrNotSystemVersioned),
+		Message: fmt.Sprintf("Table `%s` is not system-versioned", table)}
+}
+
+func errTruncateSystemVersioned(table string) error {
+	return &Error{Code: ErrTruncateSystemVersioned, SQLState: sqlState(ErrTruncateSystemVersioned),
+		Message: fmt.Sprintf("System-versioned tables do not support TRUNCATE TABLE, table `%s`", table)}
+}
+
+func errAlreadySystemVersioned(table string) error {
+	return &Error{Code: ErrAlreadySystemVersioned, SQLState: sqlState(ErrAlreadySystemVersioned),
+		Message: fmt.Sprintf("Table `%s` is already system-versioned", table)}
+}
+
+func errAlterColumnOnSystemVersioned(table string) error {
+	return &Error{Code: ErrAlterOnSystemVersioned, SQLState: sqlState(ErrAlterOnSystemVersioned),
+		Message: fmt.Sprintf("Not allowed for system-versioned `%s`. Change @@system_versioning_alter_history to proceed with ALTER.", table)}
+}
+
+func errNoVersionedColumn(table string) error {
+	return &Error{Code: ErrWrongSystemVersioning, SQLState: sqlState(ErrWrongSystemVersioning),
+		Message: fmt.Sprintf("Table `%s` must have at least one versioned column", table)}
+}
+
+func errDuplicateRowColumn(bound, col string) error {
+	return &Error{Code: ErrDuplicateRowColumn, SQLState: sqlState(ErrDuplicateRowColumn),
+		Message: fmt.Sprintf("Duplicate %s column `%s`", bound, col)}
+}
+
+func errWrongRowColumnType(table, col string) error {
+	return &Error{Code: ErrRowColumnWrongType, SQLState: sqlState(ErrRowColumnWrongType),
+		Message: fmt.Sprintf("`%s` in `%s` must be of type TIMESTAMP(6) or BIGINT(20) UNSIGNED", col, table)}
+}
+
+func errDependentByGeneratedColumn(column, genColumn, table string) error {
+	return &Error{Code: ErrDependentByGenCol, SQLState: sqlState(ErrDependentByGenCol),
+		Message: fmt.Sprintf("Column '%s' has a generated column dependency and cannot be dropped or renamed. A generated column '%s' refers to this column in table '%s'.", column, genColumn, table)}
+}
+
+func errCannotDropColumnFunctionalIndex(column string) error {
+	return &Error{Code: ErrDependentByGenCol, SQLState: sqlState(ErrDependentByGenCol),
+		Message: fmt.Sprintf("Cannot drop column '%s' because it is used by a functional index.", column)}
+}
+
+func errWrongArguments(fn string) error {
+	return &Error{Code: ErrWrongArguments, SQLState: sqlState(ErrWrongArguments),
+		Message: fmt.Sprintf("Incorrect arguments to %s", fn)}
+}

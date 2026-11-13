@@ -1,0 +1,464 @@
+package catalog
+
+import (
+	"strings"
+	"testing"
+)
+
+// TestScenario_C7 covers section C7 (Index defaults) from
+// mysql/catalog/SCENARIOS-mysql-implicit-behavior.md. Each subtest asserts that
+// both real MySQL 8.0 and the orrery catalog agree on default index
+// behaviour for a given DDL input.
+//
+// Failures in orrery assertions are NOT proof failures — they are
+// recorded in mysql/catalog/scenarios_bug_queue/c7.md.
+func TestScenario_C7(t *testing.T) {
+	mc, cleanup := scenarioContainer(t)
+	defer cleanup()
+
+	// --- 7.1 Index algorithm defaults to BTREE --------------------------
+	t.Run("7_1_btree_default", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT, KEY (a));`)
+
+		var got string
+		oracleScan(t, mc,
+			`SELECT INDEX_TYPE FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t' AND INDEX_NAME='a'`,
+			&got)
+		assertStringEq(t, "oracle index type", got, "BTREE")
+
+		idx := c7findIndex(c, "t", "a")
+		if idx == nil {
+			t.Errorf("orrery: index a missing")
+			return
+		}
+		// Orrery either stores "BTREE" explicitly or leaves blank; both round-trip
+		// to BTREE. We accept either.
+		got2 := strings.ToUpper(idx.IndexType)
+		if got2 != "" && got2 != "BTREE" {
+			t.Errorf("orrery: expected empty or BTREE, got %q", idx.IndexType)
+		}
+	})
+
+	// --- 7.2 FK creates implicit backing index --------------------------
+	t.Run("7_2_fk_implicit_index", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE p (id INT PRIMARY KEY);
+CREATE TABLE c (a INT, CONSTRAINT c_ibfk_1 FOREIGN KEY (a) REFERENCES p(id));`)
+
+		rows := oracleRows(t, mc, `SELECT INDEX_NAME FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='c'
+            ORDER BY INDEX_NAME`)
+		var oracleIdxNames []string
+		for _, r := range rows {
+			oracleIdxNames = append(oracleIdxNames, asString(r[0]))
+		}
+		want := "c_ibfk_1"
+		found := false
+		for _, n := range oracleIdxNames {
+			if n == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("oracle: expected index %q in %v", want, oracleIdxNames)
+		}
+
+		tbl := c.GetDatabase("testdb").GetTable("c")
+		if tbl == nil {
+			t.Errorf("orrery: table c missing")
+			return
+		}
+		// orrery: should have an index on column a backing the FK
+		hasBackingIdx := false
+		for _, idx := range tbl.Indexes {
+			if len(idx.Columns) >= 1 && strings.EqualFold(idx.Columns[0].Name, "a") {
+				hasBackingIdx = true
+				if idx.Name != "c_ibfk_1" {
+					t.Errorf("orrery: backing index name = %q, want c_ibfk_1", idx.Name)
+				}
+				break
+			}
+		}
+		assertBoolEq(t, "orrery FK backing index exists", hasBackingIdx, true)
+	})
+
+	// --- 7.3 USING HASH is kept on InnoDB ------------------------------
+	// MariaDB keeps the index type it was given; MySQL 8.0 coerces HASH to
+	// BTREE for InnoDB. Measured on mariadb:11.8.8.
+	t.Run("7_3_hash_kept_on_innodb", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT, KEY (a) USING HASH) ENGINE=InnoDB;`)
+
+		var got string
+		oracleScan(t, mc,
+			`SELECT INDEX_TYPE FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t' AND INDEX_NAME='a'`,
+			&got)
+		assertStringEq(t, "oracle index type for USING HASH", got, "HASH")
+
+		idx := c7findIndex(c, "t", "a")
+		if idx == nil {
+			t.Errorf("orrery: index a missing")
+			return
+		}
+		got2 := strings.ToUpper(idx.IndexType)
+		if got2 != "" && got2 != "BTREE" {
+			t.Errorf("orrery: expected empty or BTREE (HASH coercion), got %q", idx.IndexType)
+		}
+	})
+
+	// --- 7.4 USING BTREE explicit vs implicit rendering -----------------
+	t.Run("7_4_using_explicit_vs_implicit", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t1 (a INT, KEY (a));
+CREATE TABLE t2 (a INT, KEY (a) USING BTREE);`)
+
+		ct1 := oracleShow(t, mc, "SHOW CREATE TABLE t1")
+		ct2 := oracleShow(t, mc, "SHOW CREATE TABLE t2")
+		// t1 should NOT contain USING BTREE in the KEY line
+		if strings.Contains(ct1, "USING BTREE") {
+			t.Errorf("oracle: t1 unexpectedly contains USING BTREE: %s", ct1)
+		}
+		// t2 SHOULD contain USING BTREE
+		if !strings.Contains(ct2, "USING BTREE") {
+			t.Errorf("oracle: t2 missing USING BTREE: %s", ct2)
+		}
+
+		// orrery: both tables exist; presence of explicit-flag distinction
+		// is an open orrery gap. We assert both indexes parse and exist.
+		tbl1 := c.GetDatabase("testdb").GetTable("t1")
+		tbl2 := c.GetDatabase("testdb").GetTable("t2")
+		if tbl1 == nil || tbl2 == nil {
+			t.Errorf("orrery: t1=%v t2=%v missing", tbl1, tbl2)
+			return
+		}
+		idx1 := c7findIndex(c, "t1", "a")
+		idx2 := c7findIndex(c, "t2", "a")
+		if idx1 == nil || idx2 == nil {
+			t.Errorf("orrery: idx1=%v idx2=%v missing", idx1, idx2)
+			return
+		}
+		// orrery gap: the catalog has no IndexTypeExplicit field, so it
+		// cannot distinguish the two. We assert the distinction here so
+		// that the test fails until orrery grows the bit.
+		t1Explicit := strings.EqualFold(idx1.IndexType, "BTREE")
+		t2Explicit := strings.EqualFold(idx2.IndexType, "BTREE")
+		if t1Explicit == t2Explicit {
+			t.Errorf("orrery: cannot distinguish explicit BTREE from default: t1=%q t2=%q",
+				idx1.IndexType, idx2.IndexType)
+		}
+	})
+
+	// --- 7.5 UNIQUE allows multiple NULLs -------------------------------
+	t.Run("7_5_unique_multiple_nulls", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT, UNIQUE KEY (a));`)
+
+		// Insert three NULLs (oracle only — orrery catalog does not execute DML).
+		for i := 0; i < 3; i++ {
+			if _, err := mc.db.ExecContext(mc.ctx, "INSERT INTO testdb.t VALUES (NULL)"); err != nil {
+				t.Errorf("oracle: insert NULL %d failed: %v", i, err)
+			}
+		}
+		var count int
+		oracleScan(t, mc, "SELECT COUNT(*) FROM testdb.t", &count)
+		assertIntEq(t, "oracle row count after 3 NULL inserts", count, 3)
+
+		// Insert two (1)s — second should fail with duplicate key.
+		if _, err := mc.db.ExecContext(mc.ctx, "INSERT INTO testdb.t VALUES (1)"); err != nil {
+			t.Errorf("oracle: first INSERT 1 failed: %v", err)
+		}
+		_, err := mc.db.ExecContext(mc.ctx, "INSERT INTO testdb.t VALUES (1)")
+		if err == nil {
+			t.Errorf("oracle: expected duplicate-key error on second INSERT 1")
+		} else if !strings.Contains(err.Error(), "1062") &&
+			!strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+			t.Errorf("oracle: expected ER_DUP_ENTRY 1062, got %v", err)
+		}
+
+		// orrery: column a must remain nullable after UNIQUE.
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+			return
+		}
+		col := tbl.GetColumn("a")
+		if col == nil {
+			t.Errorf("orrery: column a missing")
+			return
+		}
+		assertBoolEq(t, "orrery: UNIQUE keeps column nullable", col.Nullable, true)
+	})
+
+	// --- 7.6 VISIBLE default + PK INVISIBLE rejection -------------------
+	t.Run("7_6_visible_default_pk_invisible_blocked", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT, KEY ix (a));`)
+
+		// MariaDB marks an index it skips with IGNORED, where MySQL 8.0 has an
+		// IS_VISIBLE column of the opposite sense. Measured on mariadb:11.8.8:
+		// information_schema.STATISTICS has IGNORED and no IS_VISIBLE.
+		var ignored string
+		oracleScan(t, mc,
+			`SELECT IGNORED FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t' AND INDEX_NAME='ix'`,
+			&ignored)
+		assertStringEq(t, "oracle IGNORED default", ignored, "NO")
+
+		idx := c7findIndex(c, "t", "ix")
+		if idx == nil {
+			t.Errorf("orrery: index ix missing")
+		} else {
+			assertBoolEq(t, "orrery: index visible default", idx.Visible, true)
+		}
+
+		// A primary key cannot be skipped. MariaDB has no INVISIBLE keyword for
+		// an index at all — it spells the attribute IGNORED — so the clause is
+		// a syntax error (1064) where MySQL 8.0 answers 3522. Measured on
+		// mariadb:11.8.8.
+		_, mysqlErr := mc.db.ExecContext(mc.ctx,
+			`CREATE TABLE t_pkinv (a INT, PRIMARY KEY (a) IGNORED)`)
+		if mysqlErr == nil {
+			t.Errorf("oracle: expected a primary key to be refused IGNORED, got nil")
+		}
+
+		results, err := c.Exec(`CREATE TABLE t_pkinv (a INT, PRIMARY KEY (a) IGNORED);`, nil)
+		orreryErrored := err != nil
+		if !orreryErrored {
+			for _, r := range results {
+				if r.Error != nil {
+					orreryErrored = true
+					break
+				}
+			}
+		}
+		assertBoolEq(t, "orrery: rejects PK INVISIBLE", orreryErrored, true)
+	})
+
+	// --- 7.7 BLOB/TEXT key prefix --------------------------------------
+	t.Run("7_7_blob_text_prefix", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		// Form 1: a TEXT key with no length is accepted, and the server gives
+		// it the longest prefix the index can hold — `KEY ix (a(768))` for a
+		// utf8mb4 TEXT. MySQL 8.0 refuses it with ER_BLOB_KEY_WITHOUT_LENGTH
+		// (1170). Measured on mariadb:11.8.8.
+		if _, err := mc.db.ExecContext(mc.ctx,
+			`CREATE TABLE t_noprefix (a TEXT, KEY ix (a))`); err != nil {
+			t.Errorf("oracle: expected a TEXT key with no length to be accepted, got %v", err)
+		} else {
+			create := oracleShow(t, mc, "SHOW CREATE TABLE t_noprefix")
+			if !strings.Contains(create, "`a`(") {
+				t.Errorf("oracle: expected a prefix length on the TEXT key, got %s", create)
+			}
+		}
+
+		// Form 2: TEXT KEY with prefix length succeeds; SUB_PART=100.
+		runOnBoth(t, mc, c, `CREATE TABLE t_prefix (a TEXT, KEY (a(100)));`)
+		var subPart int
+		oracleScan(t, mc,
+			`SELECT SUB_PART FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t_prefix' AND INDEX_NAME='a'`,
+			&subPart)
+		assertIntEq(t, "oracle SUB_PART", subPart, 100)
+
+		idx := c7findIndex(c, "t_prefix", "a")
+		if idx == nil {
+			t.Errorf("orrery: index a on t_prefix missing")
+		} else if len(idx.Columns) != 1 {
+			t.Errorf("orrery: expected 1 column in idx, got %d", len(idx.Columns))
+		} else {
+			assertIntEq(t, "orrery: prefix length", idx.Columns[0].Length, 100)
+		}
+
+		// Form 3: FULLTEXT exempt from prefix requirement.
+		runOnBoth(t, mc, c, `CREATE TABLE t_ft (a TEXT, FULLTEXT KEY (a));`)
+		var idxType string
+		oracleScan(t, mc,
+			`SELECT INDEX_TYPE FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t_ft' AND INDEX_NAME='a'`,
+			&idxType)
+		assertStringEq(t, "oracle FULLTEXT index type", idxType, "FULLTEXT")
+	})
+
+	// --- 7.8 FULLTEXT WITH PARSER optionality ---------------------------
+	t.Run("7_8_fulltext_parser_optional", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t1 (a TEXT, FULLTEXT KEY (a));`)
+
+		ct1 := oracleShow(t, mc, "SHOW CREATE TABLE t1")
+		if strings.Contains(ct1, "WITH PARSER") {
+			t.Errorf("oracle: t1 (no parser) unexpectedly contains WITH PARSER: %s", ct1)
+		}
+
+		// ngram is a MySQL 8.0 plugin, which MariaDB does not ship: the clause
+		// parses and the server then answers 1128 "Function 'ngram' is not
+		// defined". Measured on mariadb:11.8.8.
+		if _, err := mc.db.ExecContext(mc.ctx,
+			`CREATE TABLE t2 (a TEXT, FULLTEXT KEY (a) WITH PARSER ngram)`); err == nil {
+			t.Errorf("oracle: expected WITH PARSER ngram to be refused")
+		} else if !strings.Contains(err.Error(), "1128") {
+			t.Errorf("oracle: expected 1128 for an undefined parser, got %v", err)
+		}
+
+		idx1 := c7findIndex(c, "t1", "a")
+		if idx1 == nil {
+			t.Errorf("orrery: idx1 missing")
+			return
+		}
+		assertBoolEq(t, "orrery t1 fulltext", idx1.Fulltext, true)
+	})
+
+	// --- 7.9 SPATIAL requires NOT NULL ----------------------------------
+	t.Run("7_9_spatial_not_null", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		// OK case: a NOT NULL geometry. A per-column `SRID <n>` is MySQL 8.0's;
+		// MariaDB has no grammar for it and answers 1064. Measured on
+		// mariadb:11.8.8.
+		runOnBoth(t, mc, c, `CREATE TABLE t_ok (g GEOMETRY NOT NULL, SPATIAL KEY (g));`)
+		if _, err := mc.db.ExecContext(mc.ctx,
+			`CREATE TABLE t_srid (g GEOMETRY NOT NULL SRID 4326)`); err == nil {
+			t.Errorf("oracle: expected a per-column SRID to be refused")
+		}
+
+		// Error case 1: nullable geometry — ER_SPATIAL_CANT_HAVE_NULL 1252.
+		_, mysqlErr := mc.db.ExecContext(mc.ctx,
+			`CREATE TABLE t_null (g GEOMETRY, SPATIAL KEY (g))`)
+		if mysqlErr == nil {
+			t.Errorf("oracle: expected ER_SPATIAL_CANT_HAVE_NULL, got nil")
+		} else if !strings.Contains(mysqlErr.Error(), "1252") &&
+			!strings.Contains(strings.ToLower(mysqlErr.Error()), "all parts of a spatial index") {
+			t.Errorf("oracle: expected 1252, got %v", mysqlErr)
+		}
+		results, err := c.Exec(`CREATE TABLE t_null (g GEOMETRY, SPATIAL KEY (g));`, nil)
+		orreryErrored := err != nil
+		if !orreryErrored {
+			for _, r := range results {
+				if r.Error != nil {
+					orreryErrored = true
+					break
+				}
+			}
+		}
+		assertBoolEq(t, "orrery: rejects nullable SPATIAL", orreryErrored, true)
+
+		// Error case 2: SPATIAL with USING BTREE — ER_INDEX_TYPE_NOT_SUPPORTED_FOR_SPATIAL_INDEX 3500.
+		_, mysqlErr2 := mc.db.ExecContext(mc.ctx,
+			`CREATE TABLE t_spbtree (g GEOMETRY NOT NULL, SPATIAL KEY (g) USING BTREE)`)
+		if mysqlErr2 == nil {
+			t.Errorf("oracle: expected rejection of SPATIAL USING BTREE, got nil")
+		} else {
+			// MySQL 8.0 parser rejects `USING BTREE` on a SPATIAL index at parse
+			// time with a plain syntax error (1064) rather than the semantic
+			// ER_INDEX_TYPE_NOT_SUPPORTED_FOR_SPATIAL_INDEX (3500). Accept either
+			// so the scenario is version-robust.
+			msg := strings.ToLower(mysqlErr2.Error())
+			if !strings.Contains(mysqlErr2.Error(), "3500") &&
+				!strings.Contains(mysqlErr2.Error(), "1064") &&
+				!strings.Contains(msg, "not supported") &&
+				!strings.Contains(msg, "syntax") {
+				t.Errorf("oracle: expected 3500 or 1064/syntax, got %v", mysqlErr2)
+			}
+		}
+		results2, err2 := c.Exec(
+			`CREATE TABLE t_spbtree (g GEOMETRY NOT NULL, SPATIAL KEY (g) USING BTREE);`, nil)
+		orreryErrored2 := err2 != nil
+		if !orreryErrored2 {
+			for _, r := range results2 {
+				if r.Error != nil {
+					orreryErrored2 = true
+					break
+				}
+			}
+		}
+		assertBoolEq(t, "orrery: rejects SPATIAL USING BTREE", orreryErrored2, true)
+	})
+
+	// --- 7.10 PK + UNIQUE coexistence on same column --------------------
+	t.Run("7_10_pk_and_unique_coexist", func(t *testing.T) {
+		scenarioReset(t, mc)
+		c := scenarioNewCatalog(t)
+
+		runOnBoth(t, mc, c, `CREATE TABLE t (a INT NOT NULL, PRIMARY KEY (a), UNIQUE KEY uk (a));`)
+
+		rows := oracleRows(t, mc, `SELECT INDEX_NAME FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA='testdb' AND TABLE_NAME='t'
+            ORDER BY INDEX_NAME`)
+		var got []string
+		for _, r := range rows {
+			got = append(got, asString(r[0]))
+		}
+		// Expect both PRIMARY and uk.
+		havePrimary := false
+		haveUk := false
+		for _, n := range got {
+			if n == "PRIMARY" {
+				havePrimary = true
+			}
+			if n == "uk" {
+				haveUk = true
+			}
+		}
+		if !havePrimary || !haveUk {
+			t.Errorf("oracle: expected both PRIMARY and uk indexes, got %v", got)
+		}
+
+		tbl := c.GetDatabase("testdb").GetTable("t")
+		if tbl == nil {
+			t.Errorf("orrery: table t missing")
+			return
+		}
+		orreryHasPK := false
+		orreryHasUk := false
+		for _, idx := range tbl.Indexes {
+			if idx.Primary {
+				orreryHasPK = true
+			}
+			if idx.Unique && !idx.Primary && idx.Name == "uk" {
+				orreryHasUk = true
+			}
+		}
+		assertBoolEq(t, "orrery: has PRIMARY index", orreryHasPK, true)
+		assertBoolEq(t, "orrery: has uk unique index", orreryHasUk, true)
+	})
+}
+
+// --- section-local helpers ------------------------------------------------
+
+// c7findIndex returns the named index on the given table in testdb, or nil.
+func c7findIndex(c *Catalog, tableName, indexName string) *Index {
+	db := c.GetDatabase("testdb")
+	if db == nil {
+		return nil
+	}
+	tbl := db.GetTable(tableName)
+	if tbl == nil {
+		return nil
+	}
+	for _, idx := range tbl.Indexes {
+		if strings.EqualFold(idx.Name, indexName) {
+			return idx
+		}
+	}
+	return nil
+}

@@ -1,0 +1,2923 @@
+package parser
+
+import (
+	"strconv"
+	"strings"
+
+	nodes "github.com/Dxlxz/orrery-sql/mariadb/ast"
+)
+
+// parseWithClause parses a WITH clause (Common Table Expressions).
+//
+// Ref: https://dev.mysql.com/doc/refman/8.0/en/with.html
+//
+//	with_clause:
+//	    WITH [RECURSIVE]
+//	        cte_name [(col_name [, col_name] ...)] AS (subquery)
+//	        [, cte_name [(col_name [, col_name] ...)] AS (subquery)] ...
+func (p *Parser) parseWithClause() ([]*nodes.CommonTableExpr, error) {
+	if err := p.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer p.leaveNesting()
+	// Record CTE position for completion context (before consuming WITH).
+	if p.completing {
+		p.addCTEPosition(p.pos())
+	}
+	p.advance() // consume WITH
+
+	// Completion: after WITH keyword, offer RECURSIVE and identifier context for CTE name.
+	p.checkCursor()
+	if p.collectMode() {
+		p.addTokenCandidate(kwRECURSIVE)
+		return nil, &ParseError{Message: "collecting"}
+	}
+
+	recursive := false
+	if _, ok := p.match(kwRECURSIVE); ok {
+		recursive = true
+	}
+
+	var ctes []*nodes.CommonTableExpr
+	for {
+		start := p.pos()
+		name, _, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+
+		cte := &nodes.CommonTableExpr{
+			Loc:       nodes.Loc{Start: start},
+			Name:      name,
+			Recursive: recursive,
+		}
+
+		// Optional column list: (col1, col2, ...)
+		if p.cur.Type == '(' {
+			cols, err := p.parseParenIdentList()
+			if err != nil {
+				return nil, err
+			}
+			cte.Columns = cols
+		}
+
+		// AS (subquery)
+		if _, err := p.expect(kwAS); err != nil {
+			return nil, err
+		}
+		if _, err := p.expect('('); err != nil {
+			return nil, err
+		}
+
+		// Completion: inside CTE AS (, offer SELECT keyword.
+		p.checkCursor()
+		if p.collectMode() {
+			p.addTokenCandidate(kwSELECT)
+			return nil, &ParseError{Message: "collecting"}
+		}
+
+		sel, err := p.parseSelectStmt()
+		if err != nil {
+			return nil, err
+		}
+		cte.Select = sel
+
+		if _, err := p.expect(')'); err != nil {
+			return nil, err
+		}
+
+		cte.Loc.End = p.prev.End
+		ctes = append(ctes, cte)
+
+		if p.cur.Type != ',' {
+			break
+		}
+		p.advance()
+	}
+
+	return ctes, nil
+}
+
+// parseWithStmt parses a statement starting with WITH: WITH ... SELECT, WITH ... UPDATE, WITH ... DELETE.
+func (p *Parser) parseWithStmt() (nodes.Node, error) {
+	start := p.pos()
+	ctes, err := p.parseWithClause()
+	if err != nil {
+		return nil, err
+	}
+
+	switch p.cur.Type {
+	case kwSELECT, kwVALUES, '(':
+		// A SELECT leaf, a table value constructor, or a parenthesized
+		// query body, and the INTO a statement may end with:
+		//   WITH ... SELECT ...
+		//   WITH ... VALUES (...) [INTO ...]
+		//   WITH ... (SELECT ...) [set-op] [ORDER BY / LIMIT] [INTO ...]
+		sel, err := p.parseSelectClauseAndTrailing(start, ctes)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.parseTrailingInto(sel); err != nil {
+			return nil, err
+		}
+		return sel, nil
+
+	case kwINSERT, kwREPLACE:
+		isReplace := p.cur.Type == kwREPLACE
+		stmt, err := p.parseInsertOrReplace(isReplace)
+		if err != nil {
+			return nil, err
+		}
+		stmt.Loc.Start = start
+		return stmt, nil
+
+	case kwUPDATE:
+		stmt, err := p.parseUpdateStmt()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Loc.Start = start
+		return stmt, nil
+
+	case kwDELETE:
+		stmt, err := p.parseDeleteStmt()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Loc.Start = start
+		return stmt, nil
+
+	default:
+		return nil, &ParseError{
+			Message:  "expected SELECT, VALUES, INSERT, UPDATE, DELETE, or '(' after WITH clause",
+			Position: p.cur.Loc,
+		}
+	}
+}
+
+// parseSelectStmt parses a complete query expression as a statement: an
+// optional WITH clause, a query-expression body (a SELECT leaf, a parenthesized
+// query, or a UNION/INTERSECT/EXCEPT chain), and any trailing ORDER BY / LIMIT.
+// It is the entry point every query-bearing context uses (statement level,
+// subqueries, INSERT/CTAS/VIEW sources, routine bodies). A query nested in an
+// ON DUPLICATE KEY UPDATE assignment reads VALUES as a table value
+// constructor again.
+func (p *Parser) parseSelectStmt() (*nodes.SelectStmt, error) {
+	if p.valuesIsFunction {
+		p.valuesIsFunction = false
+		defer func() { p.valuesIsFunction = true }()
+	}
+	return p.parseSelectNoParens()
+}
+
+// parseSelectNoParens parses a query expression that is not itself wrapped in
+// parentheses (PostgreSQL's select_no_parens): [WITH] select_clause
+// [ORDER BY] [LIMIT/OFFSET]. The trailing ORDER BY / LIMIT bind at this OUTER
+// level, which is what gives a parenthesized inner query and an outer clause
+// distinct scopes.
+func (p *Parser) parseSelectNoParens() (*nodes.SelectStmt, error) {
+	start := p.pos()
+
+	// Optional WITH clause (applies to the whole query expression).
+	var ctes []*nodes.CommonTableExpr
+	if p.cur.Type == kwWITH {
+		var err error
+		ctes, err = p.parseWithClause()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return p.parseSelectClauseAndTrailing(start, ctes)
+}
+
+// parseSelectClauseAndTrailing parses a select_clause followed by the trailing
+// ORDER BY / LIMIT that applies to a parenthesized query or set-operation
+// result. ctes (already parsed by the caller) and start (the position of the
+// leading WITH / '(' / SELECT) are attached to the resulting node.
+func (p *Parser) parseSelectClauseAndTrailing(start int, ctes []*nodes.CommonTableExpr) (*nodes.SelectStmt, error) {
+	body, err := p.parseSelectClause(0)
+	if err != nil {
+		return nil, err
+	}
+	if body == nil { // collecting completion candidates
+		return nil, nil
+	}
+	return p.parseQueryExpressionTail(body, start, ctes)
+}
+
+// parseQueryExpressionTail attaches ctes and start to body, a parsed
+// select_clause, and parses the trailing ORDER BY / LIMIT that applies to a
+// parenthesized query or set-operation result.
+func (p *Parser) parseQueryExpressionTail(body *nodes.SelectStmt, start int, ctes []*nodes.CommonTableExpr) (*nodes.SelectStmt, error) {
+	if len(ctes) > 0 {
+		body.CTEs = ctes
+	}
+	body.Loc.Start = start
+
+	// A trailing ORDER BY / LIMIT after a parenthesized query or a set operation
+	// (i.e. after a ')') applies to the whole result. A bare SELECT leaf has
+	// already consumed its own ORDER BY / LIMIT / locking greedily, so it is
+	// skipped here (a second ORDER BY on a leaf is a duplicate the leaf rejects).
+	if body.ParenSource != nil || body.SetOp != nodes.SetOpNone {
+		if err := p.parseOuterOrderByLimit(body); err != nil {
+			return nil, err
+		}
+	}
+
+	body.Loc.End = p.prev.End
+	return body, nil
+}
+
+// parseOuterOrderByLimit parses trailing ORDER BY, LIMIT/OFFSET, and locking
+// clauses applying to a parenthesized query or set-operation result, onto stmt's
+// own fields. MySQL accepts FOR UPDATE / LOCK IN SHARE MODE after a closing ')',
+// unlike TiDB's leaf-only locking placement.
+func (p *Parser) parseOuterOrderByLimit(stmt *nodes.SelectStmt) error {
+	if p.cur.Type == kwORDER {
+		p.advance()
+		if _, err := p.expect(kwBY); err != nil {
+			return err
+		}
+		orderBy, err := p.parseOrderByList()
+		if err != nil {
+			return err
+		}
+		stmt.OrderBy = orderBy
+		if p.cur.Type == kwORDER {
+			return &ParseError{Message: "duplicate ORDER BY clause", Position: p.cur.Loc}
+		}
+	}
+	if _, ok := p.match(kwLIMIT); ok {
+		limit, err := p.parseLimitClause()
+		if err != nil {
+			return err
+		}
+		stmt.Limit = limit
+		if p.cur.Type == kwLIMIT {
+			return &ParseError{Message: "duplicate LIMIT clause", Position: p.cur.Loc}
+		}
+	}
+	// A leaf has read its own lock already, so one here follows a parenthesized last branch
+	// of a set operation, which the action refuses with 1221, ER_WRONG_USAGE: `(SELECT 1) FOR
+	// UPDATE` and `(SELECT 1) UNION SELECT 2 FOR UPDATE` run.
+	if stmt.SetOp != nodes.SetOpNone && (p.cur.Type == kwFOR || p.cur.Type == kwLOCK) {
+		return &ParseError{Message: "Incorrect usage of lock options and SELECT in brackets", Position: p.cur.Loc}
+	}
+	if p.cur.Type == kwFOR {
+		fu, err := p.parseForUpdateClause()
+		if err != nil {
+			return err
+		}
+		stmt.ForUpdate = fu
+	} else if p.cur.Type == kwLOCK {
+		fu, err := p.parseLockInShareMode()
+		if err != nil {
+			return err
+		}
+		stmt.ForUpdate = fu
+	}
+	return nil
+}
+
+// parseSelectClause parses a select_clause: a query primary optionally combined
+// with others via UNION / INTERSECT / EXCEPT, using precedence climbing
+// (INTERSECT binds tighter than UNION/EXCEPT). minPrec is the minimum operator
+// precedence this call will consume; the top-level no_parens call passes 0.
+func (p *Parser) parseSelectClause(minPrec int) (*nodes.SelectStmt, error) {
+	if err := p.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer p.leaveNesting()
+	left, err := p.parseSelectClausePrimary()
+	if err != nil {
+		return nil, err
+	}
+	if left == nil { // collecting completion candidates
+		return nil, nil
+	}
+	return p.parseSetOperations(left, minPrec)
+}
+
+// parseSetOperations parses the set operations, of at least minPrec
+// precedence, that follow left, the query primary already parsed.
+func (p *Parser) parseSetOperations(left *nodes.SelectStmt, minPrec int) (*nodes.SelectStmt, error) {
+	for {
+		prec := setOpPrecedence(p.cur.Type)
+		if prec == 0 || prec < minPrec {
+			return left, nil
+		}
+
+		var op nodes.SetOperation
+		switch p.cur.Type {
+		case kwUNION:
+			op = nodes.SetOpUnion
+		case kwEXCEPT:
+			op = nodes.SetOpExcept
+		case kwINTERSECT:
+			op = nodes.SetOpIntersect
+		}
+		p.advance() // consume UNION/INTERSECT/EXCEPT
+
+		// Completion: after the set-op keyword, offer ALL, DISTINCT, SELECT.
+		p.checkCursor()
+		if p.collectMode() {
+			p.addTokenCandidate(kwALL)
+			p.addTokenCandidate(kwDISTINCT)
+			p.addTokenCandidate(kwSELECT)
+			return nil, &ParseError{Message: "collecting"}
+		}
+
+		all := false
+		if _, ok := p.match(kwALL); ok {
+			all = true
+		} else {
+			p.match(kwDISTINCT)
+		}
+
+		// Completion: after ALL/DISTINCT, offer SELECT.
+		p.checkCursor()
+		if p.collectMode() {
+			p.addTokenCandidate(kwSELECT)
+			return nil, &ParseError{Message: "collecting"}
+		}
+
+		// Right operand binds higher-precedence operators first; prec+1 keeps
+		// same-precedence chains left-associative.
+		right, err := p.parseSelectClause(prec + 1)
+		if err != nil {
+			return nil, err
+		}
+
+		// Hoist a trailing ORDER BY / LIMIT off an UNPARENTHESIZED last operand
+		// onto the set-operation node: in MySQL they apply to the whole
+		// combined result. A parenthesized operand is a ParenSource wrapper whose
+		// own OrderBy/Limit are the OUTER scope, so the walk stops at it and its
+		// inner clauses stay in place — e.g. "SELECT 1 UNION (SELECT 2 LIMIT 1)"
+		// keeps LIMIT 1 on operand 2.
+		var orderBy []*nodes.OrderByItem
+		var limit *nodes.Limit
+		rightLeaf := right
+		for rightLeaf.SetOp != nodes.SetOpNone && rightLeaf.Right != nil {
+			rightLeaf = rightLeaf.Right
+		}
+		if rightLeaf.ParenSource == nil {
+			if len(rightLeaf.OrderBy) > 0 {
+				orderBy = rightLeaf.OrderBy
+				rightLeaf.OrderBy = nil
+			}
+			if rightLeaf.Limit != nil {
+				limit = rightLeaf.Limit
+				rightLeaf.Limit = nil
+			}
+		}
+
+		left = &nodes.SelectStmt{
+			Loc:     nodes.Loc{Start: left.Loc.Start, End: right.Loc.End},
+			SetOp:   op,
+			SetAll:  all,
+			Left:    left,
+			Right:   right,
+			OrderBy: orderBy,
+			Limit:   limit,
+		}
+	}
+}
+
+// parseSelectClausePrimary parses a single query primary: a parenthesized query
+// (select_with_parens), a simple SELECT leaf, or a table value constructor.
+// MariaDB has no TABLE query primary, which MySQL 8.0 has: its simple_table
+// (sql_yacc.yy line 8963) is query_specification or table_value_constructor.
+func (p *Parser) parseSelectClausePrimary() (*nodes.SelectStmt, error) {
+	switch p.cur.Type {
+	case '(':
+		return p.parseSelectWithParens()
+	case kwSELECT:
+		return p.parseSimpleSelect()
+	case kwVALUES:
+		return p.parseValuesPrimary()
+	case tokEOF:
+		return nil, p.syntaxErrorAtCur()
+	}
+	return nil, &ParseError{
+		Message:  "expected SELECT, VALUES, or '('",
+		Position: p.cur.Loc,
+	}
+}
+
+// isQueryPrimaryStart reports whether a token of type tokenType begins a
+// query expression. VALUES does not where it names the VALUES(col) function
+// (see valuesIsFunction).
+func (p *Parser) isQueryPrimaryStart(tokenType int) bool {
+	switch tokenType {
+	case kwSELECT, kwWITH:
+		return true
+	case kwVALUES:
+		return !p.valuesIsFunction
+	default:
+		return false
+	}
+}
+
+func (p *Parser) isQueryExpressionStart() bool {
+	if p.isQueryPrimaryStart(p.cur.Type) {
+		return true
+	}
+	if p.cur.Type != '(' {
+		return false
+	}
+	// A leading run of '(' may open either a parenthesized query expression
+	// — `((SELECT ...))`, `((SELECT 1) UNION (SELECT 2))` — or a parenthesized
+	// scalar expression — `(((a = b) AND (c = d)))`, as written by hand or
+	// copied from a MySQL view definition. A fixed one-token lookahead cannot
+	// tell them apart; scan past the run of '(' to the first non-'(' token — a
+	// query primary (SELECT/WITH/VALUES) means a query expression, anything
+	// else means a scalar expression or, in a FROM clause, a parenthesized
+	// join group.
+	return p.isQueryPrimaryStart(p.firstTokenPastParens().Type)
+}
+
+// scanState captures the full lexical scan position so a speculative lookahead
+// can rewind without consuming input. The Lexer is a flat value (string + ints),
+// so a shallow copy snapshots its position; the buffered next token and the
+// current/previous tokens complete the parser's scan cursor. The completion
+// `collecting` latch is position-derived (it arms when the scan reaches the
+// cursor offset), so rewinding the scan rewinds it too.
+type scanState struct {
+	lexer      Lexer
+	cur        Token
+	prev       Token
+	nextBuf    Token
+	hasNext    bool
+	collecting bool
+}
+
+func (p *Parser) saveScan() scanState {
+	return scanState{lexer: *p.lexer, cur: p.cur, prev: p.prev, nextBuf: p.nextBuf, hasNext: p.hasNext, collecting: p.collecting}
+}
+
+func (p *Parser) restoreScan(s scanState) {
+	*p.lexer = s.lexer
+	p.cur = s.cur
+	p.prev = s.prev
+	p.nextBuf = s.nextBuf
+	p.hasNext = s.hasNext
+	p.collecting = s.collecting
+}
+
+// firstTokenPastParens returns the first token at or after the current position
+// that is not an opening parenthesis, without consuming input.
+//
+// Every '(' of a run shares the run's answer, and the parser asks again at each
+// nesting level as it descends, so the last scan is cached: a '(' starting
+// between the run's first '(' and the token past it is in that run. Without
+// the cache, n nested parens cost O(n²) token scans.
+func (p *Parser) firstTokenPastParens() Token {
+	if p.cur.Type == '(' && p.cur.Loc >= p.parenRunStart && p.cur.Loc < p.parenRunPast.Loc {
+		return p.parenRunPast
+	}
+	saved := p.saveScan()
+	defer p.restoreScan(saved)
+	start := p.cur.Loc
+	for p.cur.Type == '(' {
+		p.advance()
+	}
+	p.parenRunStart, p.parenRunPast = start, p.cur
+	return p.cur
+}
+
+// parseSelectWithParens parses a parenthesized query expression (PostgreSQL's
+// select_with_parens): '(' select_no_parens ')'. It returns a WRAPPER node
+// whose ParenSource is the inner query; the wrapper's own ORDER BY / LIMIT hold
+// any OUTER trailing clauses attached by the enclosing no_parens. Unlike
+// PostgreSQL (which unwraps the inner query and would overwrite its clause),
+// MySQL accepts and must preserve BOTH scopes — e.g. "(SELECT 1 LIMIT 5) LIMIT
+// 2" — so the parens materialize as a real node. The unconditional delegation to
+// parseSelectNoParens left-factors the grammar so a nested "((...))" and a
+// parenthesized set-op operand are parsed by the same path.
+func (p *Parser) parseSelectWithParens() (*nodes.SelectStmt, error) {
+	start := p.pos()
+	if _, err := p.expect('('); err != nil {
+		return nil, err
+	}
+	inner, err := p.parseSelectNoParens()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(')'); err != nil {
+		return nil, err
+	}
+	return &nodes.SelectStmt{
+		Loc:         nodes.Loc{Start: start, End: p.prev.End},
+		ParenSource: inner,
+	}, nil
+}
+
+// parseSimpleSelect parses a single SELECT query primary (no leading WITH, no
+// trailing set operation). It greedily consumes its own ORDER BY / LIMIT /
+// locking; the enclosing select_clause hoists an unparenthesized last operand's
+// ORDER BY / LIMIT onto the set-op node.
+//
+// Ref: https://dev.mysql.com/doc/refman/8.0/en/select.html
+//
+//	SELECT
+//	    [ALL | DISTINCT | DISTINCTROW] [HIGH_PRIORITY] [STRAIGHT_JOIN]
+//	    [SQL_CALC_FOUND_ROWS] select_expr [, select_expr] ...
+//	    [FROM table_references] [WHERE where_condition]
+//	    [GROUP BY ... [WITH ROLLUP]] [HAVING ...] [WINDOW ...]
+//	    [ORDER BY ...] [LIMIT {[offset,] row_count | row_count OFFSET offset}]
+//	    [FOR {UPDATE | SHARE} ...] [INTO OUTFILE 'file_name']
+func (p *Parser) parseSimpleSelect() (*nodes.SelectStmt, error) {
+	start := p.pos()
+
+	p.advance() // consume SELECT
+
+	// Completion: after SELECT keyword, offer select-expression candidates.
+	p.checkCursor()
+	if p.collectMode() {
+		p.addTokenCandidate(kwDISTINCT)
+		p.addTokenCandidate(kwALL)
+		p.addRuleCandidate("columnref")
+		p.addRuleCandidate("func_name")
+		return nil, &ParseError{Message: "collecting"}
+	}
+
+	stmt := &nodes.SelectStmt{Loc: nodes.Loc{Start: start}}
+
+	// Parse SELECT options. They come in any order and most may repeat. ALL beside DISTINCT
+	// or DISTINCTROW is 1221, ER_WRONG_USAGE, and SQL_CACHE and SQL_NO_CACHE are 1225,
+	// ER_DUP_ARGUMENT, repeated and 1221 together, all from the action.
+	//
+	// Ref: select_option and SELECT_LEX::add_select_options in MariaDB 11.8 sql/sql_yacc.yy.
+	var sawAll, sawDistinct, sawCache, sawNoCache bool
+	for {
+		switch p.cur.Type {
+		case kwALL:
+			if sawDistinct {
+				return nil, &ParseError{Message: "Incorrect usage of ALL and DISTINCT", Position: p.cur.Loc}
+			}
+			sawAll = true
+			stmt.DistinctKind = nodes.DistinctAll
+			p.advance()
+			continue
+		case kwDISTINCT, kwDISTINCTROW:
+			if sawAll {
+				return nil, &ParseError{Message: "Incorrect usage of ALL and DISTINCT", Position: p.cur.Loc}
+			}
+			sawDistinct = true
+			stmt.DistinctKind = nodes.DistinctOn
+			p.advance()
+			continue
+		case kwHIGH_PRIORITY:
+			stmt.HighPriority = true
+			p.advance()
+			continue
+		case kwSTRAIGHT_JOIN:
+			stmt.StraightJoin = true
+			p.advance()
+			continue
+		case kwSQL_CALC_FOUND_ROWS:
+			stmt.CalcFoundRows = true
+			p.advance()
+			continue
+		case kwSQL_SMALL_RESULT:
+			stmt.SmallResult = true
+			p.advance()
+			continue
+		case kwSQL_BIG_RESULT:
+			stmt.BigResult = true
+			p.advance()
+			continue
+		case kwSQL_BUFFER_RESULT:
+			stmt.BufferResult = true
+			p.advance()
+			continue
+		case kwSQL_NO_CACHE:
+			if sawCache {
+				return nil, &ParseError{Message: "Incorrect usage of SQL_CACHE and SQL_NO_CACHE", Position: p.cur.Loc}
+			}
+			if sawNoCache {
+				return nil, &ParseError{Message: "Option 'SQL_NO_CACHE' used twice in statement", Position: p.cur.Loc}
+			}
+			sawNoCache = true
+			stmt.NoCache = true
+			p.advance()
+			continue
+		}
+		// SQL_CACHE is a word of its own and a name elsewhere: a column named sql_cache is
+		// one a select item reads, so it is the option only with an item to follow.
+		if p.cur.Type == tokIDENT && strings.EqualFold(p.cur.Str, "SQL_CACHE") && !p.backtickQuotedAt(p.cur.Loc) {
+			if sawNoCache {
+				return nil, &ParseError{Message: "Incorrect usage of SQL_CACHE and SQL_NO_CACHE", Position: p.cur.Loc}
+			}
+			if sawCache {
+				return nil, &ParseError{Message: "Option 'SQL_CACHE' used twice in statement", Position: p.cur.Loc}
+			}
+			sawCache = true
+			p.advance()
+			continue
+		}
+		break
+	}
+
+	// Parse select expression list
+	targets, err := p.parseSelectExprList()
+	if err != nil {
+		return nil, err
+	}
+	stmt.TargetList = targets
+
+	// Completion: after select target list, offer clause keywords.
+	p.checkCursor()
+	if p.collectMode() {
+		for _, tok := range []int{kwINTO, kwFROM, kwWHERE, kwGROUP, kwHAVING, kwORDER, kwLIMIT, kwFOR} {
+			if tok == kwINTO && p.intoRefused {
+				continue
+			}
+			p.addTokenCandidate(tok)
+		}
+		return nil, &ParseError{Message: "collecting"}
+	}
+
+	// INTO clause (position 1: after select_expr, before FROM)
+	if p.cur.Type == kwINTO {
+		if err := p.parseSelectInto(stmt); err != nil {
+			return nil, err
+		}
+	}
+
+	// FROM clause
+	if _, ok := p.match(kwFROM); ok {
+		// FROM DUAL stands alone: `FROM t, dual`, `FROM dual JOIN t` and `FROM (dual)` are each
+		// a 1064, and so is an alias on it.
+		if p.cur.Type == kwDUAL {
+			tok := p.advance()
+			stmt.From = []nodes.TableExpr{&nodes.TableRef{Loc: nodes.Loc{Start: tok.Loc, End: p.prev.End}, Name: "dual"}}
+		} else {
+			from, err := p.parseTableReferenceList()
+			if err != nil {
+				return nil, err
+			}
+			if err := refuseFromDuplicates(from); err != nil {
+				return nil, err
+			}
+			stmt.From = from
+		}
+	}
+
+	// WHERE clause — MySQL allows WHERE without FROM (e.g., SELECT 1 WHERE 1=1)
+	if p.cur.Type == kwWHERE {
+		p.advance()
+		where, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.collectMode() && where == nil {
+			return nil, p.syntaxErrorAtCur()
+		}
+		stmt.Where = where
+
+		// Reject duplicate WHERE
+		if p.cur.Type == kwWHERE {
+			return nil, &ParseError{
+				Message:  "duplicate WHERE clause",
+				Position: p.cur.Loc,
+			}
+		}
+	}
+
+	// GROUP BY clause — MySQL allows GROUP BY without FROM
+	if p.cur.Type == kwGROUP {
+		p.advance()
+		if _, err := p.expect(kwBY); err != nil {
+			return nil, err
+		}
+		groupBy, err := p.parseGroupByList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.GroupBy = groupBy
+
+		// Completion: after GROUP BY list, offer follow-set keywords.
+		p.checkCursor()
+		if p.collectMode() {
+			p.addTokenCandidate(kwHAVING)
+			p.addTokenCandidate(kwORDER)
+			p.addTokenCandidate(kwLIMIT)
+			p.addTokenCandidate(kwWITH)
+			return nil, &ParseError{Message: "collecting"}
+		}
+
+		// WITH ROLLUP
+		if p.cur.Type == kwWITH {
+			p.advance()
+			if _, ok := p.match(kwROLLUP); ok {
+				stmt.WithRollup = true
+			}
+		}
+
+		// Reject duplicate GROUP BY
+		if p.cur.Type == kwGROUP {
+			return nil, &ParseError{
+				Message:  "duplicate GROUP BY clause",
+				Position: p.cur.Loc,
+			}
+		}
+	}
+
+	// HAVING clause — MySQL allows HAVING without FROM
+	if p.cur.Type == kwHAVING {
+		p.advance()
+		having, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.collectMode() && having == nil {
+			return nil, p.syntaxErrorAtCur()
+		}
+		stmt.Having = having
+	}
+
+	// WINDOW clause: WINDOW window_name AS (window_spec) [, ...]
+	if p.cur.Type == kwWINDOW {
+		p.advance()
+		defs, err := p.parseNamedWindowList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.WindowClause = defs
+	}
+
+	// ORDER BY clause
+	if p.cur.Type == kwORDER {
+		p.advance()
+		if _, err := p.expect(kwBY); err != nil {
+			return nil, err
+		}
+		orderBy, err := p.parseOrderByList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.OrderBy = orderBy
+
+		// WITH ROLLUP (MySQL 8.0.12+)
+		if p.cur.Type == kwWITH {
+			next := p.peekNext()
+			if next.Type == kwROLLUP {
+				p.advance() // consume WITH
+				p.advance() // consume ROLLUP
+				stmt.OrderByWithRollup = true
+			}
+		}
+
+		// Reject duplicate ORDER BY
+		if p.cur.Type == kwORDER {
+			return nil, &ParseError{
+				Message:  "duplicate ORDER BY clause",
+				Position: p.cur.Loc,
+			}
+		}
+	}
+
+	// LIMIT clause
+	if _, ok := p.match(kwLIMIT); ok {
+		limit, err := p.parseLimitClause()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Limit = limit
+	}
+
+	// INTO clause (position 2: after LIMIT, before the locking clause).
+	//
+	// MariaDB takes INTO after the whole query expression, not between its
+	// clauses: select_into (sql/sql_yacc.yy 11.8, line 8927) follows
+	// opt_select_lock_type, and opt_procedure_or_into (13013) is INTO then
+	// opt_select_lock_type. So "... INTO OUTFILE 'f' FOR UPDATE" parses and
+	// "... INTO OUTFILE 'f' ORDER BY a" and "... INTO OUTFILE 'f' LIMIT 1" are
+	// syntax errors (container-verified).
+	if p.cur.Type == kwINTO && stmt.Into == nil {
+		if err := p.parseSelectInto(stmt); err != nil {
+			return nil, err
+		}
+	}
+
+	// FOR UPDATE / LOCK IN SHARE MODE
+	if p.cur.Type == kwFOR {
+		fu, err := p.parseForUpdateClause()
+		if err != nil {
+			return nil, err
+		}
+		stmt.ForUpdate = fu
+	} else if p.cur.Type == kwLOCK {
+		fu, err := p.parseLockInShareMode()
+		if err != nil {
+			return nil, err
+		}
+		stmt.ForUpdate = fu
+	}
+
+	// INTO clause (position 3: after the locking clause)
+	if p.cur.Type == kwINTO && stmt.Into == nil {
+		if err := p.parseSelectInto(stmt); err != nil {
+			return nil, err
+		}
+	}
+
+	stmt.Loc.End = p.prev.End
+	return stmt, nil
+}
+
+// parseSelectInto parses a SELECT's own INTO clause, at INTO, onto stmt.
+// While intoRefused is set the query takes none, and INTO is a syntax error.
+func (p *Parser) parseSelectInto(stmt *nodes.SelectStmt) error {
+	if p.intoRefused {
+		return p.syntaxErrorAtCur()
+	}
+	p.advance() // consume INTO
+	into, err := p.parseIntoClause()
+	if err != nil {
+		return err
+	}
+	stmt.Into = into
+	return nil
+}
+
+// parseSelectExprList parses a comma-separated list of select expressions.
+func (p *Parser) parseSelectExprList() ([]nodes.ExprNode, error) {
+	var list []nodes.ExprNode
+
+	for {
+		// Completion: at the start of each select expression, offer column/function candidates.
+		p.checkCursor()
+		if p.collectMode() {
+			p.addRuleCandidate("columnref")
+			p.addRuleCandidate("func_name")
+			return nil, &ParseError{Message: "collecting"}
+		}
+
+		// Soft-fail: if the current token is a clause keyword (e.g. FROM in
+		// "SELECT FROM t"), return what we have instead of parsing it as an
+		// identifier. MySQL keywords are non-reserved and would otherwise be
+		// consumed as column names, preventing completion on subsequent clauses.
+		if p.completing && p.isClauseKeyword() {
+			break
+		}
+
+		// The bare `*` is an arm of the list itself and its first item only:
+		// `SELECT a, *` and `SELECT *, *` are 1064s, where `SELECT *, a` and
+		// `SELECT a, t.*` parse.
+		//
+		// Ref: select_item_list, `select_item_list ',' select_item | select_item |
+		// '*'`, in MariaDB 11.8 sql/sql_yacc.yy.
+		if len(list) > 0 && p.cur.Type == '*' {
+			return nil, p.syntaxErrorAtCur()
+		}
+
+		target, err := p.parseSelectExpr()
+		if err != nil {
+			return nil, err
+		}
+		if target == nil {
+			break // soft-fail: no expression found, return what we have
+		}
+		list = append(list, target)
+		if p.cur.Type != ',' {
+			break
+		}
+		p.advance()
+	}
+
+	return list, nil
+}
+
+// parseSelectExpr parses one item of a select list: a wildcard, or an expression
+// and its alias (expr [AS alias]).
+func (p *Parser) parseSelectExpr() (nodes.ExprNode, error) {
+	start := p.pos()
+
+	// A wildcard is a select item of its own and no expr, so it takes no alias and
+	// no operator: the server answers 1064 for `SELECT * x`, `SELECT t.* x`,
+	// `SELECT * = 1` and `SELECT t.* + 1`.
+	//
+	// Ref: the '*' arm of select_item_list, table_wild, and `expr select_alias`
+	// of select_item in MariaDB 11.8 sql/sql_yacc.yy.
+	if wildcard, err := p.parseSelectWildcard(); wildcard != nil || err != nil {
+		return wildcard, err
+	}
+
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if expr == nil {
+		return nil, nil // soft-fail: no expression found (e.g. SELECT FROM)
+	}
+
+	// Check for AS alias or implicit alias
+	var alias string
+	if _, ok := p.match(kwAS); ok {
+		aliasLoc := p.pos()
+		name, _, err := p.parseIdentOrText()
+		if err != nil {
+			return nil, err
+		}
+		alias = name
+		if p.completing {
+			p.addSelectAliasPosition(aliasLoc)
+		}
+	} else if (p.isIdentToken() || p.cur.Type == tokSCONST) && (!p.isSelectTerminator() || p.cur.Type == kwWINDOW) {
+		// WINDOW is an alias here, where no WINDOW clause can start: `SELECT a window FROM t`.
+		// Implicit alias (identifier or string literal without AS), but not if it's a keyword that starts the next clause
+		aliasLoc := p.pos()
+		alias, _, err = p.parseIdentOrText()
+		if err != nil {
+			return nil, err
+		}
+		if p.completing {
+			p.addSelectAliasPosition(aliasLoc)
+		}
+	}
+
+	if alias != "" {
+		return &nodes.ResTarget{
+			Loc:         nodes.Loc{Start: start, End: p.prev.End},
+			Name:        alias,
+			Val:         expr,
+			NameWritten: true,
+		}, nil
+	}
+
+	return expr, nil
+}
+
+// parseSelectWildcard reads the wildcard at the current token: `*`, `tbl.*` or
+// `db.tbl.*`. It returns nil and consumes nothing when the tokens spell none of
+// them. A select list, RETURNING's included, is the only reader of a wildcard: parseExpr reads none,
+// which is what keeps `*` and `t.*` out of every operand, argument and clause.
+// COUNT(*) is COUNT's own production.
+func (p *Parser) parseSelectWildcard() (nodes.ExprNode, error) {
+	start := p.pos()
+	if p.cur.Type == '*' {
+		p.advance()
+		return &nodes.StarExpr{Loc: nodes.Loc{Start: start, End: p.prev.End}}, nil
+	}
+	qualifiers := p.wildcardQualifiers()
+	if qualifiers == 0 {
+		return nil, nil
+	}
+	ref := &nodes.ColumnRef{Star: true}
+	for i := 0; i < qualifiers; i++ {
+		name, _, err := p.parseIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		p.advance() // consume '.'
+
+		// Completion: after "table." and "schema.table.", offer columnref
+		p.checkCursor()
+		if p.collectMode() {
+			p.addRuleCandidate("columnref")
+			return nil, &ParseError{Message: "collecting"}
+		}
+		ref.Schema, ref.Table = ref.Table, name
+	}
+	p.advance() // consume '*'
+	ref.Loc = nodes.Loc{Start: start, End: p.prev.End}
+	return ref, nil
+}
+
+// wildcardQualifiers reports how many names qualify the `*` the next tokens
+// spell: 1 for `tbl.*`, 2 for `db.tbl.*`, and 0 when they spell neither. It
+// consumes nothing.
+func (p *Parser) wildcardQualifiers() int {
+	scan := p.saveScan()
+	defer p.restoreScan(scan)
+	for n := 1; n <= 2; n++ {
+		if !p.isIdentToken() || p.peekNext().Type != '.' {
+			return 0
+		}
+		p.advance() // the name
+		p.advance() // '.'
+		if p.cur.Type == '*' {
+			return n
+		}
+	}
+	return 0
+}
+
+// parseDerivedColumnList parses an optional parenthesized column alias list
+// for derived tables: (col1, col2, ...).
+// MySQL 8.0.14+ syntax: (SELECT ...) AS alias(c1, c2).
+func (p *Parser) parseDerivedColumnList() ([]string, error) {
+	p.advance() // consume '('
+	var cols []string
+	for {
+		name, _, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, name)
+		if p.cur.Type != ',' {
+			break
+		}
+		p.advance()
+	}
+	if _, err := p.expect(')'); err != nil {
+		return nil, err
+	}
+	return cols, nil
+}
+
+// isClauseKeyword returns true if the current token is a core SQL clause keyword.
+// In MySQL, these keywords are non-reserved (can be used as identifiers), so the
+// bottom-level expression parser won't soft-fail on them. This check is needed in
+// completion mode to prevent clause keywords from being consumed as column names
+// when the SELECT expression list is empty (e.g. "SELECT FROM t").
+func (p *Parser) isClauseKeyword() bool {
+	switch p.cur.Type {
+	case kwFROM, kwWHERE, kwGROUP, kwHAVING, kwORDER, kwLIMIT, kwFOR, kwINTO,
+		kwUNION, kwINTERSECT, kwEXCEPT:
+		return true
+	}
+	return false
+}
+
+// isSelectTerminator returns true if the current token starts a clause that terminates
+// the select expression list. Used to avoid consuming clause keywords as aliases.
+func (p *Parser) isSelectTerminator() bool {
+	switch p.cur.Type {
+	case kwFROM, kwWHERE, kwGROUP, kwHAVING, kwORDER, kwLIMIT, kwFOR, kwINTO,
+		kwUNION, kwINTERSECT, kwEXCEPT, kwON, kwUSING, kwJOIN, kwINNER, kwLEFT,
+		kwRIGHT, kwCROSS, kwNATURAL, kwWINDOW, kwWITH, kwLOCK, ';', tokEOF:
+		return true
+	}
+	return false
+}
+
+// parseTableReferenceList parses a comma-separated list of table references (with joins).
+func (p *Parser) parseTableReferenceList() ([]nodes.TableExpr, error) {
+	var refs []nodes.TableExpr
+
+	for {
+		// Completion: at the start of each table reference, offer table_ref candidates.
+		p.checkCursor()
+		if p.collectMode() {
+			p.addRuleCandidate("table_ref")
+			p.addRuleCandidate("database_ref")
+			return nil, &ParseError{Message: "collecting"}
+		}
+
+		ref, err := p.parseTableReference()
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+		if p.cur.Type != ',' {
+			break
+		}
+		p.advance()
+	}
+
+	return refs, nil
+}
+
+func foldTableReferenceList(refs []nodes.TableExpr) nodes.TableExpr {
+	if len(refs) == 0 {
+		return nil
+	}
+	left := refs[0]
+	for i := 1; i < len(refs); i++ {
+		left = &nodes.JoinClause{
+			Loc:   nodes.Loc{Start: tableExprLoc(left).Start, End: tableExprLoc(refs[i]).End},
+			Type:  nodes.JoinInner,
+			Left:  left,
+			Right: refs[i],
+		}
+	}
+	return left
+}
+
+// parseTableReference parses a table reference (table_factor with optional joins).
+func (p *Parser) parseTableReference() (nodes.TableExpr, error) {
+	left, err := p.parseTableFactor()
+	if err != nil {
+		return nil, err
+	}
+
+	// Completion: after a table factor, offer join keywords and post-FROM keywords.
+	p.checkCursor()
+	if p.collectMode() {
+		p.addTokenCandidate(kwWHERE)
+		p.addTokenCandidate(kwJOIN)
+		p.addTokenCandidate(kwLEFT)
+		p.addTokenCandidate(kwRIGHT)
+		p.addTokenCandidate(kwCROSS)
+		p.addTokenCandidate(kwNATURAL)
+		p.addTokenCandidate(kwINNER)
+		p.addTokenCandidate(kwSTRAIGHT_JOIN)
+		p.addTokenCandidate(kwORDER)
+		p.addTokenCandidate(kwGROUP)
+		p.addTokenCandidate(kwHAVING)
+		p.addTokenCandidate(kwLIMIT)
+		p.addTokenCandidate(kwUNION)
+		p.addTokenCandidate(kwFOR)
+		return nil, &ParseError{Message: "collecting"}
+	}
+
+	return p.parseJoinChain(left, true)
+}
+
+// parseJoinChain extends a table reference with the joins that follow it.
+//
+// MySQL's join grammar is ambiguous and yacc resolves it by precedence: a
+// conditionless plain/cross/inner JOIN and an outer (LEFT/RIGHT) JOIN let their
+// right operand absorb the joins that follow, so a trailing ON can bind to a
+// nested join (`a JOIN b JOIN c ON x ON y` is `a JOIN (b JOIN c ON x) ON y`),
+// while STRAIGHT_JOIN and NATURAL joins bind left-deep.
+//
+// It is parsed with an explicit stack rather than by recursion, so a long chain
+// — including a conditionless one like `t0 JOIN t1 JOIN ... JOIN tN` — builds a
+// left-deep tree in a loop and is bounded by maxTreeHeight, never deepening the
+// Go stack. operands and joinTypes are parallel: joinTypes[i] is an absorbing
+// join between operands[i] and operands[i+1] that is still open because it has
+// not met its ON/USING. A condition closes the rightmost open joins, inner
+// first, which is what nests a stacked ON; what is still open at the end has no
+// condition and collapses left-deep. allowChain is false in the right operand of
+// a non-absorbing join, where no further join may attach. Container-verified
+// against mariadb:11.8.
+func (p *Parser) parseJoinChain(left nodes.TableExpr, allowChain bool) (nodes.TableExpr, error) {
+	if !allowChain {
+		return left, nil
+	}
+
+	operands := []nodes.TableExpr{left}
+	var joinTypes []nodes.JoinType
+	// built holds the join nodes this chain created — a closed absorbing join or
+	// a bound NATURAL/STRAIGHT join — which a conditionless join to the left
+	// re-associates into, descending their left spine. A table or an explicitly
+	// parenthesized group (parseTableFactor's result) is not in built and is left
+	// whole, so `a JOIN (b RIGHT JOIN c)` keeps its grouping while `a JOIN b RIGHT
+	// JOIN c` binds left-deep.
+	built := map[*nodes.JoinClause]bool{}
+
+	// reduceTop closes the rightmost open join with the condition just read.
+	reduceTop := func(cond nodes.Node) {
+		n := len(operands)
+		right, leftOp := operands[n-1], operands[n-2]
+		jt := joinTypes[len(joinTypes)-1]
+		joinTypes = joinTypes[:len(joinTypes)-1]
+		operands = operands[:n-1]
+		reduced := &nodes.JoinClause{
+			Loc:       nodes.Loc{Start: tableExprLoc(leftOp).Start, End: p.prev.End},
+			Type:      jt,
+			Left:      leftOp,
+			Right:     right,
+			Condition: cond,
+		}
+		built[reduced] = true
+		operands[n-2] = reduced
+	}
+
+	for {
+		jt, ok, err := p.matchJoinType()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+
+		// Completion: after JOIN keyword, offer table_ref candidates for the right-side table.
+		p.checkCursor()
+		if p.collectMode() {
+			p.addRuleCandidate("table_ref")
+			p.addRuleCandidate("database_ref")
+			return nil, &ParseError{Message: "collecting"}
+		}
+
+		rf, err := p.parseTableFactor()
+		if err != nil {
+			return nil, err
+		}
+
+		if joinAbsorbsRight(jt) {
+			// Shift: the join stays open so a trailing stacked ON can bind to it.
+			operands = append(operands, rf)
+			joinTypes = append(joinTypes, jt)
+		} else {
+			// NATURAL / STRAIGHT bind to the top operand only; the open
+			// absorbing joins to the left resolve around the result.
+			top := operands[len(operands)-1]
+			join := &nodes.JoinClause{
+				Loc:   nodes.Loc{Start: tableExprLoc(top).Start},
+				Type:  jt,
+				Left:  top,
+				Right: rf,
+			}
+			if err := p.parseJoinCondition(join); err != nil {
+				return nil, err
+			}
+			join.Loc.End = p.prev.End
+			built[join] = true
+			operands[len(operands)-1] = join
+		}
+
+		// A run of conditions closes the open absorbing joins, inner first.
+		for len(joinTypes) > 0 {
+			cond, present, err := p.parseJoinConditionNode()
+			if err != nil {
+				return nil, err
+			}
+			if !present {
+				break
+			}
+			reduceTop(cond)
+		}
+	}
+
+	return p.collapseLeftDeep(operands, joinTypes, built)
+}
+
+// collapseLeftDeep folds the operands still open after the chain — conditionless
+// joins — into a left-deep tree. When the right operand is a join this chain
+// built, the join is pushed down that subtree's chain-built left spine so it
+// binds left-deep: `a JOIN b JOIN c ON x` is `(a JOIN b) JOIN c ON x`, and `a
+// JOIN b NATURAL LEFT JOIN c` is `(a JOIN b) NATURAL LEFT JOIN c`. The descent
+// stops at a table or an explicitly parenthesized group, which is joined whole
+// so its grouping survives. An outer (LEFT/RIGHT) join still open here never
+// found its required ON/USING, so it is a syntax error.
+func (p *Parser) collapseLeftDeep(operands []nodes.TableExpr, joinTypes []nodes.JoinType, built map[*nodes.JoinClause]bool) (nodes.TableExpr, error) {
+	left := operands[0]
+	for i, jt := range joinTypes {
+		if jt == nodes.JoinLeft || jt == nodes.JoinRight {
+			return nil, p.syntaxErrorAtCur()
+		}
+		right := operands[i+1]
+		if r, ok := right.(*nodes.JoinClause); ok && built[r] {
+			// Descend the chain-built left spine to its leftmost leaf and insert
+			// `left jt leaf` there, pulling each spine node's start back to left.
+			// A node not in built — a table or an explicit group — ends the
+			// descent, so an explicit group is never reassociated into.
+			start := tableExprLoc(left).Start
+			cur := r
+			cur.Loc.Start = start
+			for {
+				l, ok := cur.Left.(*nodes.JoinClause)
+				if !ok || !built[l] {
+					break
+				}
+				l.Loc.Start = start
+				cur = l
+			}
+			leaf := cur.Left
+			cur.Left = &nodes.JoinClause{
+				Loc:   nodes.Loc{Start: start, End: tableExprLoc(leaf).End},
+				Type:  jt,
+				Left:  left,
+				Right: leaf,
+			}
+			left = r
+			continue
+		}
+		left = &nodes.JoinClause{
+			Loc:   nodes.Loc{Start: tableExprLoc(left).Start, End: tableExprLoc(right).End},
+			Type:  jt,
+			Left:  left,
+			Right: right,
+		}
+	}
+	return left, nil
+}
+
+// joinAbsorbsRight reports whether a join's right operand may absorb the joins
+// that follow it. A plain/cross/inner JOIN and an outer (LEFT/RIGHT) JOIN do;
+// STRAIGHT_JOIN and NATURAL joins bind left-deep. See parseJoinChain for the
+// grammar; container-verified against mariadb:11.8.
+func joinAbsorbsRight(jt nodes.JoinType) bool {
+	switch jt {
+	case nodes.JoinInner, nodes.JoinCross, nodes.JoinLeft, nodes.JoinRight:
+		return true
+	default: // JoinStraight, JoinNatural, JoinNaturalLeft, JoinNaturalRight
+		return false
+	}
+}
+
+// parseJoinCondition reads the ON or USING clause for a non-absorbing join
+// (NATURAL or STRAIGHT_JOIN) and records it. A NATURAL join forbids one;
+// STRAIGHT_JOIN takes either or none. The absorbing joins read their condition
+// through parseJoinConditionNode, which parseJoinChain attaches as it closes
+// them. Container-verified against mariadb:11.8.
+func (p *Parser) parseJoinCondition(join *nodes.JoinClause) error {
+	switch join.Type {
+	case nodes.JoinNatural, nodes.JoinNaturalLeft, nodes.JoinNaturalRight:
+		// A NATURAL join names no condition; an ON/USING that follows is a
+		// syntax error, left where it sits for the caller to report.
+		return nil
+	}
+	cond, present, err := p.parseJoinConditionNode()
+	if err != nil {
+		return err
+	}
+	if present {
+		join.Condition = cond
+	}
+	return nil
+}
+
+// parseJoinConditionNode reads an ON or USING clause if one is present and
+// returns it; present is false when the next token is neither.
+func (p *Parser) parseJoinConditionNode() (nodes.Node, bool, error) {
+	condStart := p.pos()
+	if _, ok := p.match(kwON); ok {
+		// Completion: after ON keyword, offer columnref candidates for join condition.
+		p.checkCursor()
+		if p.collectMode() {
+			p.addRuleCandidate("columnref")
+			return nil, false, &ParseError{Message: "collecting"}
+		}
+		condStart = p.pos()
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, false, err
+		}
+		if cond == nil {
+			return nil, false, p.syntaxErrorAtCur()
+		}
+		return &nodes.OnCondition{Loc: nodes.Loc{Start: condStart, End: p.prev.End}, Expr: cond}, true, nil
+	}
+	if _, ok := p.match(kwUSING); ok {
+		// For USING, we manually consume '(' so we can add a completion checkpoint inside.
+		if _, err := p.expect('('); err != nil {
+			return nil, false, err
+		}
+		// Completion: after USING (, offer columnref candidates for shared columns.
+		p.checkCursor()
+		if p.collectMode() {
+			p.addRuleCandidate("columnref")
+			return nil, false, &ParseError{Message: "collecting"}
+		}
+		var cols []string
+		for {
+			name, _, err := p.parseIdent()
+			if err != nil {
+				return nil, false, err
+			}
+			cols = append(cols, name)
+			if p.cur.Type != ',' {
+				break
+			}
+			p.advance()
+		}
+		if _, err := p.expect(')'); err != nil {
+			return nil, false, err
+		}
+		return &nodes.UsingCondition{Loc: nodes.Loc{Start: condStart, End: p.prev.End}, Columns: cols}, true, nil
+	}
+	return nil, false, nil
+}
+
+// matchJoinType checks for a join keyword combination and returns the join type.
+// Returns an error if a join modifier keyword (INNER, LEFT, etc.) is found but
+// the required JOIN keyword is missing.
+func (p *Parser) matchJoinType() (nodes.JoinType, bool, error) {
+	switch p.cur.Type {
+	case kwJOIN:
+		p.advance()
+		return nodes.JoinInner, true, nil
+	case kwINNER:
+		p.advance()
+		if _, err := p.expect(kwJOIN); err != nil {
+			return 0, false, err
+		}
+		return nodes.JoinInner, true, nil
+	case kwLEFT:
+		p.advance()
+		p.match(kwOUTER)
+		if _, err := p.expect(kwJOIN); err != nil {
+			return 0, false, err
+		}
+		return nodes.JoinLeft, true, nil
+	case kwRIGHT:
+		p.advance()
+		p.match(kwOUTER)
+		if _, err := p.expect(kwJOIN); err != nil {
+			return 0, false, err
+		}
+		return nodes.JoinRight, true, nil
+	case kwCROSS:
+		p.advance()
+		if _, err := p.expect(kwJOIN); err != nil {
+			return 0, false, err
+		}
+		return nodes.JoinCross, true, nil
+	case kwNATURAL:
+		p.advance()
+		// NATURAL [LEFT|RIGHT] [OUTER] JOIN
+		if _, ok := p.match(kwLEFT); ok {
+			p.match(kwOUTER)
+			if _, err := p.expect(kwJOIN); err != nil {
+				return 0, false, err
+			}
+			return nodes.JoinNaturalLeft, true, nil
+		}
+		if _, ok := p.match(kwRIGHT); ok {
+			p.match(kwOUTER)
+			if _, err := p.expect(kwJOIN); err != nil {
+				return 0, false, err
+			}
+			return nodes.JoinNaturalRight, true, nil
+		}
+		if _, err := p.expect(kwJOIN); err != nil {
+			return 0, false, err
+		}
+		return nodes.JoinNatural, true, nil
+	case kwSTRAIGHT_JOIN:
+		p.advance()
+		return nodes.JoinStraight, true, nil
+	}
+	return 0, false, nil
+}
+
+// parenOpensQuery reports whether the '(' at p.cur opens a parenthesized
+// query expression, as opposed to a join group or a parenthesized expression,
+// without consuming input. It does when its content begins with a query
+// primary, or begins with a block that opens a query and is followed by a
+// token that continues a query expression: the ')', a set operator, ORDER BY,
+// LIMIT, or a locking clause. Any other token past that inner block makes it
+// the first operand of something else: a derived table in a join group,
+// `((SELECT 1) d JOIN t ON ...)`, or a subquery in an expression,
+// `((SELECT 1) + 0)`, both of which MariaDB writes in view definitions.
+//
+// MariaDB 11.8.8 sql/sql_yacc.yy: a table_primary_derived (line 12307) is a
+// subquery (9253) with its alias, and join_table_parens (12273) and
+// table_reference_list_parens (12248) may begin with one; primary_expr
+// (10340) is a subquery or '(' parenthesized_expr ')', and an expr may begin
+// with a subquery. Inside query_expression_body_ext_parens (9140) a
+// parenthesized operand is followed by a set operator (query_expression_body,
+// 9157), ORDER BY, LIMIT, or a locking clause (query_expression_tail), or by
+// the ')'.
+//
+// A block's verdict depends only on the run of '(' it starts and the token
+// after each of their blocks, so the verdicts of a run are recorded together,
+// and a scan records the token after every block it passes: asking again at
+// each level as the parser descends costs nothing.
+func (p *Parser) parenOpensQuery() bool {
+	if p.cur.Type != '(' {
+		return false
+	}
+	if v, ok := p.parenQuery[p.cur.Loc]; ok {
+		return v
+	}
+	if !p.isQueryExpressionStart() {
+		return false
+	}
+	saved := p.saveScan()
+	defer p.restoreScan(saved)
+	var run []int
+	for p.cur.Type == '(' {
+		run = append(run, p.cur.Loc)
+		p.advance()
+	}
+	if len(run) == 1 {
+		return true
+	}
+	if _, ok := p.parenAfter[run[0]]; !ok {
+		p.restoreScan(saved)
+		p.scanParenBlock()
+	}
+	if p.parenQuery == nil {
+		p.parenQuery = make(map[int]bool)
+	}
+	query := true
+	p.parenQuery[run[len(run)-1]] = query
+	for i := len(run) - 2; i >= 0; i-- {
+		query = query && continuesParenQuery(p.parenAfter[run[i+1]])
+		p.parenQuery[run[i]] = query
+	}
+	return query
+}
+
+// continuesParenQuery reports whether a token of type tokenType, following a
+// parenthesized query that opens a block, keeps the block a query expression.
+// The end of input does, so an unclosed block reads as it did before the
+// inner block was looked at.
+func continuesParenQuery(tokenType int) bool {
+	switch tokenType {
+	case ')', kwUNION, kwEXCEPT, kwINTERSECT, kwORDER, kwLIMIT, kwFOR, kwLOCK, tokEOF:
+		return true
+	default:
+		return false
+	}
+}
+
+// scanParenBlock consumes the block the '(' at p.cur opens, through its
+// matching ')', and records in parenAfter, for every '(' in it, the type of
+// the token after its matching ')' (tokEOF for one never closed).
+func (p *Parser) scanParenBlock() {
+	if p.parenAfter == nil {
+		p.parenAfter = make(map[int]int)
+	}
+	var open []int
+	for {
+		switch p.cur.Type {
+		case '(':
+			open = append(open, p.cur.Loc)
+		case ')':
+			loc := open[len(open)-1]
+			open = open[:len(open)-1]
+			p.advance()
+			p.parenAfter[loc] = p.cur.Type
+			if len(open) == 0 {
+				return
+			}
+			continue
+		case tokEOF:
+			for _, loc := range open {
+				p.parenAfter[loc] = tokEOF
+			}
+			return
+		}
+		p.advance()
+	}
+}
+
+// parseTableFactor parses a table factor: table_ref, subquery, LATERAL subquery, or parenthesized table_references.
+// parseOutfileFields parses the one-or-more items of a FIELDS clause in SELECT ... INTO
+// OUTFILE, the same field_term list LOAD DATA reads: BY is required, the value is a string,
+// hex or bit literal, and the items come in any order and may repeat.
+//
+// Ref: field_term in MariaDB 11.8 sql/sql_yacc.yy.
+func (p *Parser) parseOutfileFields(into *nodes.IntoClause) error {
+	for n := 0; ; n++ {
+		var target *string
+		switch p.cur.Type {
+		case kwTERMINATED:
+			target = &into.FieldsTerminatedBy
+		case kwOPTIONALLY:
+			p.advance()
+			if p.cur.Type != kwENCLOSED {
+				return p.syntaxErrorAtCur()
+			}
+			into.FieldsOptionalEncl = true
+			target = &into.FieldsEnclosedBy
+		case kwENCLOSED:
+			target = &into.FieldsEnclosedBy
+		case kwESCAPED:
+			target = &into.FieldsEscapedBy
+		default:
+			if n == 0 {
+				return p.syntaxErrorAtCur()
+			}
+			return nil
+		}
+		if err := p.parseOutfileTerminator(target); err != nil {
+			return err
+		}
+	}
+}
+
+// parseOutfileLines parses the one-or-more items of a LINES clause, line_term.
+func (p *Parser) parseOutfileLines(into *nodes.IntoClause) error {
+	for n := 0; ; n++ {
+		var target *string
+		switch p.cur.Type {
+		case kwSTARTING:
+			target = &into.LinesStartingBy
+		case kwTERMINATED:
+			target = &into.LinesTerminatedBy
+		default:
+			if n == 0 {
+				return p.syntaxErrorAtCur()
+			}
+			return nil
+		}
+		if err := p.parseOutfileTerminator(target); err != nil {
+			return err
+		}
+	}
+}
+
+// parseOutfileTerminator reads BY and the value after the word that opens an item.
+func (p *Parser) parseOutfileTerminator(target *string) error {
+	p.advance()
+	if _, err := p.expect(kwBY); err != nil {
+		return err
+	}
+	v, err := p.parseFieldTerminator()
+	if err != nil {
+		return err
+	}
+	*target = v
+	return nil
+}
+
+// a derived table takes in the grammar: MariaDB answers 1064 for a missing one.
+//
+// Ref: derived_table_list and table_primary_derived in MariaDB 11.8 sql/sql_yacc.yy.
+func refuseDerivedTableWithoutAlias(pos int) error {
+	return &ParseError{Message: "Every derived table must have its own alias", Position: pos}
+}
+
+func (p *Parser) parseTableFactor() (nodes.TableExpr, error) {
+	if err := p.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer p.leaveNesting()
+	if p.cur.Type == '(' {
+		startPos := p.pos()
+
+		// Subquery (derived table): (query_expression), including
+		// parenthesized set operations like ((SELECT ...) UNION (...)), and
+		// not a join group whose first operand is a derived table, like
+		// ((SELECT ...) d JOIN t ON ...) (see parenOpensQuery).
+		derived := p.parenOpensQuery()
+		p.advance()
+		if derived {
+			sel, err := p.parseSelectStmt()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.expect(')'); err != nil {
+				return nil, err
+			}
+
+			sub := &nodes.SubqueryExpr{
+				Loc:    nodes.Loc{Start: startPos},
+				Select: sel,
+			}
+
+			// Optional alias: [AS] alias
+			if _, ok := p.match(kwAS); ok {
+				if p.cur.Type == kwWINDOW {
+					return nil, p.syntaxErrorAtCur()
+				}
+				alias, _, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				sub.Alias = alias
+			} else if p.isIdentToken() && !p.isSelectTerminator() {
+				alias, _, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				sub.Alias = alias
+			}
+
+			// Optional derived column alias list: AS t(c1, c2)
+			if sub.Alias != "" && p.cur.Type == '(' {
+				cols, err := p.parseDerivedColumnList()
+				if err != nil {
+					return nil, err
+				}
+				sub.Columns = cols
+			}
+
+			if sub.Alias == "" {
+				return nil, refuseDerivedTableWithoutAlias(startPos)
+			}
+
+			sub.Loc.End = p.prev.End
+			return sub, nil
+		}
+
+		// Parenthesized table references use MySQL nested-join semantics.
+		refs, err := p.parseTableReferenceList()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(')'); err != nil {
+			return nil, err
+		}
+		return foldTableReferenceList(refs), nil
+	}
+
+	// JSON_TABLE(expr, path COLUMNS (...)) AS alias
+	if p.cur.Type == kwJSON_TABLE && p.peekNext().Type == '(' {
+		return p.parseJsonTable()
+	}
+
+	// Regular table reference with alias
+	return p.parseTableRefWithAlias(true)
+}
+
+// parseJsonTable parses JSON_TABLE(expr, path COLUMNS (column_list)) [AS] alias.
+//
+// Ref: https://dev.mysql.com/doc/refman/8.0/en/json-table-functions.html
+//
+//	JSON_TABLE(
+//	    expr,
+//	    path COLUMNS (column_list)
+//	) [AS] alias
+//
+//	column_list:
+//	    column[, column][, ...]
+//
+//	column:
+//	    name FOR ORDINALITY
+//	  | name type PATH string_path [on_empty] [on_error]
+//	  | name type EXISTS PATH string_path
+//	  | NESTED [PATH] path COLUMNS (column_list)
+//
+//	on_empty:
+//	    {NULL | DEFAULT json_string | ERROR} ON EMPTY
+//
+//	on_error:
+//	    {NULL | DEFAULT json_string | ERROR} ON ERROR
+func (p *Parser) parseJsonTable() (nodes.TableExpr, error) {
+	start := p.pos()
+	p.advance() // consume JSON_TABLE
+
+	if _, err := p.expect('('); err != nil {
+		return nil, err
+	}
+
+	// Parse the JSON expression
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if expr == nil {
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	if _, err := p.expect(','); err != nil {
+		return nil, err
+	}
+
+	// Parse the path expression
+	path, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if path == nil {
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	// COLUMNS
+	if p.cur.Type != kwCOLUMNS {
+		return nil, &ParseError{Message: "expected COLUMNS in JSON_TABLE", Position: p.cur.Loc}
+	}
+	p.advance()
+
+	cols, err := p.parseJsonTableColumns()
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := p.expect(')'); err != nil {
+		return nil, err
+	}
+
+	// [AS] alias (required for JSON_TABLE)
+	p.match(kwAS)
+	alias, _, aErr := p.parseIdent()
+	if aErr != nil {
+		return nil, aErr
+	}
+
+	return &nodes.JsonTableExpr{
+		Loc:     nodes.Loc{Start: start, End: p.prev.End},
+		Expr:    expr,
+		Path:    path,
+		Columns: cols,
+		Alias:   alias,
+	}, nil
+}
+
+// parseJsonTableColumns parses (column_list) for JSON_TABLE.
+func (p *Parser) parseJsonTableColumns() ([]*nodes.JsonTableColumn, error) {
+	if _, err := p.expect('('); err != nil {
+		return nil, err
+	}
+
+	var cols []*nodes.JsonTableColumn
+	for {
+		col, err := p.parseJsonTableColumn()
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, col)
+		if p.cur.Type != ',' {
+			break
+		}
+		p.advance()
+	}
+
+	if _, err := p.expect(')'); err != nil {
+		return nil, err
+	}
+	return cols, nil
+}
+
+// parseJsonTableColumn parses a single JSON_TABLE column definition.
+func (p *Parser) parseJsonTableColumn() (*nodes.JsonTableColumn, error) {
+	if err := p.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer p.leaveNesting()
+	start := p.pos()
+
+	// NESTED [PATH] path COLUMNS (column_list)
+	if p.cur.Type == kwNESTED {
+		p.advance()
+		p.match(kwPATH) // optional PATH keyword
+		if p.cur.Type != tokSCONST {
+			return nil, &ParseError{Message: "expected path string in NESTED", Position: p.cur.Loc}
+		}
+		nestedPath := p.cur.Str
+		p.advance()
+
+		if p.cur.Type != kwCOLUMNS {
+			return nil, &ParseError{Message: "expected COLUMNS after NESTED PATH", Position: p.cur.Loc}
+		}
+		p.advance()
+		nestedCols, err := p.parseJsonTableColumns()
+		if err != nil {
+			return nil, err
+		}
+		return &nodes.JsonTableColumn{
+			Loc:        nodes.Loc{Start: start, End: p.prev.End},
+			Nested:     true,
+			NestedPath: nestedPath,
+			NestedCols: nestedCols,
+		}, nil
+	}
+
+	// name FOR ORDINALITY | name type PATH path | name type EXISTS PATH path
+	name, _, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+
+	col := &nodes.JsonTableColumn{
+		Loc:  nodes.Loc{Start: start},
+		Name: name,
+	}
+
+	// FOR ORDINALITY
+	if p.cur.Type == kwFOR {
+		p.advance()
+		p.match(kwORDINALITY)
+		col.Ordinality = true
+		col.Loc.End = p.prev.End
+		return col, nil
+	}
+
+	// type. None of the types MariaDB reads by name: 11.8.8 answers 1064 for `a VECTOR(3)
+	// PATH '$'`, `a inet6 PATH '$'` and `a uuid PATH '$'` where every column and routine
+	// takes them.
+	if p.cur.Type == kwVECTOR || p.isQuotedVectorType() || p.isNamedScalarType() {
+		return nil, p.syntaxErrorAtCur()
+	}
+	typeName, err := p.parseDataType()
+	if err != nil {
+		return nil, err
+	}
+	col.TypeName = typeName
+
+	// EXISTS PATH
+	if p.cur.Type == kwEXISTS_KW {
+		p.advance()
+		col.Exists = true
+	}
+
+	// PATH
+	if p.cur.Type == kwPATH {
+		p.advance()
+		if p.cur.Type != tokSCONST {
+			return nil, &ParseError{Message: "expected path string", Position: p.cur.Loc}
+		}
+		col.Path = p.cur.Str
+		p.advance()
+	}
+
+	// [on_empty] [on_error]
+	// {NULL | DEFAULT json_string | ERROR} ON {EMPTY | ERROR}
+	for p.cur.Type == kwNULL || p.cur.Type == kwDEFAULT || p.cur.Type == kwERROR_KW {
+		option := ""
+		switch p.cur.Type {
+		case kwNULL:
+			option = "NULL"
+			p.advance()
+		case kwDEFAULT:
+			p.advance()
+			if p.cur.Type == tokSCONST {
+				option = "DEFAULT " + p.cur.Str
+				p.advance()
+			}
+		case kwERROR_KW:
+			option = "ERROR"
+			p.advance()
+		}
+
+		if p.cur.Type != kwON {
+			break
+		}
+		p.advance() // consume ON
+
+		if p.cur.Type == kwEMPTY {
+			col.EmptyOption = option
+			p.advance()
+		} else if p.cur.Type == kwERROR_KW {
+			col.ErrorOption = option
+			p.advance()
+		}
+	}
+
+	col.Loc.End = p.prev.End
+	return col, nil
+}
+
+// parseOrderByList parses ORDER BY items.
+func (p *Parser) parseOrderByList() ([]*nodes.OrderByItem, error) {
+	var items []*nodes.OrderByItem
+
+	for {
+		start := p.pos()
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if expr == nil {
+			return nil, p.syntaxErrorAtCur()
+		}
+
+		item := &nodes.OrderByItem{
+			Loc:  nodes.Loc{Start: start},
+			Expr: expr,
+		}
+
+		// Completion: after ORDER BY expression, offer ASC/DESC/LIMIT and comma.
+		p.checkCursor()
+		if p.collectMode() {
+			p.addTokenCandidate(kwASC)
+			p.addTokenCandidate(kwDESC)
+			p.addTokenCandidate(kwLIMIT)
+			p.addTokenCandidate(',')
+			return nil, &ParseError{Message: "collecting"}
+		}
+
+		if _, ok := p.match(kwDESC); ok {
+			item.Direction = nodes.OrderDirectionDesc
+			item.Desc = true
+		} else if _, ok := p.match(kwASC); ok {
+			item.Direction = nodes.OrderDirectionAsc
+		} else {
+			item.Direction = nodes.OrderDirectionDefault
+		}
+
+		item.Loc.End = p.prev.End
+		items = append(items, item)
+
+		if p.cur.Type != ',' {
+			break
+		}
+		p.advance()
+	}
+
+	return items, nil
+}
+
+// parseGroupByList parses GROUP BY items. MariaDB shares one ByItem rule
+// between ORDER BY and GROUP BY, so a GROUP BY item is an expression with an
+// optional ASC/DESC direction, e.g. "GROUP BY a DESC". ASC is the default and
+// is dropped on deparse, matching ORDER BY. GROUP BY has no NULLS FIRST/LAST.
+// Container-verified by TestGroupByDirectionOracle.
+func (p *Parser) parseGroupByList() ([]*nodes.OrderByItem, error) {
+	var items []*nodes.OrderByItem
+
+	for {
+		start := p.pos()
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if expr == nil {
+			return nil, p.syntaxErrorAtCur()
+		}
+
+		item := &nodes.OrderByItem{
+			Loc:  nodes.Loc{Start: start},
+			Expr: expr,
+		}
+
+		if _, ok := p.match(kwDESC); ok {
+			item.Direction = nodes.OrderDirectionDesc
+			item.Desc = true
+		} else if _, ok := p.match(kwASC); ok {
+			item.Direction = nodes.OrderDirectionAsc
+		} else {
+			item.Direction = nodes.OrderDirectionDefault
+		}
+
+		item.Loc.End = p.prev.End
+		items = append(items, item)
+
+		if p.cur.Type != ',' {
+			break
+		}
+		p.advance()
+	}
+
+	return items, nil
+}
+
+// parseLimitValue reads one LIMIT or OFFSET value. It is no expression: the
+// grammar's limit_option is an identifier, a parameter marker or an integer
+// literal, so `LIMIT 1 + 1`, `LIMIT (1)`, `LIMIT -1`, `LIMIT 1 OR 2`, `LIMIT 1 || 2`,
+// `LIMIT @a`, `LIMIT 0x10` and `LIMIT 1.5` are all 1064. The identifier is a stored
+// program's local variable, and parses anywhere (ER_SP_UNDECLARED_VAR comes later).
+func (p *Parser) parseLimitValue() (nodes.ExprNode, error) {
+	if p.cur.Type == tokICONST {
+		// limit_option takes the integer tokens up to ULONGLONG_NUM. What is past 64
+		// bits lexes as DECIMAL_NUM, which it does not take.
+		if _, err := strconv.ParseUint(p.cur.Str, 10, 64); err != nil {
+			return nil, p.syntaxErrorAtCur()
+		}
+		return p.parsePrimaryExpr()
+	}
+	if p.isIdentToken() && !p.isVariableRef() {
+		// The name is a stored program's local variable, and with no program around it to
+		// declare one the action answers 1327, ER_SP_UNDECLARED_VAR, as it reads it.
+		if p.routineDepth == 0 && !p.completing {
+			return nil, &ParseError{Message: "Undeclared variable: " + p.cur.Str, Position: p.cur.Loc}
+		}
+		start := p.pos()
+		name, _, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		ref := &nodes.ColumnRef{Loc: nodes.Loc{Start: start, End: p.prev.End}, Column: name}
+		// MariaDB's limit_option also takes `ident.ident`, a package variable.
+		if p.cur.Type == '.' {
+			p.advance()
+			column, _, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			ref.Table, ref.Column = name, column
+			ref.Loc.End = p.prev.End
+		}
+		return ref, nil
+	}
+	if p.cur.Type == '?' {
+		tok := p.advance()
+		return &nodes.ParamMarkerExpr{Loc: nodes.Loc{Start: tok.Loc, End: tok.End}}, nil
+	}
+	return nil, p.syntaxErrorAtCur()
+}
+
+// parseLimitClause parses LIMIT [offset,] count or LIMIT count OFFSET offset.
+func (p *Parser) parseLimitClause() (*nodes.Limit, error) {
+	start := p.pos()
+
+	count, err := p.parseLimitValue()
+	if err != nil {
+		return nil, err
+	}
+	if count == nil {
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	limit := &nodes.Limit{
+		Loc:   nodes.Loc{Start: start},
+		Count: count,
+	}
+
+	// LIMIT offset, count
+	if p.cur.Type == ',' {
+		p.advance()
+		count2, err := p.parseLimitValue()
+		if err != nil {
+			return nil, err
+		}
+		if count2 == nil {
+			return nil, p.syntaxErrorAtCur()
+		}
+		// In MySQL, LIMIT offset, count — first is offset, second is count
+		limit.Offset = limit.Count
+		limit.Count = count2
+	}
+
+	// LIMIT count OFFSET offset
+	if _, ok := p.match(kwOFFSET); ok {
+		offset, err := p.parseLimitValue()
+		if err != nil {
+			return nil, err
+		}
+		if offset == nil {
+			return nil, p.syntaxErrorAtCur()
+		}
+		limit.Offset = offset
+		limit.OffsetKeyword = true
+	}
+
+	limit.Loc.End = p.prev.End
+	return limit, nil
+}
+
+// parseForUpdateClause parses FOR UPDATE / FOR SHARE.
+func (p *Parser) parseForUpdateClause() (*nodes.ForUpdate, error) {
+	start := p.pos()
+	p.advance() // consume FOR
+
+	// Completion: after FOR keyword, offer UPDATE and SHARE.
+	p.checkCursor()
+	if p.collectMode() {
+		p.addTokenCandidate(kwUPDATE)
+		p.addTokenCandidate(kwSHARE)
+		return nil, &ParseError{Message: "collecting"}
+	}
+
+	fu := &nodes.ForUpdate{Loc: nodes.Loc{Start: start}}
+
+	// MariaDB has no FOR SHARE: a shared read lock is LOCK IN SHARE MODE
+	// (container-verified: "SELECT * FROM t FOR SHARE" is a syntax error).
+	if p.cur.Type == kwSHARE {
+		return nil, &ParseError{
+			Message:  "FOR SHARE is not supported in MariaDB; use LOCK IN SHARE MODE",
+			Position: p.cur.Loc,
+		}
+	}
+	if _, ok := p.match(kwUPDATE); !ok {
+		return nil, &ParseError{
+			Message:  "expected UPDATE after FOR",
+			Position: p.cur.Loc,
+		}
+	}
+
+	// Completion: after FOR UPDATE, offer the wait modifiers.
+	p.checkCursor()
+	if p.collectMode() {
+		p.addTokenCandidate(kwNOWAIT)
+		p.addTokenCandidate(kwSKIP)
+		p.addTokenCandidate(kwWAIT)
+		return nil, &ParseError{Message: "collecting"}
+	}
+
+	// MariaDB removed FOR UPDATE/SHARE ... OF in 11.4 (it is MySQL-only).
+	if p.cur.Type == kwOF {
+		return nil, &ParseError{
+			Message:  "FOR UPDATE ... OF is not supported in MariaDB",
+			Position: p.cur.Loc,
+		}
+	}
+
+	if err := p.parseLockWaitModifier(fu); err != nil {
+		return nil, err
+	}
+
+	fu.Loc.End = p.prev.End
+	return fu, nil
+}
+
+// isLockWaitLiteral reports whether tok is a literal MariaDB's ulong_num
+// accepts after WAIT: NUM, LONG_NUM, ULONGLONG_NUM, DECIMAL_NUM, FLOAT_NUM
+// and HEX_NUM. HEX_NUM is the 0x10 spelling only — the X'10' spelling is
+// HEX_STRING, which ulong_num does not take — and both lex to tokXCONST, so
+// the prefix separates them (container-verified: MariaDB accepts WAIT 0x10
+// and rejects WAIT X'10').
+func isLockWaitLiteral(tok Token) bool {
+	switch tok.Type {
+	case tokICONST, tokFCONST:
+		return true
+	case tokXCONST:
+		// Lower case only: MariaDB answers 1064 for WAIT 0X10.
+		return strings.HasPrefix(tok.Str, "0x")
+	}
+	return false
+}
+
+// parseLockWaitModifier parses the wait modifier a MariaDB locking clause may
+// carry, onto fu. MariaDB spells the three as one alternative each
+// (sql/sql_yacc.yy 11.8, opt_lock_wait_timeout_new), so at most one appears
+// and SKIP needs its LOCKED:
+//
+//	WAIT ulong_num | NOWAIT | SKIP LOCKED
+//
+// ulong_num is a numeric literal, not an expression: MariaDB takes WAIT 5,
+// WAIT 5.5, WAIT 1e3 and WAIT 0x10 (ulong_num includes HEX_NUM) and rejects
+// WAIT @v, WAIT ?, WAIT (5), WAIT -5, WAIT 0b10 and WAIT X'10'. The literal
+// is kept as written rather than converted, so nothing is invented about how
+// MariaDB rounds or clamps it. All container-verified on mariadb:11.8.8, as
+// are the rejections of "NOWAIT WAIT 5", "WAIT 5 NOWAIT", "WAIT 1 WAIT 2" and
+// a bare "SKIP".
+func (p *Parser) parseLockWaitModifier(fu *nodes.ForUpdate) error {
+	switch p.cur.Type {
+	case kwNOWAIT:
+		p.advance()
+		fu.NoWait = true
+	case kwWAIT:
+		p.advance()
+		if !isLockWaitLiteral(p.cur) {
+			return &ParseError{
+				Message:  "expected a number of seconds after WAIT",
+				Position: p.cur.Loc,
+			}
+		}
+		fu.WaitSeconds = p.cur.Str
+		fu.HasWait = true
+		p.advance()
+	case kwSKIP:
+		p.advance()
+		if _, err := p.expect(kwLOCKED); err != nil {
+			return err
+		}
+		fu.SkipLocked = true
+	}
+	return nil
+}
+
+// atForSystemTime reports whether the cursor begins a FOR SYSTEM_TIME temporal
+// suffix on a table factor. It must NOT match the SELECT-tail locking clause
+// (FOR UPDATE / FOR SHARE), so it requires the word SYSTEM_TIME after FOR.
+// SYSTEM_TIME is non-reserved in MariaDB, so it is matched by identifier text
+// (single-token lookahead, no backtracking).
+func (p *Parser) atForSystemTime() bool {
+	return p.cur.Type == kwFOR && p.peekNext().Type == tokIDENT &&
+		strings.EqualFold(p.peekNext().Str, "SYSTEM_TIME")
+}
+
+// parseForSystemTime parses the FOR SYSTEM_TIME temporal clause:
+//
+//	FOR SYSTEM_TIME AS OF expr
+//	FOR SYSTEM_TIME BETWEEN expr AND expr
+//	FOR SYSTEM_TIME FROM expr TO expr
+//	FOR SYSTEM_TIME ALL
+//
+// FOR is the current token; the caller has confirmed SYSTEM_TIME follows.
+func (p *Parser) parseForSystemTime() (*nodes.SystemTime, error) {
+	start := p.pos()
+	p.advance() // FOR
+	p.advance() // SYSTEM_TIME
+
+	st := &nodes.SystemTime{Loc: nodes.Loc{Start: start}}
+
+	switch p.cur.Type {
+	case kwAS:
+		// AS OF expr  |  AS OF TRANSACTION expr (time travel by transaction id)
+		p.advance() // AS
+		if _, err := p.expect(kwOF); err != nil {
+			return nil, err
+		}
+		st.Kind = nodes.SystemTimeAsOf
+		if p.cur.Type == kwTRANSACTION {
+			p.advance() // TRANSACTION
+			st.Kind = nodes.SystemTimeAsOfTransaction
+		}
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		st.From = expr
+	case kwBETWEEN:
+		// BETWEEN [TRANSACTION] expr AND [TRANSACTION] expr — bounds parsed at
+		// precAdd so the AND is read as the range separator, not a boolean
+		// operator (see parseBetweenExpr). Each bound may carry a TRANSACTION
+		// qualifier (transaction-id precision), independently.
+		p.advance() // BETWEEN
+		st.FromTransaction = p.consumeTransactionKeyword()
+		lo, err := p.parseExprPrec(precAdd)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(kwAND); err != nil {
+			return nil, err
+		}
+		st.ToTransaction = p.consumeTransactionKeyword()
+		hi, err := p.parseExprPrec(precAdd)
+		if err != nil {
+			return nil, err
+		}
+		st.Kind = nodes.SystemTimeBetween
+		st.From = lo
+		st.To = hi
+	case kwFROM:
+		// FROM [TRANSACTION] expr TO [TRANSACTION] expr
+		p.advance() // FROM
+		st.FromTransaction = p.consumeTransactionKeyword()
+		lo, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(kwTO); err != nil {
+			return nil, err
+		}
+		st.ToTransaction = p.consumeTransactionKeyword()
+		hi, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		st.Kind = nodes.SystemTimeFromTo
+		st.From = lo
+		st.To = hi
+	case kwALL:
+		p.advance() // ALL
+		st.Kind = nodes.SystemTimeAll
+	default:
+		return nil, p.syntaxErrorAtCur()
+	}
+
+	st.Loc.End = p.prev.End
+	return st, nil
+}
+
+// consumeTransactionKeyword consumes a leading TRANSACTION qualifier on a
+// FOR SYSTEM_TIME point-in-time bound and reports whether it was present.
+func (p *Parser) consumeTransactionKeyword() bool {
+	if p.cur.Type == kwTRANSACTION {
+		p.advance()
+		return true
+	}
+	return false
+}
+
+// parseLockInShareMode parses MariaDB's shared read lock and the wait
+// modifier after it. MariaDB has no FOR SHARE, so this is the only spelling.
+//
+//	LOCK IN SHARE MODE [WAIT n | NOWAIT | SKIP LOCKED]
+func (p *Parser) parseLockInShareMode() (*nodes.ForUpdate, error) {
+	start := p.pos()
+	p.advance() // consume LOCK
+
+	if _, err := p.expect(kwIN); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(kwSHARE); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(kwMODE); err != nil {
+		return nil, err
+	}
+
+	fu := &nodes.ForUpdate{
+		Loc:             nodes.Loc{Start: start},
+		Share:           true,
+		LockInShareMode: true,
+	}
+	// MariaDB takes the same wait modifier after LOCK IN SHARE MODE as after
+	// FOR UPDATE (container-verified: "LOCK IN SHARE MODE WAIT 5", "... NOWAIT"
+	// and "... SKIP LOCKED" are all accepted; MySQL and TiDB reject all three).
+	if err := p.parseLockWaitModifier(fu); err != nil {
+		return nil, err
+	}
+	fu.Loc.End = p.prev.End
+	return fu, nil
+}
+
+// parseIntoClause parses INTO OUTFILE / DUMPFILE / var_list.
+//
+// Ref: https://dev.mysql.com/doc/refman/8.0/en/select.html
+//
+//	into_option: {
+//	    INTO OUTFILE 'file_name'
+//	        [CHARACTER SET charset_name]
+//	        [{FIELDS | COLUMNS}
+//	            [TERMINATED BY 'string']
+//	            [[OPTIONALLY] ENCLOSED BY 'char']
+//	            [ESCAPED BY 'char']
+//	        ]
+//	        [LINES
+//	            [STARTING BY 'string']
+//	            [TERMINATED BY 'string']
+//	        ]
+//	  | INTO DUMPFILE 'file_name'
+//	  | INTO var_name [, var_name] ...
+//	}
+func (p *Parser) parseIntoClause() (*nodes.IntoClause, error) {
+	start := p.pos()
+	into := &nodes.IntoClause{Loc: nodes.Loc{Start: start}}
+
+	switch p.cur.Type {
+	case kwOUTFILE:
+		p.advance()
+		if p.cur.Type == tokSCONST {
+			into.Outfile = p.cur.Str
+			p.advance()
+		}
+
+		// [CHARACTER SET charset_name]
+		if p.cur.Type == kwCHARACTER {
+			p.advance()
+			p.match(kwSET)
+			charset, _, csErr := p.parseIdent()
+			if csErr != nil {
+				return nil, csErr
+			}
+			into.Charset = charset
+		} else if p.cur.Type == kwCHARSET {
+			p.advance()
+			charset, _, csErr := p.parseIdent()
+			if csErr != nil {
+				return nil, csErr
+			}
+			into.Charset = charset
+		}
+
+		// [{FIELDS | COLUMNS} ...]
+		if p.cur.Type == kwFIELDS || p.cur.Type == kwCOLUMNS {
+			p.advance()
+			into.HasFieldsClause = true
+			if err := p.parseOutfileFields(into); err != nil {
+				return nil, err
+			}
+		}
+
+		// [LINES ...]
+		if p.cur.Type == kwLINES {
+			p.advance()
+			into.HasLinesClause = true
+			if err := p.parseOutfileLines(into); err != nil {
+				return nil, err
+			}
+		}
+
+	case kwDUMPFILE:
+		p.advance()
+		if p.cur.Type == tokSCONST {
+			into.Dumpfile = p.cur.Str
+			p.advance()
+		}
+	default:
+		// INTO var_name [, var_name ...]. Accepts @user_vars as well as bare
+		// identifiers (stored-program local variables / parameters declared
+		// via DECLARE, per MySQL's select_var alternative).
+		for {
+			if p.isVariableRef() {
+				v, err := p.parseVariableRef()
+				if err != nil {
+					return nil, err
+				}
+				into.Vars = append(into.Vars, v)
+			} else if p.cur.Type == tokIDENT || (p.cur.Type >= 700 && isLvalueKeyword(p.cur.Type)) {
+				// Bare identifier: SELECT ... INTO local_var (stored program)
+				nameStart := p.pos()
+				name, _, err := p.parseLvalueIdent()
+				if err != nil {
+					return nil, err
+				}
+				into.Vars = append(into.Vars, &nodes.VariableRef{
+					Loc:  nodes.Loc{Start: nameStart, End: p.prev.End},
+					Name: name,
+				})
+			} else {
+				// INTO takes at least one target, and a comma another.
+				return nil, p.syntaxErrorAtCur()
+			}
+			if p.cur.Type != ',' {
+				break
+			}
+			p.advance()
+		}
+	}
+
+	into.Loc.End = p.prev.End
+	return into, nil
+}
+
+// setOpPrecedence returns the precedence for a set operation.
+// INTERSECT has higher precedence than UNION/EXCEPT in MySQL 8.0.31+.
+func setOpPrecedence(tokType int) int {
+	switch tokType {
+	case kwINTERSECT:
+		return 2
+	case kwUNION, kwEXCEPT:
+		return 1
+	}
+	return 0
+}
+
+// parseParenIdentList parses a parenthesized comma-separated list of identifiers.
+func (p *Parser) parseParenIdentList() ([]string, error) {
+	return p.parseParenIdentListWithCompletion("")
+}
+
+// parseParenIdentListWithCompletion is like parseParenIdentList but emits the
+// given completion rule (e.g. "columnref") at each identifier position. Pass ""
+// to disable completion candidate emission.
+func (p *Parser) parseParenIdentListWithCompletion(completionRule string) ([]string, error) {
+	if _, err := p.expect('('); err != nil {
+		return nil, err
+	}
+
+	var names []string
+	for {
+		// Completion: at each identifier position (including empty parens).
+		if completionRule != "" {
+			p.checkCursor()
+			if p.collectMode() {
+				p.addRuleCandidate(completionRule)
+				return nil, &ParseError{Message: "collecting"}
+			}
+		}
+
+		name, _, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+		if p.cur.Type != ',' {
+			break
+		}
+		p.advance()
+	}
+
+	if _, err := p.expect(')'); err != nil {
+		return nil, err
+	}
+	return names, nil
+}
+
+// tableExprLoc returns the location of a TableExpr.
+func tableExprLoc(te nodes.TableExpr) nodes.Loc {
+	switch t := te.(type) {
+	case *nodes.TableRef:
+		return t.Loc
+	case *nodes.JoinClause:
+		return t.Loc
+	case *nodes.SubqueryExpr:
+		return t.Loc
+	case *nodes.JsonTableExpr:
+		return t.Loc
+	}
+	return nodes.NoLoc()
+}
+
+// parseNamedWindowList parses WINDOW window_name AS (window_spec) [, ...].
+//
+// Ref: https://dev.mysql.com/doc/refman/8.0/en/window-functions-named-windows.html
+//
+//	window_clause:
+//	    WINDOW window_name AS (window_spec) [, window_name AS (window_spec)] ...
+func (p *Parser) parseNamedWindowList() ([]*nodes.WindowDef, error) {
+	var defs []*nodes.WindowDef
+	for {
+		start := p.pos()
+		name, _, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(kwAS); err != nil {
+			return nil, err
+		}
+		if _, err := p.expect('('); err != nil {
+			return nil, err
+		}
+
+		wd := &nodes.WindowDef{Loc: nodes.Loc{Start: start}, Name: name}
+
+		// Optional reference to existing window
+		if p.isIdentToken() && p.cur.Type != kwPARTITION && p.cur.Type != kwORDER &&
+			p.cur.Type != kwROWS && p.cur.Type != kwRANGE && p.cur.Type != kwGROUPS {
+			var refErr error
+			wd.RefName, _, refErr = p.parseIdent()
+			if refErr != nil {
+				return nil, refErr
+			}
+		}
+
+		if p.cur.Type == kwPARTITION {
+			p.advance()
+			if _, err := p.expect(kwBY); err != nil {
+				return nil, err
+			}
+			exprs, err := p.parseExprList()
+			if err != nil {
+				return nil, err
+			}
+			wd.PartitionBy = exprs
+		}
+
+		if p.cur.Type == kwORDER {
+			p.advance()
+			if _, err := p.expect(kwBY); err != nil {
+				return nil, err
+			}
+			orderBy, err := p.parseOrderByList()
+			if err != nil {
+				return nil, err
+			}
+			wd.OrderBy = orderBy
+		}
+
+		if p.cur.Type == kwROWS || p.cur.Type == kwRANGE || p.cur.Type == kwGROUPS {
+			frame, err := p.parseFrameClause()
+			if err != nil {
+				return nil, err
+			}
+			wd.Frame = frame
+		}
+
+		if _, err := p.expect(')'); err != nil {
+			return nil, err
+		}
+		wd.Loc.End = p.prev.End
+		defs = append(defs, wd)
+
+		if p.cur.Type != ',' {
+			break
+		}
+		p.advance()
+	}
+	return defs, nil
+}
+
+// parseValuesPrimary parses a table value constructor as a query primary,
+// with the ORDER BY, LIMIT, and locking clauses after it.
+func (p *Parser) parseValuesPrimary() (*nodes.SelectStmt, error) {
+	values, err := p.parseValuesConstructor()
+	if err != nil {
+		return nil, err
+	}
+	return p.parseValuesTail(values)
+}
+
+// parseValuesConstructor parses a MariaDB table value constructor, VALUES
+// (row) [, (row)] ..., into a ValuesStmt that holds only the rows. The
+// current token is VALUES, or VALUE where MariaDB reads it as VALUES (see
+// parseInsertOrReplace).
+//
+// Ref: https://mariadb.com/kb/en/table-value-constructors/
+// MariaDB 11.8.8 sql/sql_yacc.yy: table_value_constructor (line 8968) is
+// VALUES values_list, and values_list (13748) is a list of '(' opt_values
+// ')'. A row is not written ROW(...), as in MySQL 8.0, and may be empty;
+// MariaDB rejects an empty row, or rows of different lengths, only when it
+// runs the statement (errors 4141 and 4099, from sql/sql_tvc.cc).
+func (p *Parser) parseValuesConstructor() (*nodes.ValuesStmt, error) {
+	start := p.pos()
+	p.advance() // consume VALUES
+	rows, err := p.parseValuesRows()
+	if err != nil {
+		return nil, err
+	}
+	return &nodes.ValuesStmt{
+		Loc:  nodes.Loc{Start: start, End: p.prev.End},
+		Rows: rows,
+	}, nil
+}
+
+// parseValuesTail wraps a table value constructor in the SelectStmt that is
+// the query primary, and parses onto that SelectStmt the ORDER BY, LIMIT, and
+// locking clauses after the constructor, so they have one owner.
+//
+// In MariaDB's grammar those clauses follow a whole query expression body
+// (query_expression_body_ext, line 9112, then opt_query_expression_tail,
+// 13009, which is opt_order_limit_lock), never one operand of a set
+// operation: VALUES (1) LIMIT 1 UNION VALUES (2) is a syntax error. A set
+// operator after them is rejected here. Like a SELECT's own clauses, the
+// clauses after the last operand move to the set operation (see
+// parseSetOperations). INTO is not one of them: MariaDB takes it only after a
+// query expression that stands as a statement (see parseTrailingInto).
+func (p *Parser) parseValuesTail(values *nodes.ValuesStmt) (*nodes.SelectStmt, error) {
+	stmt := &nodes.SelectStmt{Loc: values.Loc, ValuesSource: values}
+	if err := p.parseOuterOrderByLimit(stmt); err != nil {
+		return nil, err
+	}
+	if (len(stmt.OrderBy) > 0 || stmt.Limit != nil || stmt.ForUpdate != nil) && setOpPrecedence(p.cur.Type) > 0 {
+		return nil, p.syntaxErrorAtCur()
+	}
+	stmt.Loc.End = p.prev.End
+	return stmt, nil
+}
+
+// parseQueryAfterValues parses the rest of a query expression whose first
+// query primary is a table value constructor the caller has parsed: the
+// clauses after it, any set operations, and the clauses after those. INSERT
+// and CREATE TABLE parse VALUES rows first and come here when what follows
+// makes them a query expression, as in INSERT INTO t VALUES (1) UNION
+// VALUES (2).
+func (p *Parser) parseQueryAfterValues(values *nodes.ValuesStmt) (*nodes.SelectStmt, error) {
+	if err := p.enterNesting(); err != nil {
+		return nil, err
+	}
+	defer p.leaveNesting()
+	left, err := p.parseValuesTail(values)
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.parseSetOperations(left, 0)
+	if err != nil {
+		return nil, err
+	}
+	if body == nil { // collecting completion candidates
+		return nil, nil
+	}
+	return p.parseQueryExpressionTail(body, values.Loc.Start, nil)
+}
+
+// atQueryExpressionTail reports whether the current token continues a query
+// expression past its first query primary: a set operator or a clause that
+// applies to the whole expression.
+func (p *Parser) atQueryExpressionTail() bool {
+	switch p.cur.Type {
+	case kwORDER, kwLIMIT, kwFOR, kwLOCK:
+		return true
+	}
+	return setOpPrecedence(p.cur.Type) > 0
+}
+
+// parseQueryStatement parses a query expression that stands as a statement or
+// an EXPLAIN target, and the INTO after it.
+func (p *Parser) parseQueryStatement() (*nodes.SelectStmt, error) {
+	sel, err := p.parseSelectStmt()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.parseTrailingInto(sel); err != nil {
+		return nil, err
+	}
+	return sel, nil
+}
+
+// parseTrailingInto parses the INTO clause, and a locking clause after it,
+// that MariaDB accepts after a whole query expression standing as a
+// statement: the select rule (sql_yacc.yy line 8895) ends in
+// opt_procedure_or_into (13013), INTO then opt_select_lock_type. A SELECT
+// also takes INTO among its own clauses (select_into, 8927), and this parser
+// reads it there, so the clause parsed here follows something else: a table
+// value constructor, a ')' or the clauses of a set operation, as in
+// VALUES (1) INTO @x or (SELECT 1) INTO @x. It is held by the SelectStmt
+// for the whole expression. A statement takes one INTO.
+func (p *Parser) parseTrailingInto(sel *nodes.SelectStmt) error {
+	if sel == nil || p.cur.Type != kwINTO || hasInto(sel) {
+		return nil
+	}
+	p.advance() // consume INTO
+	into, err := p.parseIntoClause()
+	if err != nil {
+		return err
+	}
+	sel.Into = into
+	if sel.ForUpdate == nil {
+		switch p.cur.Type {
+		case kwFOR:
+			if sel.ForUpdate, err = p.parseForUpdateClause(); err != nil {
+				return err
+			}
+		case kwLOCK:
+			if sel.ForUpdate, err = p.parseLockInShareMode(); err != nil {
+				return err
+			}
+		}
+	}
+	sel.Loc.End = p.prev.End
+	return nil
+}
+
+// hasInto reports whether the query expression or the query primary it ends
+// with, through set operations and parentheses, already holds an INTO.
+func hasInto(sel *nodes.SelectStmt) bool {
+	for sel != nil {
+		if sel.Into != nil {
+			return true
+		}
+		switch {
+		case sel.SetOp != nodes.SetOpNone:
+			sel = sel.Right
+		case sel.ParenSource != nil:
+			sel = sel.ParenSource
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// parseSubqueryExpr parses a subquery expression: SELECT ... or a
+// parenthesized query expression. The caller owns the surrounding subquery
+// parentheses used by IN/EXISTS/scalar-subquery syntax.
+func (p *Parser) parseSubqueryExpr() (*nodes.SubqueryExpr, error) {
+	if err := p.refuseStoredExprSubquery(p.pos(), false); err != nil {
+		return nil, err
+	}
+	start := p.pos()
+	sel, err := p.parseSelectStmt()
+	if err != nil {
+		return nil, err
+	}
+	return &nodes.SubqueryExpr{
+		Loc:    nodes.Loc{Start: start, End: p.prev.End},
+		Select: sel,
+	}, nil
+}
+
+// parseIndexHints parses an optional list of index hints following a table reference.
+//
+// Ref: https://dev.mysql.com/doc/refman/8.0/en/index-hints.html
+//
+//	index_hint_list:
+//	    index_hint [index_hint] ...
+//
+//	index_hint:
+//	    USE {INDEX|KEY}
+//	      [FOR {JOIN|ORDER BY|GROUP BY}] ([index_list])
+//	  | {IGNORE|FORCE} {INDEX|KEY}
+//	      [FOR {JOIN|ORDER BY|GROUP BY}] (index_list)
+//
+//	index_list:
+//	    index_name [, index_name] ...
+func (p *Parser) parseIndexHints() ([]*nodes.IndexHint, error) {
+	var hints []*nodes.IndexHint
+	for p.cur.Type == kwUSE || p.cur.Type == kwFORCE || p.cur.Type == kwIGNORE {
+		hint, err := p.parseIndexHint()
+		if err != nil {
+			return hints, err
+		}
+		hints = append(hints, hint)
+	}
+	return hints, nil
+}
+
+// parseIndexHint parses a single index hint.
+//
+//	index_hint:
+//	    USE {INDEX|KEY}
+//	      [FOR {JOIN|ORDER BY|GROUP BY}] ([index_list])
+//	  | {IGNORE|FORCE} {INDEX|KEY}
+//	      [FOR {JOIN|ORDER BY|GROUP BY}] (index_list)
+func (p *Parser) parseIndexHint() (*nodes.IndexHint, error) {
+	start := p.pos()
+	hint := &nodes.IndexHint{
+		Loc: nodes.Loc{Start: start},
+	}
+
+	// Parse hint type: USE | FORCE | IGNORE
+	switch p.cur.Type {
+	case kwUSE:
+		hint.Type = nodes.HintUse
+	case kwFORCE:
+		hint.Type = nodes.HintForce
+	case kwIGNORE:
+		hint.Type = nodes.HintIgnore
+	default:
+		return nil, &ParseError{Message: "expected USE, FORCE, or IGNORE", Position: p.cur.Loc}
+	}
+	p.advance()
+
+	// Parse INDEX | KEY
+	if p.cur.Type != kwINDEX && p.cur.Type != kwKEY {
+		return nil, &ParseError{Message: "expected INDEX or KEY", Position: p.cur.Loc}
+	}
+	p.advance()
+
+	// Optional FOR {JOIN | ORDER BY | GROUP BY}
+	hint.Scope = nodes.HintScopeAll
+	if p.cur.Type == kwFOR {
+		p.advance()
+		switch p.cur.Type {
+		case kwJOIN:
+			hint.Scope = nodes.HintScopeJoin
+			p.advance()
+		case kwORDER:
+			p.advance()
+			if _, err := p.expect(kwBY); err != nil {
+				return nil, err
+			}
+			hint.Scope = nodes.HintScopeOrderBy
+		case kwGROUP:
+			p.advance()
+			if _, err := p.expect(kwBY); err != nil {
+				return nil, err
+			}
+			hint.Scope = nodes.HintScopeGroupBy
+		default:
+			return nil, &ParseError{Message: "expected JOIN, ORDER BY, or GROUP BY", Position: p.cur.Loc}
+		}
+	}
+
+	// Parse (index_list) — required parens, list may be empty for USE
+	if _, err := p.expect('('); err != nil {
+		return nil, err
+	}
+
+	// Completion: inside index hint parentheses, offer index_ref candidates.
+	p.checkCursor()
+	if p.collectMode() {
+		p.addRuleCandidate("index_ref")
+		return nil, &ParseError{Message: "collecting"}
+	}
+
+	if p.cur.Type != ')' {
+		// Parse comma-separated index names
+		for {
+			name, _, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			hint.Indexes = append(hint.Indexes, name)
+			if p.cur.Type != ',' {
+				break
+			}
+			p.advance()
+		}
+	}
+
+	if _, err := p.expect(')'); err != nil {
+		return nil, err
+	}
+
+	hint.Loc.End = p.prev.End
+	return hint, nil
+}

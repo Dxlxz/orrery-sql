@@ -1,0 +1,311 @@
+package ast
+
+// This file holds AST node types for SELECT statement parsing (T1.4).
+
+// ---------------------------------------------------------------------------
+// SELECT statement
+// ---------------------------------------------------------------------------
+
+// WithClause represents a WITH clause preceding a SELECT statement.
+//
+//	WITH [RECURSIVE] cte_name [(col1, col2, ...)] AS (query)
+//	  [, cte_name2 AS (query2)]
+type WithClause struct {
+	Recursive bool   // RECURSIVE keyword present
+	CTEs      []*CTE // one or more CTE definitions
+	Loc       Loc
+}
+
+// Tag implements Node.
+func (n *WithClause) Tag() NodeTag { return T_WithClause }
+
+// Compile-time assertion that *WithClause satisfies Node.
+var _ Node = (*WithClause)(nil)
+
+// CTE is one named entry in a WITH clause:
+//
+//	cte_name [(col1, col2, ...)] AS (query)
+type CTE struct {
+	Name    string   // the CTE alias name
+	Columns []string // optional column aliases; nil/empty if not specified
+	Query   Node     // the inner SELECT statement (*SelectStmt)
+	Loc     Loc
+}
+
+// Tag implements Node.
+func (n *CTE) Tag() NodeTag { return T_CTE }
+
+// Compile-time assertion that *CTE satisfies Node.
+var _ Node = (*CTE)(nil)
+
+// SelectStmt represents a full SELECT statement.
+//
+//	[WITH [RECURSIVE] cte ...]
+//	SELECT [DISTINCT|ALL] select_list
+//	  [FROM table_references]
+//	  [WHERE condition]
+//	  [GROUP BY expr, ...]
+//	  [HAVING condition]
+//	  [QUALIFY condition]
+//	  [ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...]
+//	  [LIMIT count [OFFSET offset]]
+//	  [INTO OUTFILE ...]
+type SelectStmt struct {
+	With              *WithClause    // optional WITH clause (nil if absent)
+	Distinct          bool           // DISTINCT keyword present
+	All               bool           // ALL keyword present (explicit, rarely used)
+	Items             []*SelectItem  // SELECT list
+	From              []Node         // FROM clause table references (TableRef or JoinClause)
+	Where             Node           // WHERE expression (nil if absent)
+	GroupBy           []Node         // GROUP BY expressions
+	GroupByWithRollup bool           // GROUP BY ... WITH ROLLUP
+	Having            Node           // HAVING expression (nil if absent)
+	Qualify           Node           // QUALIFY expression (nil if absent)
+	OrderBy           []*OrderByItem // ORDER BY items
+	Limit             Node           // LIMIT expression (nil if absent)
+	Offset            Node           // OFFSET expression (nil if absent)
+
+	// Into holds the INTO OUTFILE clause when this statement is the whole
+	// query of a statement — see IntoOutfileClause for why it can also sit
+	// on SetOpStmt and GroupedQuery.
+	Into *IntoOutfileClause
+
+	Loc Loc
+}
+
+// Tag implements Node.
+func (n *SelectStmt) Tag() NodeTag { return T_SelectStmt }
+
+// Compile-time assertion that *SelectStmt satisfies Node.
+var _ Node = (*SelectStmt)(nil)
+
+// IntoOutfileClause represents an INTO OUTFILE clause, which writes the
+// query's result set out to S3, HDFS or a local path:
+//
+//	INTO OUTFILE 'path'
+//	  [FORMAT AS format_type]
+//	  [PROPERTIES ("key" = "value", ...)]
+//
+// Doris attaches it to a whole statement, not to a query operand:
+//
+//	statementBase : explain? query outFileClause?   #statementDefault
+//	query         : cte? queryTerm queryOrganization ;
+//	queryOrganization : sortClause? limitClause? ;
+//
+// (DorisParser.g4, branch-3.1.) So the clause follows everything a query can
+// carry, ORDER BY and LIMIT included, and cannot appear inside parentheses:
+// `(SELECT 1) INTO OUTFILE 'p'` parses and `(SELECT 1 INTO OUTFILE 'p')` does
+// not — both container-verified. That is why Into sits on each of the three
+// node types a statement's outermost query can be (SelectStmt, SetOpStmt,
+// GroupedQuery) rather than only on SelectStmt: a consumer reads the clause
+// off the node it is handed and never walks into an operand looking for one.
+//
+// StarRocks's sibling node carries the same fields, but its parser attaches
+// the clause inside the SELECT, so there it can land on a set-operation arm.
+type IntoOutfileClause struct {
+	Path       string      // file path (S3, HDFS, or local)
+	Format     string      // format type: CSV, PARQUET, ORC, etc. (empty if not specified)
+	Properties []*Property // PROPERTIES key-value pairs
+	Loc        Loc
+}
+
+// Tag implements Node.
+func (n *IntoOutfileClause) Tag() NodeTag { return T_IntoOutfileClause }
+
+// Compile-time assertion that *IntoOutfileClause satisfies Node.
+var _ Node = (*IntoOutfileClause)(nil)
+
+// ---------------------------------------------------------------------------
+// SELECT list item
+// ---------------------------------------------------------------------------
+
+// SelectItem represents one item in the SELECT list:
+//   - expr [AS alias]    — a computed expression with optional alias
+//   - *                  — all columns
+//   - table.*            — all columns from a specific table
+type SelectItem struct {
+	Expr  Node   // the expression; for *, this is nil
+	Alias string // optional alias name; empty if absent
+
+	// Aliased reports whether an explicit alias was present. It is what
+	// distinguishes the engine-valid empty alias (SELECT c AS '') from no
+	// alias at all — Alias alone cannot, since "" is its absent value.
+	Aliased bool
+	Star    bool // true for * or table.*
+	// For table.*, TableName holds the qualifier ObjectName.
+	TableName *ObjectName
+	// For SELECT * EXCEPT (col1, col2, ...) — list of column names to exclude.
+	ExceptColumns []string
+	Loc           Loc
+}
+
+// Tag implements Node.
+func (n *SelectItem) Tag() NodeTag { return T_SelectItem }
+
+// Compile-time assertion that *SelectItem satisfies Node.
+var _ Node = (*SelectItem)(nil)
+
+// ---------------------------------------------------------------------------
+// Table reference
+// ---------------------------------------------------------------------------
+
+// TableRef represents a table reference in the FROM clause.
+//
+//	table_name [AS alias]
+//	db.table_name [AS alias]
+//	catalog.db.table_name [AS alias]
+type TableRef struct {
+	Name  *ObjectName // table name (may be qualified: db.table or catalog.db.table)
+	Alias string      // optional alias; empty if absent
+
+	// Func is set when the source is a table-valued function such as
+	// BACKENDS() or numbers("number" = "10"); Name mirrors the function name.
+	Func *FuncCallExpr
+
+	// Subquery is set when this FROM item is a parenthesized subquery;
+	// Name.Parts[0] mirrors its raw text for legacy consumers.
+	Subquery *SubqueryExpr
+
+	// TabletIDs holds TABLET(id, ...) — a physical-tablet restriction that
+	// appears between the table name and the alias.
+	TabletIDs []int64
+
+	// Sample holds TABLESAMPLE(...) [REPEATABLE seed], which follows the alias.
+	Sample *TableSample
+
+	// LateralViews holds the Hive-style LATERAL VIEW suffixes that follow
+	// the alias: LATERAL VIEW generator(args) tableAlias AS col [, col...],
+	// chainable. The engine requires both the table alias and the AS column
+	// list and has no OUTER variant (container-verified).
+	LateralViews []*LateralView
+
+	Loc Loc
+}
+
+// LateralView is one LATERAL VIEW suffix of a table reference.
+type LateralView struct {
+	Func       *FuncCallExpr // the generator call, e.g. EXPLODE([1, 2])
+	TableAlias string        // required by the engine
+	Columns    []string      // AS col [, col ...] — at least one
+}
+
+// TableSample is the TABLESAMPLE(...) [REPEATABLE seed] suffix of a table
+// reference: TABLESAMPLE(1000 ROWS), TABLESAMPLE(20 PERCENT), TABLESAMPLE().
+type TableSample struct {
+	Value Node   // sample size; nil for the bare TABLESAMPLE() form
+	Unit  string // "ROWS" or "PERCENT"; empty when Value is nil
+	Seed  Node   // REPEATABLE seed; nil if absent
+}
+
+// Tag implements Node.
+func (n *TableRef) Tag() NodeTag { return T_TableRef }
+
+// Compile-time assertion that *TableRef satisfies Node.
+var _ Node = (*TableRef)(nil)
+
+// ---------------------------------------------------------------------------
+// JOIN clause (basic structure for T1.4; T1.5 will flesh out)
+// ---------------------------------------------------------------------------
+
+// JoinType classifies the kind of join.
+type JoinType int
+
+const (
+	JoinInner     JoinType = iota // [INNER] JOIN
+	JoinLeft                      // LEFT [OUTER] JOIN
+	JoinRight                     // RIGHT [OUTER] JOIN
+	JoinFull                      // FULL [OUTER] JOIN
+	JoinCross                     // CROSS JOIN
+	JoinLeftSemi                  // LEFT SEMI JOIN
+	JoinRightSemi                 // RIGHT SEMI JOIN
+	JoinLeftAnti                  // LEFT ANTI JOIN
+	JoinRightAnti                 // RIGHT ANTI JOIN
+)
+
+// JoinClause represents a JOIN expression in the FROM clause.
+type JoinClause struct {
+	Type    JoinType
+	Left    Node     // left side of the join
+	Right   Node     // right side of the join
+	Natural bool     // NATURAL join modifier
+	On      Node     // ON condition (nil if absent)
+	Using   []string // USING (col1, col2, ...) column names
+	Hints   []string // execution hints, e.g. [shuffle], [broadcast]
+	Loc     Loc
+}
+
+// Tag implements Node.
+func (n *JoinClause) Tag() NodeTag { return T_JoinClause }
+
+// Compile-time assertion that *JoinClause satisfies Node.
+var _ Node = (*JoinClause)(nil)
+
+// ---------------------------------------------------------------------------
+// Set operation (UNION / INTERSECT / EXCEPT / MINUS) — T1.7
+// ---------------------------------------------------------------------------
+
+// SetOperator represents the type of set operation.
+type SetOperator int
+
+const (
+	SetUnion     SetOperator = iota // UNION
+	SetIntersect                    // INTERSECT
+	SetExcept                       // EXCEPT / MINUS
+)
+
+// SetOpStmt represents a set operation between two queries.
+//
+//	left UNION [ALL|DISTINCT] right
+//	left INTERSECT [ALL|DISTINCT] right
+//	left EXCEPT [ALL|DISTINCT] right
+//	left MINUS [ALL|DISTINCT] right  -- MINUS is an alias for EXCEPT in Doris
+type SetOpStmt struct {
+	Op    SetOperator // the set operator
+	All   bool        // true for ALL quantifier; false means DISTINCT (the default)
+	Left  Node        // SelectStmt or another SetOpStmt
+	Right Node        // SelectStmt or another SetOpStmt
+
+	// Trailing clauses applied to the combined result, as in
+	// (SELECT 1) UNION (SELECT 2) ORDER BY 1 LIMIT 5.
+	OrderBy []*OrderByItem
+	Limit   Node
+	Offset  Node
+
+	// Into is the INTO OUTFILE clause applied to the combined result, as in
+	// SELECT a FROM t1 UNION SELECT a FROM t2 INTO OUTFILE 'p'. The engine
+	// rejects the clause inside an arm, so it only ever sits out here.
+	Into *IntoOutfileClause
+
+	Loc Loc
+}
+
+// Tag implements Node.
+func (n *SetOpStmt) Tag() NodeTag { return T_SetOpStmt }
+
+// Compile-time assertion that *SetOpStmt satisfies Node.
+var _ Node = (*SetOpStmt)(nil)
+
+// GroupedQuery carries a trailing ORDER BY / LIMIT group applied to a query
+// that already carries that clause itself — (SELECT 1 ORDER BY 1) ORDER BY 2,
+// or the engine-lenient bare repetition SELECT 1 ORDER BY 1 ORDER BY 2 (both
+// engine-verified accepts). The engine applies the outer group; keeping the
+// groups on distinct nodes means no inner expression (and no subquery table
+// read inside one) is lost from the tree.
+type GroupedQuery struct {
+	Query   Node // SelectStmt, SetOpStmt, or nested GroupedQuery
+	OrderBy []*OrderByItem
+	Limit   Node
+	Offset  Node
+
+	// Into is the INTO OUTFILE clause applied to the grouped result, as in
+	// (SELECT 1 ORDER BY 1) ORDER BY 1 INTO OUTFILE 'p'.
+	Into *IntoOutfileClause
+
+	Loc Loc
+}
+
+// Tag implements Node.
+func (n *GroupedQuery) Tag() NodeTag { return T_GroupedQuery }
+
+// Compile-time assertion that *GroupedQuery satisfies Node.
+var _ Node = (*GroupedQuery)(nil)

@@ -1,0 +1,667 @@
+package analysis
+
+import (
+	"sort"
+	"strings"
+	"testing"
+)
+
+// --- helpers --------------------------------------------------------------
+
+// tableNames renders AccessTables as sorted "schema.table" (or
+// "catalog.schema.table") strings for stable comparison.
+func tableNames(span *QuerySpan) []string {
+	var out []string
+	for _, ta := range span.AccessTables {
+		out = append(out, ta.qualifiedString())
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (ta TableAccess) qualifiedString() string {
+	var parts []string
+	if ta.Catalog != "" {
+		parts = append(parts, ta.Catalog)
+	}
+	if ta.Database != "" {
+		parts = append(parts, ta.Database)
+	}
+	if ta.Schema != "" {
+		parts = append(parts, ta.Schema)
+	}
+	parts = append(parts, ta.Table)
+	return strings.Join(parts, ".")
+}
+
+func resultNames(span *QuerySpan) []string {
+	var out []string
+	for _, r := range span.Results {
+		out = append(out, r.Name)
+	}
+	return out
+}
+
+func predicateColumnNames(span *QuerySpan) []string {
+	var out []string
+	for _, c := range span.PredicateColumns {
+		out = append(out, c.Column)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func eqStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// --- AccessTables ---------------------------------------------------------
+
+func TestGetQuerySpan_AccessTables(t *testing.T) {
+	tests := []struct {
+		name       string
+		sql        string
+		dialect    Dialect
+		wantTables []string
+	}{
+		{"single table", "SELECT a FROM t", DialectBigQuery, []string{"t"}},
+		{"qualified table bq", "SELECT a FROM ds.t", DialectBigQuery, []string{"ds.t"}},
+		{"three-part bq", "SELECT a FROM proj.ds.t", DialectBigQuery, []string{"proj.ds.t"}},
+		{"join", "SELECT * FROM a JOIN b ON a.x = b.x", DialectBigQuery, []string{"a", "b"}},
+		{"comma join", "SELECT * FROM a, b", DialectBigQuery, []string{"a", "b"}},
+		{"chained join", "SELECT * FROM a JOIN b ON a.x=b.x JOIN c ON b.y=c.y", DialectBigQuery, []string{"a", "b", "c"}},
+		{"aliased table excluded-from-name", "SELECT * FROM t AS x", DialectBigQuery, []string{"t"}},
+		{"subquery in from", "SELECT * FROM (SELECT a FROM inner_t) AS s", DialectBigQuery, []string{"inner_t"}},
+		{"scalar subquery", "SELECT (SELECT MAX(x) FROM u) AS m FROM t", DialectBigQuery, []string{"t", "u"}},
+		{"exists subquery", "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)", DialectBigQuery, []string{"t", "u"}},
+		{"in subquery", "SELECT * FROM t WHERE id IN (SELECT id FROM u)", DialectBigQuery, []string{"t", "u"}},
+		// Quantified comparison subquery RHS (`= ANY (SELECT ...)`): its table must
+		// be followed, exactly like an IN/EXISTS subquery (regression for the
+		// CompareExpr Quant* walker path).
+		{"quantified-comparison subquery", "SELECT * FROM t WHERE x = ANY (SELECT id FROM u)", DialectBigQuery, []string{"t", "u"}},
+		{"quantified-comparison all subquery", "SELECT * FROM t WHERE x > ALL (SELECT id FROM u)", DialectSpanner, []string{"t", "u"}},
+		{"set op", "SELECT a FROM t UNION ALL SELECT a FROM u", DialectBigQuery, []string{"t", "u"}},
+		{"dedup same table", "SELECT * FROM t WHERE a IN (SELECT a FROM t)", DialectBigQuery, []string{"t"}},
+		// Spanner schema.table bucketing (named schema under one DB).
+		{"qualified table spanner", "SELECT a FROM myschema.t", DialectSpanner, []string{"myschema.t"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			span, err := GetQuerySpan(tc.sql, tc.dialect)
+			if err != nil {
+				t.Fatalf("GetQuerySpan(%q) error: %v", tc.sql, err)
+			}
+			got := tableNames(span)
+			if !eqStrings(got, tc.wantTables) {
+				t.Errorf("GetQuerySpan(%q) tables = %v, want %v", tc.sql, got, tc.wantTables)
+			}
+		})
+	}
+}
+
+// TestGetQuerySpan_CTEsExcluded confirms CTE names are recorded in span.CTEs and
+// excluded from AccessTables, while the CTE BODY's base tables are kept.
+func TestGetQuerySpan_CTEsExcluded(t *testing.T) {
+	sql := "WITH c AS (SELECT a FROM base) SELECT a FROM c"
+	span, err := GetQuerySpan(sql, DialectBigQuery)
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	if got := tableNames(span); !eqStrings(got, []string{"base"}) {
+		t.Errorf("tables = %v, want [base] (CTE c must be excluded, its body's base kept)", got)
+	}
+	if len(span.CTEs) != 1 || !strings.EqualFold(span.CTEs[0], "c") {
+		t.Errorf("CTEs = %v, want [c]", span.CTEs)
+	}
+}
+
+// TestGetQuerySpan_CTEShadowsTable confirms a bare reference to a CTE name is not
+// recorded as a base table even when a real table of the same name could exist.
+func TestGetQuerySpan_CTEShadowsTable(t *testing.T) {
+	sql := "WITH t AS (SELECT 1 AS n) SELECT n FROM t"
+	span, err := GetQuerySpan(sql, DialectBigQuery)
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	if len(span.AccessTables) != 0 {
+		t.Errorf("tables = %v, want [] (FROM t references the CTE, not a base table)", tableNames(span))
+	}
+}
+
+// --- System-schema classification (dialect divergence) --------------------
+
+func TestGetQuerySpan_SystemTables(t *testing.T) {
+	// wantSchema / wantDatabase reflect WHERE the 2nd-to-last qualifier lands per
+	// the dialect bucketing: in BigQuery a non-INFORMATION_SCHEMA qualifier is the
+	// Database (dataset); in Spanner it is always the Schema.
+	tests := []struct {
+		name         string
+		sql          string
+		dialect      Dialect
+		wantSystem   bool
+		wantSchema   string
+		wantDatabase string
+	}{
+		{"bq info schema", "SELECT * FROM INFORMATION_SCHEMA.TABLES", DialectBigQuery, true, "INFORMATION_SCHEMA", ""},
+		{"bq dataset.info_schema.view", "SELECT * FROM ds.INFORMATION_SCHEMA.COLUMNS", DialectBigQuery, true, "INFORMATION_SCHEMA", "ds"},
+		{"bq spanner_sys not system", "SELECT * FROM SPANNER_SYS.X", DialectBigQuery, false, "", "SPANNER_SYS"},
+		{"spanner info schema", "SELECT * FROM INFORMATION_SCHEMA.TABLES", DialectSpanner, true, "INFORMATION_SCHEMA", ""},
+		{"spanner spanner_sys", "SELECT * FROM SPANNER_SYS.QUERY_STATS_TOP_MINUTE", DialectSpanner, true, "SPANNER_SYS", ""},
+		{"user table bq", "SELECT * FROM ds.users", DialectBigQuery, false, "", "ds"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			span, err := GetQuerySpan(tc.sql, tc.dialect)
+			if err != nil {
+				t.Fatalf("GetQuerySpan(%q) error: %v", tc.sql, err)
+			}
+			if len(span.AccessTables) != 1 {
+				t.Fatalf("expected exactly 1 table, got %d (%v)", len(span.AccessTables), tableNames(span))
+			}
+			ta := span.AccessTables[0]
+			if ta.IsSystem != tc.wantSystem {
+				t.Errorf("IsSystem = %v, want %v (sql %q dialect %v)", ta.IsSystem, tc.wantSystem, tc.sql, tc.dialect)
+			}
+			if ta.Schema != tc.wantSchema {
+				t.Errorf("Schema = %q, want %q", ta.Schema, tc.wantSchema)
+			}
+			if ta.Database != tc.wantDatabase {
+				t.Errorf("Database = %q, want %q", ta.Database, tc.wantDatabase)
+			}
+		})
+	}
+}
+
+// TestGetQuerySpan_BigQuerySchemaBucketing confirms the BigQuery accessTableListener
+// rule: the 2nd-to-last identifier is treated as Schema ONLY when it is
+// INFORMATION_SCHEMA; otherwise it is the Database (dataset). Spanner always
+// treats the 2nd-to-last identifier as Schema.
+func TestGetQuerySpan_SchemaBucketing(t *testing.T) {
+	// BigQuery: ds.t => ds is Database, Schema empty.
+	span, _ := GetQuerySpan("SELECT a FROM ds.t", DialectBigQuery)
+	ta := span.AccessTables[0]
+	if ta.Database != "ds" || ta.Schema != "" {
+		t.Errorf("BigQuery ds.t: Database=%q Schema=%q, want Database=ds Schema=\"\"", ta.Database, ta.Schema)
+	}
+
+	// Spanner: sch.t => sch is Schema.
+	span, _ = GetQuerySpan("SELECT a FROM sch.t", DialectSpanner)
+	ta = span.AccessTables[0]
+	if ta.Schema != "sch" {
+		t.Errorf("Spanner sch.t: Schema=%q, want sch", ta.Schema)
+	}
+}
+
+// --- Results --------------------------------------------------------------
+
+func TestGetQuerySpan_Results(t *testing.T) {
+	tests := []struct {
+		name        string
+		sql         string
+		wantResults []string
+	}{
+		{"columns", "SELECT a, b FROM t", []string{"a", "b"}},
+		{"alias", "SELECT a AS x, b y FROM t", []string{"x", "y"}},
+		{"star", "SELECT * FROM t", []string{"*"}},
+		{"qualified col", "SELECT t.a FROM t", []string{"a"}},
+		{"expr no name", "SELECT a + b FROM t", []string{""}},
+		{"set op left wins", "SELECT a AS x FROM t UNION ALL SELECT b AS y FROM u", []string{"x"}},
+		// A `rel.*` star is now a resolved StarSegments item (the relation's
+		// projection), surfaced with Name "*"; the segment carries the base relation
+		// the consumer expands. See TestGetQuerySpan_StarSegments for the segment shape.
+		{"dot star", "SELECT t.* FROM t", []string{"*"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			span, err := GetQuerySpan(tc.sql, DialectBigQuery)
+			if err != nil {
+				t.Fatalf("GetQuerySpan(%q) error: %v", tc.sql, err)
+			}
+			got := resultNames(span)
+			if !eqStrings(got, tc.wantResults) {
+				t.Errorf("GetQuerySpan(%q) results = %v, want %v", tc.sql, got, tc.wantResults)
+			}
+		})
+	}
+}
+
+// --- PredicateColumns -----------------------------------------------------
+
+func TestGetQuerySpan_PredicateColumns(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		wantPred []string
+	}{
+		{"where", "SELECT a FROM t WHERE b > 1", []string{"b"}},
+		{"where and", "SELECT a FROM t WHERE b > 1 AND c < 2", []string{"b", "c"}},
+		{"join on", "SELECT * FROM a JOIN b ON a.x = b.y", []string{"x", "y"}},
+		{"having", "SELECT a, COUNT(*) c FROM t GROUP BY a HAVING c > 1", []string{"a", "c"}},
+		{"qualify", "SELECT a FROM t QUALIFY ROW_NUMBER() OVER (ORDER BY b) = 1", []string{"b"}},
+		{"using", "SELECT * FROM a JOIN b USING (k)", []string{"k"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			span, err := GetQuerySpan(tc.sql, DialectBigQuery)
+			if err != nil {
+				t.Fatalf("GetQuerySpan(%q) error: %v", tc.sql, err)
+			}
+			got := predicateColumnNames(span)
+			if !eqStrings(got, tc.wantPred) {
+				t.Errorf("GetQuerySpan(%q) predicate columns = %v, want %v", tc.sql, got, tc.wantPred)
+			}
+		})
+	}
+}
+
+// --- DML / DDL / empty ----------------------------------------------------
+
+func TestGetQuerySpan_NonQuery(t *testing.T) {
+	// DML / DDL statements get a Type but the access-table walk still runs over
+	// their bodies (an UPDATE/INSERT touches tables, which masking/access cares
+	// about).
+	tests := []struct {
+		name       string
+		sql        string
+		wantType   QueryType
+		wantTables []string
+	}{
+		{"insert select", "INSERT INTO dst SELECT a FROM src", DML, []string{"dst", "src"}},
+		{"update", "UPDATE t SET a = 1 WHERE b = 2", DML, []string{"t"}},
+		{"delete", "DELETE FROM t WHERE a = 1", DML, []string{"t"}},
+		{"create table", "CREATE TABLE t (a INT64) PRIMARY KEY (a)", DDL, []string{"t"}},
+		{"ctas", "CREATE TABLE t AS SELECT a FROM src", DDL, []string{"src", "t"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			span, err := GetQuerySpan(tc.sql, DialectBigQuery)
+			if err != nil {
+				t.Fatalf("GetQuerySpan(%q) error: %v", tc.sql, err)
+			}
+			if span.Type != tc.wantType {
+				t.Errorf("Type = %v, want %v", span.Type, tc.wantType)
+			}
+			got := tableNames(span)
+			if !eqStrings(got, tc.wantTables) {
+				t.Errorf("tables = %v, want %v", got, tc.wantTables)
+			}
+		})
+	}
+}
+
+func TestGetQuerySpan_Empty(t *testing.T) {
+	span, err := GetQuerySpan("", DialectBigQuery)
+	if err != nil {
+		t.Fatalf("GetQuerySpan(\"\") error: %v", err)
+	}
+	if span.Type != Unknown {
+		t.Errorf("Type = %v, want Unknown", span.Type)
+	}
+	if len(span.AccessTables) != 0 || len(span.Results) != 0 {
+		t.Errorf("expected empty span, got %+v", span)
+	}
+}
+
+// TestGetQuerySpan_FailsClosedOnParseError: a statement that does not fully
+// parse yields an error, never a smaller span. The parser re-parses embedded
+// subqueries itself, so a malformed subquery surfaces through the same list.
+func TestGetQuerySpan_FailsClosedOnParseError(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT * FROM",
+		"SELECT a FROM t )))",
+		"SELECT (SELECT a FROM t2 )))) AS x FROM t1",
+		"SELECT a FROM t1 WHERE EXISTS (SELECT 1 FROM t2 )))",
+		"this is not sql",
+	} {
+		if _, err := GetQuerySpan(sql, DialectBigQuery); err == nil {
+			t.Errorf("GetQuerySpan(%q) accepted input that does not parse", sql)
+		}
+	}
+	// ClassifySQL shares the verdict: a truncated statement is Unknown, not
+	// the type of whatever prefix parsed.
+	if got := ClassifySQL("SELECT a FROM t )))", DialectBigQuery); got != Unknown {
+		t.Errorf("ClassifySQL(truncated) = %v, want Unknown", got)
+	}
+}
+
+// TestGetQuerySpan_CorrelatedSubquery confirms a correlated scalar subquery
+// contributes its own base table AND its correlation predicate columns.
+func TestGetQuerySpan_CorrelatedSubquery(t *testing.T) {
+	sql := "SELECT (SELECT x FROM u WHERE u.id = t.id) AS m FROM t"
+	span, err := GetQuerySpan(sql, DialectBigQuery)
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	if got := tableNames(span); !eqStrings(got, []string{"t", "u"}) {
+		t.Errorf("tables = %v, want [t u]", got)
+	}
+	// The correlation predicate `u.id = t.id` columns are collected from the inner
+	// WHERE (a predicate position).
+	if got := predicateColumnNames(span); !eqStrings(got, []string{"id", "id"}) {
+		t.Errorf("predicate columns = %v, want [id id]", got)
+	}
+}
+
+// TestGetQuerySpan_NestedCTEShadowing confirms an inner WITH scope shadows an
+// outer CTE of the same name, and both scopes' bodies' base tables are recorded.
+func TestGetQuerySpan_NestedCTEShadowing(t *testing.T) {
+	sql := "WITH c AS (SELECT a FROM outer_base) " +
+		"SELECT a FROM (WITH c AS (SELECT a FROM inner_base) SELECT a FROM c)"
+	span, err := GetQuerySpan(sql, DialectBigQuery)
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	// Both CTE bodies' base tables are recorded; neither `c` reference is a base
+	// table. outer_base is from the outer CTE body (walked even though the outer
+	// query does not reference the outer c — matching the legacy permissive walk).
+	if got := tableNames(span); !eqStrings(got, []string{"inner_base", "outer_base"}) {
+		t.Errorf("tables = %v, want [inner_base outer_base]", got)
+	}
+}
+
+// TestGetQuerySpan_SetOpThreeArms confirms the leftmost arm's result names win
+// across a chained set operation.
+func TestGetQuerySpan_SetOpThreeArms(t *testing.T) {
+	sql := "SELECT a AS first FROM t UNION ALL SELECT b FROM u UNION ALL SELECT c FROM v"
+	span, err := GetQuerySpan(sql, DialectBigQuery)
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	if got := resultNames(span); !eqStrings(got, []string{"first"}) {
+		t.Errorf("results = %v, want [first] (leftmost arm wins)", got)
+	}
+	if got := tableNames(span); !eqStrings(got, []string{"t", "u", "v"}) {
+		t.Errorf("tables = %v, want [t u v]", got)
+	}
+}
+
+// TestGetQuerySpan_DMLSubquery confirms a subquery inside a DML WHERE clause
+// contributes its table.
+func TestGetQuerySpan_DMLSubquery(t *testing.T) {
+	sql := "DELETE FROM t WHERE id IN (SELECT id FROM staging)"
+	span, err := GetQuerySpan(sql, DialectBigQuery)
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	if span.Type != DML {
+		t.Errorf("Type = %v, want DML", span.Type)
+	}
+	if got := tableNames(span); !eqStrings(got, []string{"staging", "t"}) {
+		t.Errorf("tables = %v, want [staging t]", got)
+	}
+}
+
+// TestGetQuerySpan_SourceColumns confirms a select-item's direct source columns
+// are captured (the lineage seed the masking layer consumes).
+func TestGetQuerySpan_SourceColumns(t *testing.T) {
+	span, err := GetQuerySpan("SELECT a + b AS s, t.c FROM t", DialectBigQuery)
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	if len(span.Results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(span.Results))
+	}
+	// s = a + b → two source columns a, b.
+	var srcCols []string
+	for _, sc := range span.Results[0].SourceColumns {
+		srcCols = append(srcCols, sc.Column)
+	}
+	sort.Strings(srcCols)
+	if !eqStrings(srcCols, []string{"a", "b"}) {
+		t.Errorf("result[0] source columns = %v, want [a b]", srcCols)
+	}
+	// t.c → one source column c with table t.
+	if len(span.Results[1].SourceColumns) != 1 ||
+		span.Results[1].SourceColumns[0].Column != "c" ||
+		span.Results[1].SourceColumns[0].Table != "t" {
+		t.Errorf("result[1] source columns = %+v, want [{Table:t Column:c}]", span.Results[1].SourceColumns)
+	}
+}
+
+// TestGetQuerySpan_LambdaParamsExcluded confirms a lambda's bound parameter is
+// not recorded as a column reference, while a free column inside the lambda is.
+func TestGetQuerySpan_LambdaParamsExcluded(t *testing.T) {
+	// ARRAY_FILTER-style: the lambda param `e` is bound; `threshold` is a free
+	// column reference.
+	sql := "SELECT ARRAY_TRANSFORM(arr, e -> e + threshold) AS r FROM t"
+	span, err := GetQuerySpan(sql, DialectBigQuery)
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	var cols []string
+	for _, sc := range span.Results[0].SourceColumns {
+		cols = append(cols, sc.Column)
+	}
+	sort.Strings(cols)
+	// `arr` (the array arg) and `threshold` (free) are columns; `e` (bound param)
+	// is excluded.
+	if !eqStrings(cols, []string{"arr", "threshold"}) {
+		t.Errorf("source columns = %v, want [arr threshold] (lambda param e excluded)", cols)
+	}
+}
+
+// TestGetQuerySpan_GQLEmptySpan pins the parser-gql query-span DISPOSITION
+// (finding F9): a GQL graph query (`GRAPH … MATCH … RETURN …`) yields an EMPTY
+// span — Type=Unknown, no AccessTables, no Results, no PredicateColumns. This is
+// faithful parity with the legacy bytebase GetQuerySpan, which short-circuits any
+// non-Select statement to `{Type: <unknown>, SourceColumns: {}, Results: []}`
+// (plugin/parser/{bigquery,spanner}/query_span_extractor.go getQuerySpan) and
+// whose accessTableListener walks only table_path_expression nodes — graph
+// element patterns reference labels, not table paths, so legacy records nothing
+// for a graph read either. Deferred-parity: a future source-table-discovery pass
+// over graph patterns is tracked as a divergence/follow-up, not implemented here.
+func TestGetQuerySpan_GQLEmptySpan(t *testing.T) {
+	cases := []string{
+		"GRAPH g MATCH (n) RETURN n",
+		"GRAPH g MATCH (a)-[e]->(b) WHERE a.id = b.id RETURN a, b",
+		"GRAPH myproject.mydataset.g MATCH (p:Person) RETURN p.name",
+	}
+	for _, sql := range cases {
+		for _, dialect := range []Dialect{DialectBigQuery, DialectSpanner} {
+			span, err := GetQuerySpan(sql, dialect)
+			if err != nil {
+				t.Fatalf("GetQuerySpan(%q, %v) error: %v", sql, dialect, err)
+			}
+			if span.Type != Unknown {
+				t.Errorf("GetQuerySpan(%q, %v) Type = %v, want Unknown (legacy non-Select parity)", sql, dialect, span.Type)
+			}
+			if len(span.AccessTables) != 0 {
+				t.Errorf("GetQuerySpan(%q, %v) AccessTables = %v, want empty", sql, dialect, tableNames(span))
+			}
+			if len(span.Results) != 0 {
+				t.Errorf("GetQuerySpan(%q, %v) Results = %v, want empty", sql, dialect, resultNames(span))
+			}
+			if len(span.PredicateColumns) != 0 {
+				t.Errorf("GetQuerySpan(%q, %v) PredicateColumns = %v, want empty", sql, dialect, predicateColumnNames(span))
+			}
+		}
+	}
+}
+
+// --- Masking-grade per-shape lineage (BigQuery cutover) -------------------
+//
+// These pin the lineage SHAPE the bytebase masking layer consumes, independent
+// of catalog metadata: orrery records bare (unqualified) source-column refs and a
+// star's EXCEPT/REPLACE modifiers; the bytebase extractor resolves them against
+// dataset metadata. The shape — which refs feed which output position — is what
+// must be correct here.
+
+// resultSourceColumns renders one result's source ColumnRefs as sorted
+// "table.column" (or just "column" when unqualified) strings.
+func resultSourceColumns(info ColumnInfo) []string {
+	var out []string
+	for _, sc := range info.SourceColumns {
+		if sc.Table != "" {
+			out = append(out, sc.Table+"."+sc.Column)
+		} else {
+			out = append(out, sc.Column)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestGetQuerySpan_SetOpMergesBothArms pins fix #1: a set operation's output
+// column at position i draws its lineage from the UNION of BOTH arms' source
+// columns at that position (the left arm alone is a masking leak). The output
+// NAME still comes from the left arm.
+func TestGetQuerySpan_SetOpMergesBothArms(t *testing.T) {
+	tests := []struct {
+		name        string
+		sql         string
+		wantNames   []string
+		wantSources [][]string // per output position, sorted source columns
+	}{
+		{
+			name:        "two arms aliased",
+			sql:         "SELECT a AS x FROM t UNION ALL SELECT b AS y FROM u",
+			wantNames:   []string{"x"},
+			wantSources: [][]string{{"t.a", "u.b"}},
+		},
+		{
+			name:        "two columns each",
+			sql:         "SELECT a, b FROM t UNION ALL SELECT c, d FROM u",
+			wantNames:   []string{"a", "b"},
+			wantSources: [][]string{{"t.a", "u.c"}, {"t.b", "u.d"}},
+		},
+		{
+			name:        "three arms accumulate",
+			sql:         "SELECT a FROM t UNION ALL SELECT b FROM u UNION ALL SELECT c FROM v",
+			wantNames:   []string{"a"},
+			wantSources: [][]string{{"t.a", "u.b", "v.c"}},
+		},
+		{
+			name:        "intersect and except also merge",
+			sql:         "SELECT a FROM t INTERSECT DISTINCT SELECT b FROM u",
+			wantNames:   []string{"a"},
+			wantSources: [][]string{{"t.a", "u.b"}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			span, err := GetQuerySpan(tc.sql, DialectBigQuery)
+			if err != nil {
+				t.Fatalf("GetQuerySpan(%q) error: %v", tc.sql, err)
+			}
+			if got := resultNames(span); !eqStrings(got, tc.wantNames) {
+				t.Errorf("names = %v, want %v", got, tc.wantNames)
+			}
+			if len(span.Results) != len(tc.wantSources) {
+				t.Fatalf("got %d results, want %d", len(span.Results), len(tc.wantSources))
+			}
+			for i, want := range tc.wantSources {
+				if got := resultSourceColumns(span.Results[i]); !eqStrings(got, want) {
+					t.Errorf("result[%d] sources = %v, want %v", i, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestGetQuerySpan_ScalarSubqueryInSelectListIsOpaque pins the SELECT-list
+// scalar-subquery lineage shape: the subquery's projected columns are NOT
+// surfaced as the output column's direct sources (the column is treated as
+// opaque, matching the restored BigQuery goldens — a SELECT-list `(SELECT c FROM
+// u)` yields an empty source set). Its inner tables and correlation predicates
+// are still discovered by the walk.
+func TestGetQuerySpan_ScalarSubqueryInSelectListIsOpaque(t *testing.T) {
+	sql := "SELECT (SELECT NAME FROM people), ID FROM people"
+	span, err := GetQuerySpan(sql, DialectBigQuery)
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	if len(span.Results) != 2 {
+		t.Fatalf("got %d results, want 2", len(span.Results))
+	}
+	// The scalar subquery output column has no direct source columns.
+	if got := resultSourceColumns(span.Results[0]); len(got) != 0 {
+		t.Errorf("scalar-subquery result sources = %v, want empty", got)
+	}
+	// The sibling bare column resolves normally.
+	if got := resultSourceColumns(span.Results[1]); !eqStrings(got, []string{"people.ID"}) {
+		t.Errorf("result[1] sources = %v, want [people.ID]", got)
+	}
+	// The subquery's table is still discovered (people appears once, deduped).
+	if got := tableNames(span); !eqStrings(got, []string{"people"}) {
+		t.Errorf("tables = %v, want [people]", got)
+	}
+}
+
+// TestGetQuerySpan_JoinUsingCoalesceSurfacesColumn pins fix #4's orrery-side
+// contribution: a JOIN ... USING (c) records the coalesced column c as a bare
+// reference (Column=c, no table qualifier) so the catalog-aware consumer matches
+// it against BOTH joined sides' c columns; the USING column is also a predicate.
+func TestGetQuerySpan_JoinUsingCoalesceSurfacesColumn(t *testing.T) {
+	sql := "SELECT ID, NAME, ADDRESS FROM people JOIN address ON people.ID = address.PEOPLE_ID USING (ID)"
+	span, err := GetQuerySpan(sql, DialectBigQuery)
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	if len(span.Results) == 0 || span.Results[0].Name != "ID" {
+		t.Fatalf("results = %v, want first column ID", resultNames(span))
+	}
+	// The coalesced ID is a bare ref (no table) so it flat-matches both PEOPLE.ID
+	// and ADDRESS.ID downstream.
+	if got := resultSourceColumns(span.Results[0]); !eqStrings(got, []string{"ID"}) {
+		t.Errorf("ID result sources = %v, want [ID] (bare, table-agnostic)", got)
+	}
+	if got := predicateColumnNames(span); !containsString(got, "ID") {
+		t.Errorf("predicate columns = %v, want to include the USING column ID", got)
+	}
+}
+
+// TestGetQuerySpan_StarExceptReplaceCaptured pins fix #2: a SELECT * EXCEPT/
+// REPLACE star item records its modifiers on the ColumnInfo (StarExcept names,
+// StarReplace name+expr-sources) so the catalog-aware consumer can drop EXCEPT-ed
+// columns and re-point a REPLACE-d column's lineage.
+func TestGetQuerySpan_StarExceptReplaceCaptured(t *testing.T) {
+	sql := "SELECT * EXCEPT (ID) REPLACE (ID/2 AS NAME) FROM people"
+	span, err := GetQuerySpan(sql, DialectBigQuery)
+	if err != nil {
+		t.Fatalf("GetQuerySpan error: %v", err)
+	}
+	if len(span.Results) != 1 {
+		t.Fatalf("got %d results, want 1 (the star)", len(span.Results))
+	}
+	star := span.Results[0]
+	if star.Name != "*" {
+		t.Errorf("star name = %q, want *", star.Name)
+	}
+	if !eqStrings(star.StarExcept, []string{"ID"}) {
+		t.Errorf("StarExcept = %v, want [ID]", star.StarExcept)
+	}
+	if len(star.StarReplace) != 1 {
+		t.Fatalf("got %d StarReplace, want 1", len(star.StarReplace))
+	}
+	repl := star.StarReplace[0]
+	if repl.Name != "NAME" {
+		t.Errorf("StarReplace[0].Name = %q, want NAME", repl.Name)
+	}
+	var cols []string
+	for _, sc := range repl.Sources {
+		cols = append(cols, sc.Column)
+	}
+	if !eqStrings(cols, []string{"ID"}) {
+		t.Errorf("StarReplace[0].Sources = %v, want [ID] (the ID/2 expr)", cols)
+	}
+}
+
+// containsString reports whether list contains s.
+func containsString(list []string, s string) bool {
+	for _, e := range list {
+		if e == s {
+			return true
+		}
+	}
+	return false
+}

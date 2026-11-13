@@ -1,0 +1,6318 @@
+package catalog
+
+import (
+	"errors"
+	"fmt"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+
+	nodes "github.com/Dxlxz/orrery-sql/pg/ast"
+)
+
+// analyzeSelectStmt transforms a raw pgparser SelectStmt into an analyzed Query.
+//
+// pg: src/backend/parser/analyze.c — transformSelectStmt
+func (c *Catalog) analyzeSelectStmt(stmt *nodes.SelectStmt) (*Query, error) {
+	return c.analyzeSelectStmtWithOptions(stmt, AnalyzeOptions{})
+}
+
+func (c *Catalog) analyzeSelectStmtWithOptions(stmt *nodes.SelectStmt, opts AnalyzeOptions) (*Query, error) {
+	if stmt == nil {
+		return nil, fmt.Errorf("NULL select statement")
+	}
+
+	// Set operation.
+	if stmt.Op != nodes.SETOP_NONE {
+		q := &Query{}
+		ac := &analyzeCtx{catalog: c, query: q, opts: opts}
+		return ac.analyzeSetOp(stmt)
+	}
+
+	return c.analyzeSimpleSelect(stmt, opts)
+}
+
+// analyzeSetOp handles UNION/INTERSECT/EXCEPT.
+//
+// pg: src/backend/parser/analyze.c — transformSetOperationStmt
+func (ac *analyzeCtx) analyzeSetOp(stmt *nodes.SelectStmt) (*Query, error) {
+	if ac.query == nil {
+		ac.query = &Query{}
+	}
+	q := ac.query
+	ac.setOp = true
+	ac.noCTEs = stmt.WithClause == nil && len(q.CTEList) == 0
+
+	// WITH belongs to the set-operation query as a whole and must be visible to
+	// each branch while it is analyzed.
+	if stmt.WithClause != nil {
+		if err := ac.analyzeCTEs(stmt.WithClause); err != nil {
+			return nil, err
+		}
+	}
+
+	lQuery, err := ac.analyzeSubSelectWithOptions(stmt.Larg, false)
+	if err != nil {
+		return nil, err
+	}
+	rQuery, err := ac.analyzeSubSelectWithOptions(stmt.Rarg, false)
+	if err != nil {
+		return nil, err
+	}
+
+	lOutput := nonJunkTargetEntries(lQuery.TargetList)
+	rOutput := nonJunkTargetEntries(rQuery.TargetList)
+	if len(lOutput) != len(rOutput) {
+		return nil, &Error{
+			Code:    CodeDatatypeMismatch,
+			Message: fmt.Sprintf("each %s query must have the same number of columns", setOpKeyword(stmt.Op)),
+		}
+	}
+
+	op := convertSetOpType(stmt.Op)
+
+	// Determine common types for each column position.
+	// pg: src/backend/parser/analyze.c — transformSetOperationTree
+	// For non-UNKNOWN types: verify coercibility but don't modify the branch expr
+	// (the deparser shows branches as-is). For UNKNOWN Const: coerce by changing
+	// the Const's type, matching PG's coerce_type behavior.
+	tlist := make([]*TargetEntry, len(lOutput))
+	for i := range lOutput {
+		lte := lOutput[i]
+		rte := rOutput[i]
+
+		lTypeOID := lte.Expr.exprType()
+		rTypeOID := rte.Expr.exprType()
+
+		common, err := ac.catalog.selectCommonType([]AnalyzedExpr{lte.Expr, rte.Expr}, setOpKeyword(stmt.Op))
+		if err != nil {
+			return nil, err
+		}
+
+		// Left branch coercion.
+		// pg: src/backend/parser/analyze.c — transformSetOperationTree (coercion loop)
+		if lTypeOID != UNKNOWNOID {
+			if _, err := ac.catalog.coerceToTargetType(lte.Expr, lTypeOID, common, 'i'); err != nil {
+				return nil, err
+			}
+		} else if _, ok := lte.Expr.(*ConstExpr); ok {
+			coerced, err := ac.catalog.coerceToTargetType(lte.Expr, lTypeOID, common, 'i')
+			if err != nil {
+				return nil, err
+			}
+			lte.Expr = coerced
+		}
+
+		// Right branch coercion.
+		if rTypeOID != UNKNOWNOID {
+			if _, err := ac.catalog.coerceToTargetType(rte.Expr, rTypeOID, common, 'i'); err != nil {
+				return nil, err
+			}
+		} else if _, ok := rte.Expr.(*ConstExpr); ok {
+			coerced, err := ac.catalog.coerceToTargetType(rte.Expr, rTypeOID, common, 'i')
+			if err != nil {
+				return nil, err
+			}
+			rte.Expr = coerced
+		}
+
+		// Align right branch column names with left branch.
+		// PG does this via the resultDesc mechanism in the deparser.
+		rte.ResName = lte.ResName
+
+		// Top-level target entry with the common type, standing for column
+		// i+1 of both branches. Never shown by the deparser.
+		var coll uint32
+		if ac.catalog.typeCollation(common) != 0 {
+			var conflict bool
+			coll, conflict, err = ac.catalog.setOpCollation(lte.Expr, rte.Expr, op == SetOpUnion && stmt.All)
+			if err != nil {
+				return nil, err
+			}
+			if coll == 0 && !conflict {
+				coll = ac.catalog.typeCollation(common)
+			}
+		}
+		tlist[i] = &TargetEntry{
+			Expr:    &SetOpColumnExpr{ResNo: int16(i + 1), TypeOID: common, TypeMod: -1, Collation: coll},
+			ResNo:   int16(i + 1),
+			ResName: lte.ResName,
+		}
+	}
+
+	q.TargetList = tlist
+	q.SetOp = op
+	q.AllSetOp = stmt.All
+	q.LArg = lQuery
+	q.RArg = rQuery
+	return q, nil
+}
+
+// setOpCollation merges the collations of a set operation's two input
+// columns. An explicit COLLATE wins, and two different explicit ones are an
+// error. Of two implicit collations a non-default one beats the default, and
+// two different non-default ones conflict: a UNION ALL column then has no
+// collation, and the other operations fail. conflict reports that case.
+//
+// pg: src/backend/parser/analyze.c — transformSetOperationTree (rescolcoll)
+// pg: src/backend/parser/parse_collate.c — select_common_collation
+func (c *Catalog) setOpCollation(l, r AnalyzedExpr, noneOK bool) (coll uint32, conflict bool, err error) {
+	lColl, rColl := l.exprCollation(), r.exprCollation()
+	lName, lExplicit := explicitCollation(l)
+	rName, rExplicit := explicitCollation(r)
+	switch {
+	case lExplicit && rExplicit:
+		if lName != rName {
+			return 0, false, &Error{Code: CodeCollationMismatch, Message: fmt.Sprintf("collation mismatch between explicit collations %q and %q", lName, rName)}
+		}
+		return lColl, false, nil
+	case lExplicit:
+		return lColl, false, nil
+	case rExplicit:
+		return rColl, false, nil
+	}
+	switch {
+	case lColl == rColl || rColl == 0 || rColl == DEFAULT_COLLATION_OID:
+		return lColl, false, nil
+	case lColl == 0 || lColl == DEFAULT_COLLATION_OID:
+		return rColl, false, nil
+	case noneOK:
+		return 0, true, nil
+	}
+	return 0, false, &Error{Code: CodeCollationMismatch, Message: fmt.Sprintf("collation mismatch between implicit collations %q and %q", c.collationName(lColl), c.collationName(rColl))}
+}
+
+// explicitCollation reports the collation name of an expression whose
+// collation comes from a COLLATE clause: the clause itself, or an expression
+// whose collation is derived from an input that has it. A column, constant,
+// parameter, or subquery result carries no explicit collation.
+//
+// pg: src/backend/parser/parse_collate.c — assign_collations_walker (COLLATE_EXPLICIT)
+func explicitCollation(e AnalyzedExpr) (string, bool) {
+	return collationMemo(nil).explicit(e)
+}
+
+// collationMemo holds explicitCollation's answer for each expression it has
+// visited; a nil one holds none. lacksCollation asks about an expression and
+// then about the expressions under it, and without the answers kept it
+// walked a chain such as a || b || c ... again at every level.
+type collationMemo map[AnalyzedExpr]explicitColl
+
+type explicitColl struct {
+	name string
+	ok   bool
+}
+
+// explicit is explicitCollation, answering from m and keeping its answers
+// there when m is not nil.
+func (m collationMemo) explicit(e AnalyzedExpr) (string, bool) {
+	if r, done := m[e]; done {
+		return r.name, r.ok
+	}
+	name, ok := m.findExplicit(e)
+	if m != nil {
+		m[e] = explicitColl{name, ok}
+	}
+	return name, ok
+}
+
+func (m collationMemo) findExplicit(e AnalyzedExpr) (string, bool) {
+	switch v := e.(type) {
+	case *CollateExprQ:
+		return v.CollName, true
+	case *RelabelExpr:
+		return m.explicit(v.Arg)
+	case *VarExpr, *ConstExpr, *ParamExpr, *SubLinkExpr, *SetOpColumnExpr:
+		return "", false
+	}
+	coll := e.exprCollation()
+	if coll == 0 {
+		return "", false
+	}
+	for _, child := range AnalyzedExprChildren(e) {
+		if child.exprCollation() != coll {
+			continue
+		}
+		if name, ok := m.explicit(child); ok {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// nonJunkTargetEntry returns output column n of tlist, counting from 1, or
+// nil when it has fewer, without listing the others as nonJunkTargetEntries
+// does.
+func nonJunkTargetEntry(tlist []*TargetEntry, n int) *TargetEntry {
+	for _, te := range tlist {
+		if te == nil || te.ResJunk {
+			continue
+		}
+		if n--; n == 0 {
+			return te
+		}
+	}
+	return nil
+}
+
+func nonJunkTargetEntries(tlist []*TargetEntry) []*TargetEntry {
+	output := make([]*TargetEntry, 0, len(tlist))
+	for _, te := range tlist {
+		if te == nil || te.ResJunk {
+			continue
+		}
+		output = append(output, te)
+	}
+	return output
+}
+
+// analyzeSimpleSelect handles a simple (non-set-op) SELECT.
+//
+// pg: src/backend/parser/analyze.c — transformSelectStmt
+func (c *Catalog) analyzeSimpleSelect(stmt *nodes.SelectStmt, opts AnalyzeOptions) (*Query, error) {
+	q := &Query{}
+
+	// 0. Process WITH clause (CTEs) before anything else.
+	// pg: src/backend/parser/analyze.c — transformSelectStmt calls analyzeCTEList
+	ac := &analyzeCtx{
+		catalog: c,
+		query:   q,
+		opts:    opts,
+	}
+
+	if stmt.WithClause != nil {
+		if err := ac.analyzeCTEs(stmt.WithClause); err != nil {
+			return nil, err
+		}
+	}
+
+	if stmt.FromClause != nil {
+		for _, item := range stmt.FromClause.Items {
+			jn, err := ac.transformFromClauseItem(item)
+			if err != nil {
+				return nil, err
+			}
+			if q.JoinTree == nil {
+				q.JoinTree = &JoinTree{}
+			}
+			q.JoinTree.FromList = append(q.JoinTree.FromList, jn)
+		}
+	}
+
+	// 2. Process SELECT target list.
+	if stmt.TargetList != nil {
+		for _, item := range stmt.TargetList.Items {
+			rt, ok := item.(*nodes.ResTarget)
+			if !ok {
+				continue
+			}
+			entries, err := ac.transformTargetEntry(rt, len(q.TargetList))
+			if err != nil {
+				return nil, err
+			}
+			q.TargetList = append(q.TargetList, entries...)
+		}
+	}
+
+	// 2b. Coerce UNKNOWN target entries to TEXT.
+	// pg: src/backend/rewrite/rewriteHandler.c — fireRIRrules
+	// PG's rewriter coerces UNKNOWN output columns to TEXT for views.
+	for _, te := range q.TargetList {
+		if !te.ResJunk && te.Expr.exprType() == UNKNOWNOID {
+			if c, ok := te.Expr.(*ConstExpr); ok {
+				c.TypeOID = TEXTOID
+			}
+		}
+	}
+
+	// 3. Process WHERE clause.
+	if stmt.WhereClause != nil {
+		qual, err := ac.transformExpr(stmt.WhereClause)
+		if err != nil {
+			return nil, err
+		}
+		if q.JoinTree == nil {
+			q.JoinTree = &JoinTree{}
+		}
+		q.JoinTree.Quals = qual
+	}
+
+	// 4. Process GROUP BY clause.
+	//
+	// pg: src/backend/parser/parse_clause.c — transformGroupClause
+	if stmt.GroupClause != nil {
+		hasGroupingSets := false
+		for _, item := range stmt.GroupClause.Items {
+			if _, ok := item.(*nodes.GroupingSet); ok {
+				hasGroupingSets = true
+				break
+			}
+		}
+		if hasGroupingSets {
+			for _, item := range stmt.GroupClause.Items {
+				gs, err := ac.transformGroupingSet(item, q.TargetList)
+				if err != nil {
+					return nil, err
+				}
+				q.GroupingSets = append(q.GroupingSets, gs)
+				// Also add flat refs to GroupClause for deparse of simple columns.
+				ac.flattenGroupingSetRefs(gs, q)
+			}
+		} else {
+			for _, item := range stmt.GroupClause.Items {
+				tle, err := ac.findTargetlistEntry(item, q.TargetList)
+				if err != nil {
+					return nil, err
+				}
+				ref := ac.assignSortGroupRef(tle, q.TargetList)
+				// Check for duplicate GROUP BY entries.
+				isDup := false
+				for _, existing := range q.GroupClause {
+					if existing.TLESortGroupRef == ref {
+						isDup = true
+						break
+					}
+				}
+				if !isDup {
+					q.GroupClause = append(q.GroupClause, &SortGroupClause{
+						TLESortGroupRef: ref,
+					})
+				}
+			}
+		}
+	}
+
+	// 5. Process HAVING clause.
+	if stmt.HavingClause != nil {
+		having, err := ac.transformExpr(stmt.HavingClause)
+		if err != nil {
+			return nil, err
+		}
+		q.HavingQual = having
+	}
+
+	// 5b. Process WINDOW clause (named windows).
+	// pg: src/backend/parser/parse_clause.c — transformWindowDefinitions
+	if stmt.WindowClause != nil {
+		for _, item := range stmt.WindowClause.Items {
+			wd, ok := item.(*nodes.WindowDef)
+			if !ok {
+				continue
+			}
+			_, err := ac.resolveWindowDef(wd)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// 6. Process ORDER BY clause (as junk target entries).
+	//
+	// pg: src/backend/parser/parse_clause.c — transformSortClause
+	if stmt.SortClause != nil {
+		for _, item := range stmt.SortClause.Items {
+			sb, ok := item.(*nodes.SortBy)
+			if !ok {
+				continue
+			}
+			tle, err := ac.findTargetlistEntry(sb.Node, q.TargetList)
+			if err != nil {
+				return nil, err
+			}
+			ref := ac.assignSortGroupRef(tle, q.TargetList)
+			// Check for duplicate ORDER BY entries.
+			isDup := false
+			for _, existing := range q.SortClause {
+				if existing.TLESortGroupRef == ref {
+					isDup = true
+					break
+				}
+			}
+			if !isDup {
+				// Determine sort direction.
+				// pg: addTargetToSortList — SORTBY_ASC/DESC/DEFAULT + NULLS
+				desc := sb.SortbyDir == nodes.SORTBY_DESC
+				nullsFirst := false
+				switch sb.SortbyNulls {
+				case nodes.SORTBY_NULLS_FIRST:
+					nullsFirst = true
+				case nodes.SORTBY_NULLS_LAST:
+					nullsFirst = false
+				default:
+					// SORTBY_NULLS_DEFAULT: DESC gets nulls first, ASC gets nulls last
+					nullsFirst = desc
+				}
+				q.SortClause = append(q.SortClause, &SortGroupClause{
+					TLESortGroupRef: ref,
+					Descending:      desc,
+					NullsFirst:      nullsFirst,
+				})
+			}
+		}
+	}
+
+	// 7. Process LIMIT/OFFSET.
+	if stmt.LimitCount != nil {
+		lc, err := ac.transformExpr(stmt.LimitCount)
+		if err != nil {
+			return nil, err
+		}
+		q.LimitCount = lc
+	}
+	if stmt.LimitOffset != nil {
+		lo, err := ac.transformExpr(stmt.LimitOffset)
+		if err != nil {
+			return nil, err
+		}
+		q.LimitOffset = lo
+	}
+
+	// 8. DISTINCT / DISTINCT ON.
+	//
+	// pg: src/backend/parser/analyze.c — transformDistinctClause / transformDistinctOnClause
+	// pgparser: plain DISTINCT → list with one nil item; DISTINCT ON → list of expressions
+	if stmt.DistinctClause != nil {
+		hasRealExprs := false
+		for _, item := range stmt.DistinctClause.Items {
+			if item != nil {
+				hasRealExprs = true
+				break
+			}
+		}
+		if hasRealExprs {
+			// DISTINCT ON (col1, col2, ...)
+			q.Distinct = true
+			for _, item := range stmt.DistinctClause.Items {
+				if item == nil {
+					continue
+				}
+				tle, err := ac.findTargetlistEntry(item, q.TargetList)
+				if err != nil {
+					return nil, err
+				}
+				ref := ac.assignSortGroupRef(tle, q.TargetList)
+				q.DistinctOn = append(q.DistinctOn, &SortGroupClause{
+					TLESortGroupRef: ref,
+				})
+			}
+		} else {
+			// Plain DISTINCT
+			q.Distinct = true
+		}
+	}
+
+	// 9. FOR UPDATE/SHARE (LockingClause).
+	if stmt.LockingClause != nil {
+		for _, item := range stmt.LockingClause.Items {
+			lc, ok := item.(*nodes.LockingClause)
+			if !ok || lc == nil {
+				continue
+			}
+			lcq := &LockingClauseQ{
+				Strength:   LockClauseStrength(lc.Strength),
+				WaitPolicy: LockWaitPolicy(lc.WaitPolicy),
+			}
+			if lc.LockedRels != nil {
+				for _, rel := range lc.LockedRels.Items {
+					if rv, ok := rel.(*nodes.RangeVar); ok && rv != nil {
+						lcq.Tables = append(lcq.Tables, rv.Relname)
+					}
+				}
+			}
+			q.LockingClauses = append(q.LockingClauses, lcq)
+		}
+	}
+
+	orderTargetList(q)
+	return q, nil
+}
+
+// orderTargetList puts a query's output columns before the junk entries its
+// ORDER BY, GROUP BY, and window clauses added, and numbers every entry by
+// its position. A window's PARTITION BY and ORDER BY entries are added while
+// the target list is being transformed; PostgreSQL adds them only after it,
+// so an output column's position, which a Var of the query's output uses
+// as AttNum, is its index in TargetList. Clauses refer to entries by
+// TLESortGroupRef, which moving an entry keeps.
+//
+// pg: src/backend/parser/analyze.c — transformSelectStmt
+// (transformWindowDefinitions after transformTargetList)
+func orderTargetList(q *Query) {
+	ordered := make([]*TargetEntry, 0, len(q.TargetList))
+	for _, junk := range []bool{false, true} {
+		for _, te := range q.TargetList {
+			if te.ResJunk == junk {
+				ordered = append(ordered, te)
+			}
+		}
+	}
+	for i, te := range ordered {
+		te.ResNo = int16(i + 1)
+	}
+	q.TargetList = ordered
+}
+
+// analyzeCtx holds state during query analysis.
+type analyzeCtx struct {
+	catalog             *Catalog
+	query               *Query
+	parent              *analyzeCtx // for correlated subqueries
+	disallowParentCols  bool        // true for non-LATERAL FROM subqueries that may see CTEs but not outer columns
+	exprKind            analyzeExprKind
+	domainConstraint    bool   // true when analyzing a domain CHECK constraint
+	domainBaseTypeOID   uint32 // base type OID for domain VALUE keyword
+	domainBaseTypMod    int32  // base type modifier for domain VALUE keyword
+	domainBaseCollation uint32 // base type collation for domain VALUE keyword
+	opts                AnalyzeOptions
+	onNamespace         []JoinNode   // while analyzing a JOIN's ON condition, the join's two inputs
+	onVisible           map[int]bool // the range table entries of onNamespace, built by visibleRTEs when first asked
+
+	// The analyzer nests each arm of a left-deep UNION one level inside the
+	// next, and the level of a set operation has no range table, nor CTEs
+	// unless it has a WITH clause. A lookup that went through every level,
+	// for a CTE or for an outer column, made a long UNION take quadratic
+	// time and memory, so each level keeps where those lookups go on,
+	// passing over the levels of set operations that cannot answer them.
+	setOp       bool        // the level of a set operation
+	noCTEs      bool        // the level of a set operation with no WITH clause
+	cteParent   *analyzeCtx // the level lookupCTE searches after this one
+	outerCols   *analyzeCtx // the level findColumnRef searches for a column this one lacks, or nil
+	outerColsUp int         // how many levels up outerCols is
+}
+
+// subContext returns the context of a query nested in ac. A query in FROM
+// that is not LATERAL passes ac over in its search for outer columns.
+func (ac *analyzeCtx) subContext(disallowParentCols bool) *analyzeCtx {
+	sub := &analyzeCtx{
+		catalog:            ac.catalog,
+		query:              &Query{},
+		parent:             ac,
+		disallowParentCols: disallowParentCols,
+		opts:               ac.opts,
+		cteParent:          ac,
+	}
+	if ac.noCTEs {
+		sub.cteParent = ac.cteParent
+	}
+	cols, up := ac, 1
+	if disallowParentCols {
+		cols, up = ac.parent, 2
+	}
+	if cols != nil && cols.setOp {
+		// A column lookup finds nothing at a set operation's level and goes
+		// on to the level that one searches next.
+		cols, up = cols.outerCols, up+cols.outerColsUp
+	}
+	sub.outerCols, sub.outerColsUp = cols, up
+	return sub
+}
+
+type analyzeExprKind int
+
+const (
+	analyzeExprKindStandalone analyzeExprKind = iota
+	analyzeExprKindColumnDefault
+)
+
+// transformFromClauseItem processes a FROM clause item.
+//
+// pg: src/backend/parser/parse_clause.c — transformFromClauseItem
+func (ac *analyzeCtx) transformFromClauseItem(n nodes.Node) (JoinNode, error) {
+	switch v := n.(type) {
+	case *nodes.RangeVar:
+		return ac.transformRangeVar(v)
+	case *nodes.JoinExpr:
+		return ac.transformJoinExpr(v)
+	case *nodes.RangeSubselect:
+		return ac.transformRangeSubselect(v)
+	case *nodes.RangeFunction:
+		return ac.transformRangeFunction(v)
+	case *nodes.RangeTableSample:
+		return ac.transformRangeTableSampleItem(v)
+	default:
+		return nil, fmt.Errorf("unsupported FROM clause item: %T", n)
+	}
+}
+
+// transformRangeVar processes a table reference in FROM.
+//
+// pg: src/backend/parser/parse_clause.c — transformTableEntry
+func (ac *analyzeCtx) transformRangeVar(rv *nodes.RangeVar) (JoinNode, error) {
+	// Check if this is a CTE reference before looking up tables.
+	// pg: src/backend/parser/parse_clause.c — getRTEForSpecialRelationTypes
+	if rv.Schemaname == "" {
+		if cte, idx, current := ac.lookupCTE(rv.Relname); cte != nil {
+			alias := ""
+			if rv.Alias != nil {
+				alias = rv.Alias.Aliasname
+			}
+			if current {
+				return ac.transformCTERef(rv.Relname, alias, idx)
+			}
+			return ac.transformVisibleCTERef(cte, rv.Relname, alias, idx)
+		}
+	}
+
+	_, rel, err := ac.catalog.findRelation(rv.Schemaname, rv.Relname)
+	if err != nil {
+		return nil, err
+	}
+
+	alias := ""
+	if rv.Alias != nil {
+		alias = rv.Alias.Aliasname
+	}
+
+	eref := rv.Relname
+	if alias != "" {
+		eref = alias
+	}
+
+	colNames := make([]string, len(rel.Columns))
+	colTypes := make([]uint32, len(rel.Columns))
+	colTypMods := make([]int32, len(rel.Columns))
+	colCollations := make([]uint32, len(rel.Columns))
+	for i, col := range rel.Columns {
+		colNames[i] = col.Name
+		colTypes[i] = col.TypeOID
+		colTypMods[i] = col.TypeMod
+		colCollations[i] = col.Collation
+	}
+
+	rtIdx := len(ac.query.RangeTable)
+	rte := &RangeTableEntry{
+		Kind:          RTERelation,
+		RelOID:        rel.OID,
+		RelName:       rv.Relname,
+		SchemaName:    rv.Schemaname,
+		Alias:         alias,
+		ERef:          eref,
+		ColNames:      colNames,
+		ColTypes:      colTypes,
+		ColTypMods:    colTypMods,
+		ColCollations: colCollations,
+	}
+	ac.query.RangeTable = append(ac.query.RangeTable, rte)
+
+	return &RangeTableRef{RTIndex: rtIdx}, nil
+}
+
+func (ac *analyzeCtx) lookupCTE(name string) (*CommonTableExprQ, int, bool) {
+	for ctx := ac; ctx != nil; ctx = ctx.cteParent {
+		for i := len(ctx.query.CTEList) - 1; i >= 0; i-- {
+			cte := ctx.query.CTEList[i]
+			if cte.Name == name {
+				return cte, i, ctx == ac
+			}
+		}
+	}
+	for i := len(ac.catalog.visibleCTEs) - 1; i >= 0; i-- {
+		cte := ac.catalog.visibleCTEs[i]
+		if cte.Name == name {
+			return cte, i, false
+		}
+	}
+	return nil, 0, false
+}
+
+// transformJoinExpr processes a JOIN expression.
+//
+// The join's output columns are its USING columns, merged, followed by the
+// remaining columns of the left input and then of the right. A natural join
+// is a USING join over the column names both inputs have.
+//
+// pg: src/backend/parser/parse_clause.c — transformFromClauseItem (JoinExpr)
+func (ac *analyzeCtx) transformJoinExpr(je *nodes.JoinExpr) (JoinNode, error) {
+	left, err := ac.transformFromClauseItem(je.Larg)
+	if err != nil {
+		return nil, err
+	}
+	right, err := ac.transformFromClauseItem(je.Rarg)
+	if err != nil {
+		return nil, err
+	}
+
+	jt := convertJoinType(je.Jointype)
+	lRT, rRT := joinNodeRTIndex(left), joinNodeRTIndex(right)
+	lNames := ac.query.RangeTable[lRT].ColNames
+	rNames := ac.query.RangeTable[rRT].ColNames
+
+	var usingClause []string
+	if je.IsNatural {
+		for _, idx := range append(joinNodeBaseRTEs(left), joinNodeBaseRTEs(right)...) {
+			if rte := ac.query.RangeTable[idx]; rte.UnknownColumns {
+				return nil, &Error{Code: CodeFeatureNotSupported, Message: fmt.Sprintf("cannot match the NATURAL JOIN columns of function %q, whose columns are unknown", rte.ERef)}
+			}
+		}
+		for _, name := range lNames {
+			if slices.Contains(rNames, name) {
+				usingClause = append(usingClause, name)
+			}
+		}
+	} else if je.UsingClause != nil {
+		for _, item := range je.UsingClause.Items {
+			if s, ok := item.(*nodes.String); ok {
+				usingClause = append(usingClause, s.Str)
+			}
+		}
+	}
+
+	// Under OpaqueUnknownFunctions, a USING name that a function with
+	// unknown columns could have names one of its columns.
+	if ac.opts.OpaqueUnknownFunctions && !je.IsNatural {
+		for _, name := range usingClause {
+			if !slices.Contains(lNames, name) {
+				ac.addUnknownColumnIn(left, name, left, right)
+			}
+			if !slices.Contains(rNames, name) {
+				ac.addUnknownColumnIn(right, name, left, right)
+			}
+			lNames, rNames = ac.query.RangeTable[lRT].ColNames, ac.query.RangeTable[rRT].ColNames
+		}
+	}
+
+	// Each USING column compares the two inputs' columns of that name and
+	// is output once, merged.
+	var quals AnalyzedExpr
+	var conds, merged []AnalyzedExpr
+	lUsed := make([]bool, len(lNames))
+	rUsed := make([]bool, len(rNames))
+	for i, name := range usingClause {
+		if slices.Contains(usingClause[:i], name) {
+			return nil, &Error{Code: CodeDuplicateColumn, Message: fmt.Sprintf("column name %q appears more than once in USING clause", name)}
+		}
+		lIdx, err := usingColumnIndex(lNames, name, "left")
+		if err != nil {
+			return nil, err
+		}
+		rIdx, err := usingColumnIndex(rNames, name, "right")
+		if err != nil {
+			return nil, err
+		}
+		lUsed[lIdx], rUsed[rIdx] = true, true
+		lVar, rVar := ac.nsColumnVar(lRT, lIdx), ac.nsColumnVar(rRT, rIdx)
+		cond, err := ac.usingCondition(lVar, rVar)
+		if err != nil {
+			return nil, err
+		}
+		conds = append(conds, cond)
+		col, err := ac.mergedJoinColumn(jt, lVar, rVar)
+		if err != nil {
+			return nil, err
+		}
+		merged = append(merged, col)
+	}
+	switch {
+	case len(conds) == 1:
+		quals = conds[0]
+	case len(conds) > 1:
+		quals = &BoolExprQ{Op: BoolAnd, Args: conds}
+	case je.Quals != nil:
+		// The ON condition sees the columns of the join's two inputs.
+		// pg: src/backend/parser/parse_clause.c — transformJoinOnClause
+		outer, outerVisible := ac.onNamespace, ac.onVisible
+		ac.onNamespace, ac.onVisible = []JoinNode{left, right}, nil
+		quals, err = ac.transformExpr(je.Quals)
+		ac.onNamespace, ac.onVisible = outer, outerVisible
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	rtIdx := len(ac.query.RangeTable)
+	rte := &RangeTableEntry{Kind: RTEJoin, JoinType: jt}
+	addColumn := func(name string, alias AnalyzedExpr) {
+		rte.ColNames = append(rte.ColNames, name)
+		rte.ColTypes = append(rte.ColTypes, alias.exprType())
+		rte.ColTypMods = append(rte.ColTypMods, alias.exprTypMod())
+		rte.ColCollations = append(rte.ColCollations, alias.exprCollation())
+		rte.JoinAliasVars = append(rte.JoinAliasVars, alias)
+	}
+	for i, name := range usingClause {
+		addColumn(name, merged[i])
+	}
+	// pg: src/backend/parser/parse_clause.c — extractRemainingColumns
+	for i, name := range lNames {
+		if !lUsed[i] {
+			addColumn(name, ac.nsColumnVar(lRT, i))
+		}
+	}
+	for i, name := range rNames {
+		if !rUsed[i] {
+			addColumn(name, ac.nsColumnVar(rRT, i))
+		}
+	}
+	ac.query.RangeTable = append(ac.query.RangeTable, rte)
+
+	return &JoinExprNode{
+		JoinType:    jt,
+		Left:        left,
+		Right:       right,
+		Quals:       quals,
+		UsingClause: usingClause,
+		RTIndex:     rtIdx,
+	}, nil
+}
+
+// usingColumnIndex finds the one column of a join input named in USING.
+//
+// pg: src/backend/parser/parse_clause.c — transformFromClauseItem (USING)
+func usingColumnIndex(names []string, name, side string) (int, error) {
+	idx := -1
+	for i, n := range names {
+		if n != name {
+			continue
+		}
+		if idx >= 0 {
+			return -1, &Error{Code: CodeAmbiguousColumn, Message: fmt.Sprintf("common column name %q appears more than once in %s table", name, side)}
+		}
+		idx = i
+	}
+	if idx < 0 {
+		return -1, &Error{Code: CodeUndefinedColumn, Message: fmt.Sprintf("column %q specified in USING clause does not exist in %s table", name, side)}
+	}
+	return idx, nil
+}
+
+// usingCondition builds the condition l = r of a USING column, resolving =
+// as an operator expression does.
+//
+// pg: src/backend/parser/parse_clause.c — transformJoinUsingClause
+func (ac *analyzeCtx) usingCondition(l, r *VarExpr) (AnalyzedExpr, error) {
+	op, lType, rType, err := ac.catalog.resolveOperator("=", l.TypeOID, r.TypeOID, false)
+	if err != nil {
+		return nil, err
+	}
+	if op.Result != BOOLOID {
+		return nil, &Error{Code: CodeDatatypeMismatch, Message: fmt.Sprintf("argument of JOIN/USING must be type boolean, not type %s", ac.catalog.typeName(op.Result))}
+	}
+	var left, right AnalyzedExpr = l, r
+	if lType != l.TypeOID {
+		if left, err = ac.catalog.coerceToTargetType(l, l.TypeOID, lType, 'i'); err != nil {
+			return nil, err
+		}
+	}
+	if rType != r.TypeOID {
+		if right, err = ac.catalog.coerceToTargetType(r, r.TypeOID, rType, 'i'); err != nil {
+			return nil, err
+		}
+	}
+	return &OpExpr{OpOID: op.OID, OpName: op.Name, ResultType: op.Result, Left: left, Right: right}, nil
+}
+
+// mergedJoinColumn is the value a USING column has in the join's output.
+// Both inputs are coerced to their common type; an inner join takes an input
+// that needed no coercion, preferring the left, a LEFT or RIGHT JOIN takes
+// the left or right input, and a FULL JOIN takes COALESCE of both.
+//
+// pg: src/backend/parser/parse_clause.c — buildMergedJoinVar
+func (ac *analyzeCtx) mergedJoinColumn(jt JoinType, l, r *VarExpr) (AnalyzedExpr, error) {
+	common, err := ac.catalog.selectCommonType([]AnalyzedExpr{l, r}, "JOIN/USING")
+	if err != nil {
+		return nil, err
+	}
+	// pg: src/backend/parser/parse_coerce.c — select_common_typmod
+	typmod := int32(-1)
+	if l.TypeOID == common && r.TypeOID == common && l.TypeMod == r.TypeMod {
+		typmod = l.TypeMod
+	}
+	toCommon := func(v *VarExpr) (AnalyzedExpr, error) {
+		switch {
+		case v.TypeOID != common:
+			return ac.catalog.coerceToTargetType(v, v.TypeOID, common, 'i')
+		case v.TypeMod != typmod:
+			return &RelabelExpr{Arg: v, ResultType: common, TypeMod: typmod, Collation: v.Collation, Format: 'i'}, nil
+		}
+		return v, nil
+	}
+	lNode, err := toCommon(l)
+	if err != nil {
+		return nil, err
+	}
+	rNode, err := toCommon(r)
+	if err != nil {
+		return nil, err
+	}
+	switch jt {
+	case JoinLeft:
+		return lNode, nil
+	case JoinRight:
+		return rNode, nil
+	case JoinFull:
+		return &CoalesceExprQ{Args: []AnalyzedExpr{lNode, rNode}, ResultType: common, Collation: resolveCollation(lNode, rNode)}, nil
+	}
+	if _, ok := lNode.(*VarExpr); !ok {
+		if _, ok := rNode.(*VarExpr); ok {
+			return rNode, nil
+		}
+	}
+	return lNode, nil
+}
+
+// joinNodeRTIndex returns the range table entry of a FROM item.
+func joinNodeRTIndex(jn JoinNode) int {
+	switch v := jn.(type) {
+	case *RangeTableRef:
+		return v.RTIndex
+	case *JoinExprNode:
+		return v.RTIndex
+	}
+	return -1
+}
+
+// nsColumnVar is the Var a reference to column colIdx of range table entry
+// rtIdx analyzes to. A join column equal to a column of one of its inputs is
+// that input's Var, so only a column a FULL JOIN USING merges references the
+// join's own entry.
+//
+// pg: src/backend/parser/parse_clause.c — transformFromClauseItem (res_nscolumns)
+func (ac *analyzeCtx) nsColumnVar(rtIdx, colIdx int) *VarExpr {
+	rte := ac.query.RangeTable[rtIdx]
+	if rte.Kind == RTEJoin && colIdx < len(rte.JoinAliasVars) {
+		if v, ok := rte.JoinAliasVars[colIdx].(*VarExpr); ok {
+			cp := *v
+			return &cp
+		}
+	}
+	return makeRTEColumnVar(rtIdx, rte, colIdx)
+}
+
+// transformRangeSubselect processes a subquery in FROM.
+//
+// pg: src/backend/parser/parse_clause.c — transformRangeSubselect
+func (ac *analyzeCtx) transformRangeSubselect(rs *nodes.RangeSubselect) (JoinNode, error) {
+	sub, ok := rs.Subquery.(*nodes.SelectStmt)
+	if !ok {
+		return nil, fmt.Errorf("subquery in FROM is not a SELECT")
+	}
+
+	// LATERAL subqueries can reference columns from preceding FROM items.
+	// pg: src/backend/parser/parse_clause.c — transformRangeSubselect
+	var subQuery *Query
+	var err error
+	if rs.Lateral {
+		// LATERAL: analyze with parent context for correlation.
+		subQuery, err = ac.analyzeSubSelect(sub)
+	} else {
+		subQuery, err = ac.analyzeSubSelectWithOptions(sub, true)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	alias := ""
+	if rs.Alias != nil {
+		alias = rs.Alias.Aliasname
+	}
+
+	outputTargetList := nonJunkTargetEntries(subQuery.TargetList)
+	colNames := make([]string, len(outputTargetList))
+	colTypes := make([]uint32, len(outputTargetList))
+	colTypMods := make([]int32, len(outputTargetList))
+	colCollations := make([]uint32, len(outputTargetList))
+	for i, te := range outputTargetList {
+		colNames[i] = te.ResName
+		colTypes[i] = te.Expr.exprType()
+		colTypMods[i] = -1 // typmod lost through subquery
+		colCollations[i] = te.Expr.exprCollation()
+	}
+
+	rtIdx := len(ac.query.RangeTable)
+	rte := &RangeTableEntry{
+		Kind:          RTESubquery,
+		Alias:         alias,
+		ERef:          alias,
+		ColNames:      colNames,
+		ColTypes:      colTypes,
+		ColTypMods:    colTypMods,
+		ColCollations: colCollations,
+		Subquery:      subQuery,
+		Lateral:       rs.Lateral,
+	}
+	ac.query.RangeTable = append(ac.query.RangeTable, rte)
+
+	return &RangeTableRef{RTIndex: rtIdx}, nil
+}
+
+// transformRangeFunction processes a function call in FROM clause.
+//
+// pg: src/backend/parser/parse_clause.c — transformRangeFunction
+func (ac *analyzeCtx) transformRangeFunction(rf *nodes.RangeFunction) (JoinNode, error) {
+	if rf.Functions == nil || len(rf.Functions.Items) == 0 {
+		return nil, fmt.Errorf("empty function list in RangeFunction")
+	}
+
+	// Each item in Functions is a List of {funcexpr, coldeflist}.
+	var funcExprs []AnalyzedExpr
+	var funcNames []string
+	var funcColdefLists []*nodes.List
+	for _, item := range rf.Functions.Items {
+		funcItem, ok := item.(*nodes.List)
+		if !ok || len(funcItem.Items) < 1 {
+			return nil, fmt.Errorf("invalid function list item in RangeFunction")
+		}
+
+		fexpr := funcItem.Items[0]
+		if fc, ok := fexpr.(*nodes.FuncCall); ok && isMultiArgUnnest(fc) {
+			for _, arg := range fc.Args.Items {
+				unnestCall := *fc
+				unnestCall.Args = &nodes.List{Items: []nodes.Node{arg}}
+				analyzed, err := ac.transformExpr(&unnestCall)
+				if err != nil {
+					return nil, err
+				}
+				funcExprs = append(funcExprs, analyzed)
+				funcNames = append(funcNames, "unnest")
+				funcColdefLists = append(funcColdefLists, nil)
+			}
+			continue
+		}
+		analyzed, err := ac.transformExpr(fexpr)
+		if err != nil {
+			return nil, err
+		}
+		funcExprs = append(funcExprs, analyzed)
+		funcNames = append(funcNames, figureColname(fexpr))
+		var coldeflist *nodes.List
+		if len(funcItem.Items) > 1 {
+			coldeflist, _ = funcItem.Items[1].(*nodes.List)
+		}
+		funcColdefLists = append(funcColdefLists, coldeflist)
+	}
+
+	return ac.addRangeTableEntryForFunction(rf, funcExprs, funcNames, funcColdefLists)
+}
+
+func isMultiArgUnnest(fc *nodes.FuncCall) bool {
+	if fc == nil || fc.FuncVariadic || fc.Args == nil || len(fc.Args.Items) <= 1 || fc.Funcname == nil || len(fc.Funcname.Items) == 0 {
+		return false
+	}
+	return strings.EqualFold(stringVal(fc.Funcname.Items[len(fc.Funcname.Items)-1]), "unnest")
+}
+
+// addRangeTableEntryForFunction builds a RTEFunction RangeTableEntry.
+//
+// pg: src/backend/parser/parse_relation.c — addRangeTableEntryForFunction
+func (ac *analyzeCtx) addRangeTableEntryForFunction(
+	rf *nodes.RangeFunction, funcExprs []AnalyzedExpr, funcNames []string, funcColdefLists []*nodes.List,
+) (JoinNode, error) {
+	// Choose alias name.
+	alias := ""
+	if rf.Alias != nil {
+		alias = rf.Alias.Aliasname
+	}
+	eref := alias
+	if eref == "" && len(funcNames) > 0 {
+		eref = funcNames[0]
+	}
+
+	// Build column info from each function's return type.
+	var colNames []string
+	var colTypes []uint32
+	var colTypMods []int32
+	var colCollations []uint32
+
+	unknownColumns := false
+	colDefs := make([]*funcColDef, len(funcExprs))
+	addColDefList := func(i int, coldeflist *nodes.List) error {
+		start := len(colNames)
+		if err := ac.appendColumnsFromColdefList(coldeflist, &colNames, &colTypes, &colTypMods, &colCollations); err != nil {
+			return err
+		}
+		def := &funcColDef{
+			names:      slices.Clone(colNames[start:]),
+			types:      slices.Clone(colTypes[start:]),
+			typmods:    slices.Clone(colTypMods[start:]),
+			collations: slices.Clone(colCollations[start:]),
+		}
+		for _, item := range coldeflist.Items {
+			cd, _ := item.(*nodes.ColumnDef)
+			var name []string
+			if cd != nil {
+				name = collateClauseName(cd.CollClause)
+			}
+			def.collNames = append(def.collNames, name)
+		}
+		colDefs[i] = def
+		return nil
+	}
+	for i, fexpr := range funcExprs {
+		retType := fexpr.exprType()
+		cls := ac.catalog.getTypeFuncClass(retType)
+
+		// Under OpaqueUnknownFunctions, a function the catalog does not
+		// know has the columns its column definition list gives, or else
+		// unknown ones, which only a lone function without ORDINALITY can
+		// have: the query's column references then name them.
+		if f, ok := fexpr.(*FuncCallExpr); ok && f.FuncOID == 0 && retType == UNKNOWNOID && ac.opts.OpaqueUnknownFunctions {
+			if coldeflist := recordFunctionColdefList(rf, funcColdefLists, i, len(funcExprs)); coldeflist != nil {
+				if err := addColDefList(i, coldeflist); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if len(funcExprs) == 1 && !rf.Ordinality {
+				unknownColumns = true
+				continue
+			}
+			// ROWS FROM and WITH ORDINALITY place columns after this
+			// function's, whose number is unknown.
+			return nil, &Error{Code: CodeFeatureNotSupported, Message: fmt.Sprintf("function %s, whose columns are unknown, needs a column definition list in ROWS FROM or WITH ORDINALITY", funcNames[i])}
+		}
+
+		switch cls {
+		case typeFuncScalar:
+			// Single column with name from function.
+			cname := ac.chooseScalarFunctionAlias(fexpr, funcNames[i], alias, len(funcExprs))
+			colNames = append(colNames, cname)
+			colTypes = append(colTypes, retType)
+			colTypMods = append(colTypMods, fexpr.exprTypMod())
+			var coll uint32
+			if ac.catalog.typeCollation(retType) != 0 {
+				coll = fexpr.exprCollation()
+				if coll == 0 {
+					coll = ac.catalog.typeCollation(retType)
+				}
+			}
+			colCollations = append(colCollations, coll)
+
+		case typeFuncComposite:
+			// Extract columns from composite type's relation.
+			bt := ac.catalog.typeByOID[retType]
+			if bt == nil || bt.RelID == 0 {
+				return nil, fmt.Errorf("composite type %d has no relation", retType)
+			}
+			rel := ac.catalog.findRelByOID(bt.RelID)
+			if rel == nil {
+				return nil, fmt.Errorf("relation %d for composite type not found", bt.RelID)
+			}
+			for _, col := range rel.Columns {
+				colNames = append(colNames, col.Name)
+				colTypes = append(colTypes, col.TypeOID)
+				colTypMods = append(colTypMods, col.TypeMod)
+				colCollations = append(colCollations, col.Collation)
+			}
+
+		case typeFuncRecord:
+			coldeflist := recordFunctionColdefList(rf, funcColdefLists, i, len(funcExprs))
+			if coldeflist != nil {
+				if err := addColDefList(i, coldeflist); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if ac.appendOutputParamColumns(fexpr, &colNames, &colTypes, &colTypMods, &colCollations) {
+				continue
+			}
+			return nil, &Error{
+				Code:    CodeFeatureNotSupported,
+				Message: "function returning record requires column definition list",
+			}
+		default:
+			return nil, &Error{
+				Code:    CodeFeatureNotSupported,
+				Message: fmt.Sprintf("unsupported return type for function in FROM: %s", ac.catalog.typeName(retType)),
+			}
+		}
+	}
+
+	// WITH ORDINALITY adds an extra column.
+	if rf.Ordinality {
+		colNames = append(colNames, "ordinality")
+		colTypes = append(colTypes, INT8OID)
+		colTypMods = append(colTypMods, -1)
+		colCollations = append(colCollations, 0)
+	}
+
+	// The alias of a function whose columns are unknown names its first
+	// columns.
+	aliasColumns := 0
+	if unknownColumns && rf.Alias != nil && rf.Alias.Colnames != nil {
+		aliasColumns = len(rf.Alias.Colnames.Items)
+		for _, item := range rf.Alias.Colnames.Items {
+			colNames = append(colNames, stringVal(item))
+			colTypes = append(colTypes, UNKNOWNOID)
+			colTypMods = append(colTypMods, -1)
+			colCollations = append(colCollations, 0)
+		}
+	}
+
+	// Apply explicit column aliases from rf.Alias.Colnames.
+	if rf.Alias != nil && rf.Alias.Colnames != nil {
+		for i, item := range rf.Alias.Colnames.Items {
+			if i >= len(colNames) {
+				break
+			}
+			if s, ok := item.(*nodes.String); ok {
+				colNames[i] = s.Str
+			}
+		}
+	}
+
+	rtIdx := len(ac.query.RangeTable)
+	rte := &RangeTableEntry{
+		Kind:           RTEFunction,
+		Alias:          alias,
+		ERef:           eref,
+		ColNames:       colNames,
+		ColTypes:       colTypes,
+		ColTypMods:     colTypMods,
+		ColCollations:  colCollations,
+		FuncExprs:      funcExprs,
+		Ordinality:     rf.Ordinality,
+		Lateral:        rf.Lateral,
+		UnknownColumns: unknownColumns,
+		aliasColumns:   aliasColumns,
+		funcColDefs:    colDefs,
+	}
+	ac.query.RangeTable = append(ac.query.RangeTable, rte)
+
+	return &RangeTableRef{RTIndex: rtIdx}, nil
+}
+
+func recordFunctionColdefList(rf *nodes.RangeFunction, funcColdefLists []*nodes.List, idx, nfuncs int) *nodes.List {
+	if idx < len(funcColdefLists) && funcColdefLists[idx] != nil {
+		return funcColdefLists[idx]
+	}
+	if nfuncs == 1 && rf.Coldeflist != nil {
+		return rf.Coldeflist
+	}
+	return nil
+}
+
+func (ac *analyzeCtx) appendColumnsFromColdefList(
+	coldeflist *nodes.List,
+	colNames *[]string,
+	colTypes *[]uint32,
+	colTypMods *[]int32,
+	colCollations *[]uint32,
+) error {
+	seen := map[string]bool{}
+	for _, item := range coldeflist.Items {
+		coldef, ok := item.(*nodes.ColumnDef)
+		if !ok {
+			return fmt.Errorf("invalid column definition in function column definition list")
+		}
+		// pg: src/backend/parser/parse_relation.c — addRangeTableEntryForFunction
+		// (CheckAttributeNamesTypes on the column definition list)
+		if seen[coldef.Colname] {
+			return &Error{Code: CodeDuplicateColumn, Message: fmt.Sprintf("column name %q specified more than once", coldef.Colname)}
+		}
+		seen[coldef.Colname] = true
+		typ := convertTypeNameToInternal(coldef.TypeName)
+		typeOID, typmod, err := ac.catalog.ResolveType(typ)
+		if err != nil {
+			return err
+		}
+		// The type's modifiers encode as a column's do, varchar(5) as 9.
+		// pg: src/backend/parser/parse_type.c — typenameTypeMod
+		if rawMods := extractRawTypmods(coldef.TypeName.Typmods); len(rawMods) > 0 {
+			_, name := typeNameParts(coldef.TypeName)
+			typmod = encodeTypModByName(resolveAlias(name), rawMods)
+		}
+		coll := ac.catalog.typeCollation(typeOID)
+		if oid := builtinCollationOIDOf(collateClauseName(coldef.CollClause)); oid != 0 && coll != 0 {
+			coll = oid
+		}
+		*colNames = append(*colNames, coldef.Colname)
+		*colTypes = append(*colTypes, typeOID)
+		*colTypMods = append(*colTypMods, typmod)
+		*colCollations = append(*colCollations, coll)
+	}
+	return nil
+}
+
+// collateClauseName returns the name a COLLATE clause gives, its schema
+// first when it is qualified, or nil without a clause.
+func collateClauseName(cc *nodes.CollateClause) []string {
+	if cc == nil || cc.Collname == nil {
+		return nil
+	}
+	var parts []string
+	for _, item := range cc.Collname.Items {
+		parts = append(parts, stringVal(item))
+	}
+	return parts
+}
+
+// builtinCollationOIDOf resolves a possibly qualified collation name to a
+// fixed built-in OID, or 0: only an unqualified or pg_catalog name can be one.
+func builtinCollationOIDOf(parts []string) uint32 {
+	switch {
+	case len(parts) == 1:
+		return builtinCollationOID(parts[0])
+	case len(parts) == 2 && parts[0] == "pg_catalog":
+		return builtinCollationOID(parts[1])
+	}
+	return 0
+}
+
+func (ac *analyzeCtx) appendOutputParamColumns(
+	fexpr AnalyzedExpr,
+	colNames *[]string,
+	colTypes *[]uint32,
+	colTypMods *[]int32,
+	colCollations *[]uint32,
+) bool {
+	call, ok := fexpr.(*FuncCallExpr)
+	if !ok || call.FuncOID == 0 {
+		return false
+	}
+
+	var modes []byte
+	var names []string
+	var allArgTypes []uint32
+	var kind byte
+	if up := ac.catalog.userProcs[call.FuncOID]; up != nil {
+		kind = up.Kind
+		modes = up.ArgModes
+		names = up.ArgNames
+		allArgTypes = up.AllArgTypes
+	} else if proc := ac.catalog.procByOID[call.FuncOID]; proc != nil {
+		kind = proc.Kind
+		modes = proc.ArgModes
+		names = proc.ArgNames
+		allArgTypes = proc.AllArgTypes
+	}
+	if len(modes) == 0 || len(allArgTypes) == 0 || len(modes) != len(allArgTypes) {
+		return false
+	}
+	if len(names) > 0 && len(names) != len(allArgTypes) {
+		return false
+	}
+
+	outCount := 0
+	type outputColumn struct {
+		name    string
+		typeOID uint32
+	}
+	outputs := make([]outputColumn, 0, len(modes))
+	for i, mode := range modes {
+		if mode != 'o' && mode != 'b' && mode != 't' {
+			continue
+		}
+		outCount++
+		name := ""
+		if i < len(names) {
+			name = names[i]
+		}
+		if name == "" {
+			name = fmt.Sprintf("column%d", outCount)
+		}
+		outputs = append(outputs, outputColumn{name: name, typeOID: allArgTypes[i]})
+	}
+	if outCount == 0 || (outCount < 2 && kind != 'p') {
+		return false
+	}
+	for _, output := range outputs {
+		typeOID := output.typeOID
+		*colNames = append(*colNames, output.name)
+		*colTypes = append(*colTypes, typeOID)
+		*colTypMods = append(*colTypMods, int32(-1))
+		*colCollations = append(*colCollations, ac.catalog.typeCollation(typeOID))
+	}
+	return true
+}
+
+// chooseScalarFunctionAlias picks the column name for a scalar function in FROM.
+//
+// pg: src/backend/parser/parse_relation.c — chooseScalarFunctionAlias
+func (ac *analyzeCtx) chooseScalarFunctionAlias(fexpr AnalyzedExpr, funcName, rteAlias string, nfuncs int) string {
+	if pname := ac.funcResultName(fexpr); pname != "" {
+		return pname
+	}
+	if nfuncs == 1 && rteAlias != "" {
+		return rteAlias
+	}
+	return funcName
+}
+
+// funcResultName returns the single named OUT/INOUT/TABLE parameter name for
+// a function, if one exists.
+//
+// pg: src/backend/utils/fmgr/funcapi.c — get_func_result_name
+func (ac *analyzeCtx) funcResultName(fexpr AnalyzedExpr) string {
+	call, ok := fexpr.(*FuncCallExpr)
+	if !ok || call.FuncOID == 0 {
+		return ""
+	}
+
+	var modes []byte
+	var names []string
+	if up := ac.catalog.userProcs[call.FuncOID]; up != nil {
+		modes = up.ArgModes
+		names = up.ArgNames
+	} else if proc := ac.catalog.procByOID[call.FuncOID]; proc != nil {
+		modes = proc.ArgModes
+		names = proc.ArgNames
+	}
+	if len(modes) == 0 || len(names) == 0 {
+		return ""
+	}
+
+	outCount := 0
+	result := ""
+	for i, mode := range modes {
+		switch mode {
+		case 'i', 'v':
+			continue
+		case 'o', 'b', 't':
+			outCount++
+			if outCount > 1 || i >= len(names) || names[i] == "" {
+				return ""
+			}
+			result = names[i]
+		}
+	}
+	if outCount != 1 {
+		return ""
+	}
+	return result
+}
+
+// figureColname extracts the function name from a raw expression for FROM alias.
+//
+// pg: src/backend/parser/parse_target.c — FigureColname
+func figureColname(n nodes.Node) string {
+	if n == nil {
+		return "?column?"
+	}
+	switch v := n.(type) {
+	case *nodes.FuncCall:
+		if v.Funcname != nil && len(v.Funcname.Items) > 0 {
+			return stringVal(v.Funcname.Items[len(v.Funcname.Items)-1])
+		}
+	}
+	return "?column?"
+}
+
+// transformTargetEntry processes a single SELECT target list entry.
+// A star expression expands into multiple entries.
+//
+// pg: src/backend/parser/parse_target.c — transformTargetEntry
+func (ac *analyzeCtx) transformTargetEntry(rt *nodes.ResTarget, startIdx int) ([]*TargetEntry, error) {
+	// Check for star expression.
+	if cr, ok := rt.Val.(*nodes.ColumnRef); ok {
+		if isStar(cr) {
+			return ac.expandStar(cr, startIdx)
+		}
+	}
+
+	expr, err := ac.transformExpr(rt.Val)
+	if err != nil {
+		return nil, err
+	}
+
+	name := rt.Name
+	if name == "" {
+		name = figureColName(rt.Val)
+	}
+
+	te := &TargetEntry{
+		Expr:    expr,
+		ResNo:   int16(startIdx + 1),
+		ResName: name,
+	}
+
+	// Track provenance for simple column refs.
+	if v, ok := expr.(*VarExpr); ok && v.LevelsUp == 0 && v.RangeIdx >= 0 && v.RangeIdx < len(ac.query.RangeTable) {
+		rte := ac.query.RangeTable[v.RangeIdx]
+		te.ResOrigTbl = rte.RelOID
+		te.ResOrigCol = v.AttNum
+	}
+
+	return []*TargetEntry{te}, nil
+}
+
+// expandStar expands a * or table.* reference.
+//
+// pg: src/backend/parser/parse_target.c — ExpandAllTables / expandNSItemAttrs
+func (ac *analyzeCtx) expandStar(cr *nodes.ColumnRef, startIdx int) ([]*TargetEntry, error) {
+	tableName := starTableName(cr)
+
+	// The columns of a function whose columns are unknown cannot be listed.
+	for _, rte := range ac.query.RangeTable {
+		if rte.UnknownColumns && (tableName == "" || rte.ERef == tableName) {
+			return nil, &Error{Code: CodeFeatureNotSupported, Message: fmt.Sprintf("cannot expand * over function %q, whose columns are unknown", rte.ERef)}
+		}
+	}
+
+	var entries []*TargetEntry
+	hasSource := false
+
+	if tableName == "" && ac.query.JoinTree != nil {
+		// Unqualified *: walk the join tree so that JOIN USING deduplication
+		// is respected. Each top-level FROM item contributes its columns;
+		// for JoinExprNode the RTE already has the correct (deduplicated) list.
+		hasSource = len(ac.query.JoinTree.FromList) > 0
+		for _, jn := range ac.query.JoinTree.FromList {
+			ac.expandStarFromJoinNode(jn, &entries, startIdx)
+		}
+	} else {
+		// Qualified table.* or no join tree: iterate RTEs directly.
+		for rtIdx, rte := range ac.query.RangeTable {
+			if rte.Kind == RTEJoin {
+				continue
+			}
+			if tableName != "" && rte.ERef != tableName {
+				continue
+			}
+			hasSource = true
+			for colIdx, colName := range rte.ColNames {
+				var coll uint32
+				if colIdx < len(rte.ColCollations) {
+					coll = rte.ColCollations[colIdx]
+				}
+				te := &TargetEntry{
+					Expr: &VarExpr{
+						RangeIdx:  rtIdx,
+						AttNum:    int16(colIdx + 1),
+						TypeOID:   rte.ColTypes[colIdx],
+						TypeMod:   rte.ColTypMods[colIdx],
+						Collation: coll,
+					},
+					ResNo:      int16(startIdx + len(entries) + 1),
+					ResName:    colName,
+					ResOrigTbl: rte.RelOID,
+					ResOrigCol: int16(colIdx + 1),
+				}
+				entries = append(entries, te)
+			}
+			if tableName != "" {
+				break
+			}
+		}
+	}
+
+	if len(entries) == 0 {
+		if hasSource {
+			return entries, nil
+		}
+		if tableName != "" {
+			return nil, errUndefinedTable(tableName)
+		}
+		return nil, &Error{Code: CodeFeatureNotSupported, Message: "SELECT * with no tables specified is not valid"}
+	}
+
+	return entries, nil
+}
+
+// expandStarFromJoinNode expands the columns of a FROM item for unqualified
+// *. A join expands to its output columns, USING columns first, each as the
+// Var a reference to it analyzes to, so that lineage reaches the base tables.
+//
+// pg: src/backend/parser/parse_target.c — ExpandAllTables (expandNSItemAttrs)
+func (ac *analyzeCtx) expandStarFromJoinNode(jn JoinNode, entries *[]*TargetEntry, startIdx int) {
+	rtIdx := joinNodeRTIndex(jn)
+	if rtIdx < 0 {
+		return
+	}
+	for colIdx, colName := range ac.query.RangeTable[rtIdx].ColNames {
+		v := ac.nsColumnVar(rtIdx, colIdx)
+		te := &TargetEntry{
+			Expr:    v,
+			ResNo:   int16(startIdx + len(*entries) + 1),
+			ResName: colName,
+		}
+		if src := ac.query.RangeTable[v.RangeIdx]; src.Kind != RTEJoin {
+			te.ResOrigTbl = src.RelOID
+			te.ResOrigCol = v.AttNum
+		}
+		*entries = append(*entries, te)
+	}
+}
+
+// transformExpr transforms a raw expression node into an analyzed expression.
+//
+// pg: src/backend/parser/parse_expr.c — transformExprRecurse
+func (ac *analyzeCtx) transformExpr(n nodes.Node) (AnalyzedExpr, error) {
+	if n == nil {
+		return &ConstExpr{TypeOID: UNKNOWNOID, TypeMod: -1, IsNull: true}, nil
+	}
+
+	switch v := n.(type) {
+	case *nodes.ColumnRef:
+		return ac.transformColumnRef(v)
+	case *nodes.A_Const:
+		return ac.transformAConst(v)
+	case *nodes.FuncCall:
+		return ac.transformFuncCall(v)
+	case *nodes.A_Expr:
+		return ac.transformAExpr(v)
+	case *nodes.TypeCast:
+		return ac.transformTypeCast(v)
+	case *nodes.BoolExpr:
+		return ac.transformBoolExpr(v)
+	case *nodes.CaseExpr:
+		return ac.transformCaseExpr(v)
+	case *nodes.CoalesceExpr:
+		return ac.transformCoalesceExpr(v)
+	case *nodes.SubLink:
+		return ac.transformSubLink(v)
+	case *nodes.NullTest:
+		return ac.transformNullTest(v)
+	case *nodes.MinMaxExpr:
+		return ac.transformMinMaxExpr(v)
+	case *nodes.BooleanTest:
+		return ac.transformBooleanTest(v)
+	case *nodes.SQLValueFunction:
+		return ac.transformSQLValueFunction(v)
+	case *nodes.ArrayExpr:
+		return ac.transformArrayExpr(v)
+	case *nodes.A_ArrayExpr:
+		return ac.transformAArrayExpr(v)
+	case *nodes.RowExpr:
+		return ac.transformRowExpr(v)
+	case *nodes.CollateClause:
+		return ac.transformCollateClause(v)
+	case *nodes.Integer:
+		return ac.transformAConst(&nodes.A_Const{Val: v})
+	case *nodes.Float:
+		return ac.transformAConst(&nodes.A_Const{Val: v})
+	case *nodes.String:
+		return ac.transformAConst(&nodes.A_Const{Val: v})
+	case *nodes.Boolean:
+		return ac.transformAConst(&nodes.A_Const{Val: v})
+	case *nodes.A_Indirection:
+		return ac.transformIndirection(v)
+	case *nodes.NamedArgExpr:
+		return ac.transformNamedArgExpr(v)
+	case *nodes.ParamRef:
+		return ac.transformParamRef(v)
+	case *nodes.GroupingFunc:
+		return ac.transformGroupingFunc(v)
+	case *nodes.XmlExpr:
+		return ac.transformXmlExpr(v)
+	case *nodes.XmlSerialize:
+		return ac.transformXmlSerialize(v)
+	case *nodes.JsonIsPredicate:
+		return ac.transformJsonIsPredicate(v)
+	case *nodes.JsonFuncExpr:
+		return ac.transformJsonFuncExpr(v)
+	case *nodes.JsonObjectConstructor:
+		return ac.transformJsonObjectConstructor(v)
+	case *nodes.JsonArrayConstructor:
+		return ac.transformJsonArrayConstructor(v)
+	case *nodes.JsonValueExpr:
+		return ac.transformJsonValueExpr(v)
+	case *nodes.JsonScalarExpr:
+		return ac.transformJsonScalarExpr(v)
+	case *nodes.JsonParseExpr:
+		return ac.transformJsonParseExpr(v)
+	case *nodes.JsonSerializeExpr:
+		return ac.transformJsonSerializeExpr(v)
+	default:
+		return &ConstExpr{TypeOID: UNKNOWNOID, TypeMod: -1, IsNull: true}, nil
+	}
+}
+
+// transformColumnRef resolves a column reference to a Var.
+//
+// pg: src/backend/parser/parse_expr.c — transformColumnRef
+func (ac *analyzeCtx) transformColumnRef(cr *nodes.ColumnRef) (AnalyzedExpr, error) {
+	if cr.Fields == nil {
+		return nil, errUndefinedColumn("")
+	}
+
+	items := cr.Fields.Items
+	var tableName, colName string
+
+	switch len(items) {
+	case 1:
+		colName = stringVal(items[0])
+	case 2:
+		tableName = stringVal(items[0])
+		colName = stringVal(items[1])
+	default:
+		// schema.table.column — take last two parts.
+		colName = stringVal(items[len(items)-1])
+		tableName = stringVal(items[len(items)-2])
+	}
+
+	// pg: src/backend/parser/parse_expr.c — transformColumnRef
+	// EXPR_KIND_COLUMN_DEFAULT rejects ColumnRef before attempting resolution.
+	if ac.exprKind == analyzeExprKindColumnDefault {
+		return nil, errColumnReferenceInDefault()
+	}
+
+	// pg: src/backend/commands/typecmds.c — replace_domain_constraint_value
+	// In domain CHECK constraints, "value" is replaced with CoerceToDomainValue.
+	if ac.domainConstraint && tableName == "" && strings.EqualFold(colName, "value") {
+		return &CoerceToDomainValueExpr{
+			TypeOID:   ac.domainBaseTypeOID,
+			TypeMod:   ac.domainBaseTypMod,
+			Collation: ac.domainBaseCollation,
+		}, nil
+	}
+
+	return ac.resolveColumnRef(tableName, colName)
+}
+
+// resolveColumnRef resolves a column name to a VarExpr.
+// If the column is not found in the current query's range table, and a parent
+// context exists, it searches the parent for correlated subquery references.
+// resolveColumnRef resolves a column name to a VarExpr, searching this
+// query level and then the enclosing ones. Under
+// AnalyzeOptions.OpaqueUnknownFunctions, a name no level has becomes a
+// column of a function in FROM whose columns are unknown, innermost level
+// first: the one named, or for an unqualified name the only one at that
+// level.
+func (ac *analyzeCtx) resolveColumnRef(tableName, colName string) (*VarExpr, error) {
+	v, err := ac.findColumnRef(tableName, colName)
+	if !ac.opts.OpaqueUnknownFunctions {
+		return v, err
+	}
+	// limit bounds the levels the inference searches, -1 for all of them.
+	limit := -1
+	var catErr *Error
+	switch {
+	case err == nil:
+		// An enclosing level's inferred column is no better than one a
+		// nearer function could have, so the nearer levels come first.
+		if v.LevelsUp == 0 || !ac.inferredAt(v) {
+			return v, nil
+		}
+		limit = v.LevelsUp
+	case !errors.As(err, &catErr) || (catErr.Code != CodeUndefinedColumn && catErr.Code != CodeUndefinedTable):
+		return v, err
+	}
+	levelsUp := 0
+	for ctx := ac; ctx != nil && (limit < 0 || levelsUp < limit); ctx = ctx.parent {
+		w, ambiguous := ctx.addUnknownColumn(tableName, colName)
+		if ambiguous {
+			// More than one function here could own the name; an
+			// enclosing level's must not take it.
+			if err == nil {
+				return nil, errAmbiguousColumn(colName)
+			}
+			return nil, err
+		}
+		if w != nil {
+			w.LevelsUp = levelsUp
+			return w, nil
+		}
+		if tableName != "" && ctx.hasVisibleAlias(tableName) {
+			// The alias is this level's: an enclosing level's function
+			// of the same alias is shadowed.
+			return nil, err
+		}
+		levelsUp++
+		if ctx.disallowParentCols && ctx.parent != nil {
+			// A FROM subquery that is not LATERAL cannot see its
+			// parent's columns, only those above it.
+			ctx = ctx.parent
+			levelsUp++
+		}
+	}
+	return v, err
+}
+
+// inferredAt reports whether v, a Var of an enclosing query level, is a column
+// a reference alone added to a function there.
+func (ac *analyzeCtx) inferredAt(v *VarExpr) bool {
+	ctx := ac
+	for i := 0; i < v.LevelsUp && ctx != nil; i++ {
+		ctx = ctx.parent
+	}
+	if ctx == nil || v.RangeIdx < 0 || v.RangeIdx >= len(ctx.query.RangeTable) {
+		return false
+	}
+	return ctx.query.RangeTable[v.RangeIdx].inferredColumn(v.AttNum)
+}
+
+// visibleRTEs returns the range table entries visible at this query level,
+// or nil when all are: within an ON condition, only the join's inputs. The
+// set is built once per ON condition, not once per column the condition
+// names: in a left-deep chain of joins each ON condition sees every table
+// before it.
+//
+// pg: src/backend/parser/parse_clause.c — transformJoinOnClause
+func (ac *analyzeCtx) visibleRTEs() map[int]bool {
+	if ac.onNamespace == nil {
+		return nil
+	}
+	if ac.onVisible == nil {
+		visible := map[int]bool{}
+		var add func(jn JoinNode)
+		add = func(jn JoinNode) {
+			switch n := jn.(type) {
+			case *RangeTableRef:
+				visible[n.RTIndex] = true
+			case *JoinExprNode:
+				visible[n.RTIndex] = true
+				add(n.Left)
+				add(n.Right)
+			}
+		}
+		for _, jn := range ac.onNamespace {
+			add(jn)
+		}
+		ac.onVisible = visible
+	}
+	return ac.onVisible
+}
+
+// hasVisibleAlias reports whether a range table entry visible at this level
+// has the reference name name.
+func (ac *analyzeCtx) hasVisibleAlias(name string) bool {
+	visible := ac.visibleRTEs()
+	for i, rte := range ac.query.RangeTable {
+		if rte.ERef == name && (visible == nil || visible[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// addUnknownColumn adds colName as a column, of unknown type, of the function
+// at this query level whose columns are unknown: the one tableName names, or
+// the only one. Within a JOIN's ON condition only the join's inputs count.
+// It reports ambiguous when more than one function could own the name.
+func (ac *analyzeCtx) addUnknownColumn(tableName, colName string) (v *VarExpr, ambiguous bool) {
+	inScope := ac.visibleRTEs()
+	idx := -1
+	for i, rte := range ac.query.RangeTable {
+		if !rte.UnknownColumns || (tableName != "" && rte.ERef != tableName) || (inScope != nil && !inScope[i]) {
+			continue
+		}
+		if idx >= 0 {
+			return nil, true
+		}
+		idx = i
+	}
+	if idx < 0 {
+		return nil, false
+	}
+	if ac.usingJoinNames(idx, colName) {
+		return nil, true
+	}
+	return ac.appendUnknownColumn(idx, colName, true), false
+}
+
+// usingJoinNames reports whether a USING join over range table entry idx
+// already matched colName against its inputs' columns. A function's column
+// of that name, found later, would make the join's match ambiguous, so it
+// cannot be inferred.
+func (ac *analyzeCtx) usingJoinNames(idx int, colName string, extra ...JoinNode) bool {
+	var visit func(jn JoinNode) (contains, names bool)
+	visit = func(jn JoinNode) (bool, bool) {
+		switch n := jn.(type) {
+		case *RangeTableRef:
+			return n.RTIndex == idx, false
+		case *JoinExprNode:
+			lc, ln := visit(n.Left)
+			rc, rn := visit(n.Right)
+			contains := lc || rc
+			return contains, ln || rn || (contains && slices.Contains(n.UsingClause, colName))
+		}
+		return false, false
+	}
+	roots := append(append([]JoinNode(nil), ac.onNamespace...), extra...)
+	if ac.query.JoinTree != nil {
+		roots = append(roots, ac.query.JoinTree.FromList...)
+	}
+	for _, jn := range roots {
+		if _, names := visit(jn); names {
+			return true
+		}
+	}
+	return false
+}
+
+// addUnknownColumnIn adds colName, which a USING list names, to the one
+// function whose columns are unknown among the base relations of jn, and
+// reports whether there was one. extra holds join inputs not yet in the
+// join tree.
+func (ac *analyzeCtx) addUnknownColumnIn(jn JoinNode, colName string, extra ...JoinNode) bool {
+	idx := -1
+	for _, i := range joinNodeBaseRTEs(jn) {
+		if !ac.query.RangeTable[i].UnknownColumns {
+			continue
+		}
+		if idx >= 0 {
+			return false
+		}
+		idx = i
+	}
+	if idx < 0 || ac.usingJoinNames(idx, colName, extra...) {
+		return false
+	}
+	ac.appendUnknownColumn(idx, colName, false, extra...)
+	return true
+}
+
+// appendUnknownColumn adds a column to the function at range table entry idx
+// and to every join over it, which outputs it last, so an unqualified
+// reference through a join sees it as a comma join would. inferred marks a
+// column only a reference named, not an alias or USING. extra holds join
+// inputs not yet in the join tree.
+func (ac *analyzeCtx) appendUnknownColumn(idx int, colName string, inferred bool, extra ...JoinNode) *VarExpr {
+	addColumn := func(rte *RangeTableEntry) {
+		rte.ColNames = append(rte.ColNames, colName)
+		rte.ColTypes = append(rte.ColTypes, UNKNOWNOID)
+		rte.ColTypMods = append(rte.ColTypMods, -1)
+		rte.ColCollations = append(rte.ColCollations, 0)
+	}
+	rte := ac.query.RangeTable[idx]
+	for len(rte.inferredCols) < len(rte.ColNames) {
+		rte.inferredCols = append(rte.inferredCols, false)
+	}
+	// A column the function already has is reused: a join built before
+	// the column was added, and not yet in the join tree, may lack it.
+	colIdx := slices.Index(rte.ColNames, colName)
+	if colIdx < 0 {
+		addColumn(rte)
+		rte.inferredCols = append(rte.inferredCols, inferred)
+		colIdx = len(rte.ColNames) - 1
+	} else if !inferred {
+		rte.inferredCols[colIdx] = false
+	}
+	v := makeRTEColumnVar(idx, rte, colIdx)
+	refersToV := func(e AnalyzedExpr) bool {
+		found := false
+		WalkAnalyzedExpr(e, func(e AnalyzedExpr) bool {
+			if w, ok := e.(*VarExpr); ok && w.RangeIdx == v.RangeIdx && w.AttNum == v.AttNum && w.LevelsUp == 0 {
+				found = true
+			}
+			return !found
+		})
+		return found
+	}
+
+	seen := map[int]bool{}
+	var visit func(jn JoinNode) bool
+	visit = func(jn JoinNode) bool {
+		switch n := jn.(type) {
+		case *RangeTableRef:
+			return n.RTIndex == idx
+		case *JoinExprNode:
+			l, r := visit(n.Left), visit(n.Right)
+			if (l || r) && !seen[n.RTIndex] && n.RTIndex < len(ac.query.RangeTable) {
+				seen[n.RTIndex] = true
+				join := ac.query.RangeTable[n.RTIndex]
+				if !slices.ContainsFunc(join.JoinAliasVars, refersToV) {
+					addColumn(join)
+					alias := *v
+					join.JoinAliasVars = append(join.JoinAliasVars, &alias)
+				}
+			}
+			return l || r
+		}
+		return false
+	}
+	roots := append(append([]JoinNode(nil), ac.onNamespace...), extra...)
+	if ac.query.JoinTree != nil {
+		roots = append(roots, ac.query.JoinTree.FromList...)
+	}
+	for _, jn := range roots {
+		visit(jn)
+	}
+	return v
+}
+
+// joinNodeBaseRTEs lists the range table entries of the relations, subqueries,
+// and functions a FROM item joins.
+func joinNodeBaseRTEs(jn JoinNode) []int {
+	switch n := jn.(type) {
+	case *RangeTableRef:
+		return []int{n.RTIndex}
+	case *JoinExprNode:
+		return append(joinNodeBaseRTEs(n.Left), joinNodeBaseRTEs(n.Right)...)
+	}
+	return nil
+}
+
+// findColumnRef resolves a column name to a VarExpr among the columns the
+// query levels have.
+func (ac *analyzeCtx) findColumnRef(tableName, colName string) (*VarExpr, error) {
+	// Within an ON condition only the join's inputs are visible at this
+	// level. Other FROM items are hidden, and the search goes on to the
+	// enclosing levels.
+	// pg: src/backend/parser/parse_clause.c — transformJoinOnClause
+	visible := ac.visibleRTEs()
+	inScope := func(i int) bool { return visible == nil || visible[i] }
+
+	fromItems := ac.onNamespace
+	if fromItems == nil && ac.query.JoinTree != nil {
+		fromItems = ac.query.JoinTree.FromList
+	}
+	if tableName == "" && len(fromItems) > 0 {
+		var cands []*VarExpr
+		for _, jn := range fromItems {
+			cands = append(cands, ac.findVarsInRTE(joinNodeRTIndex(jn), colName)...)
+		}
+		if len(cands) > 0 {
+			return ac.pickColumn(cands, colName, visible)
+		}
+	}
+
+	var cands []*VarExpr
+	ownsTable := false
+	for rtIdx, rte := range ac.query.RangeTable {
+		if !inScope(rtIdx) || (tableName != "" && rte.ERef != tableName) {
+			continue
+		}
+		ownsTable = tableName != ""
+		var inTable []*VarExpr
+		for colIdx, cn := range rte.ColNames {
+			if cn == colName {
+				inTable = append(inTable, makeRTEColumnVar(rtIdx, rte, colIdx))
+			}
+		}
+		if tableName != "" && len(inTable) > 0 {
+			// A table's own columns of one name, as a subquery or alias
+			// list can give, make a qualified reference ambiguous.
+			// pg: src/backend/parser/parse_relation.c — scanNSItemForColumn
+			if len(inTable) > 1 {
+				return nil, errAmbiguousColumn(colName)
+			}
+			return inTable[0], nil
+		}
+		cands = append(cands, inTable...)
+	}
+	if len(cands) > 0 {
+		return ac.pickColumn(cands, colName, visible)
+	}
+	// A table name this level has is this level's, even when the column is
+	// missing: it shadows an enclosing level's table of the same name.
+	// pg: src/backend/parser/parse_relation.c — refnameNamespaceItem
+	if ownsTable {
+		return nil, errUndefinedColumn(colName)
+	}
+
+	var found *VarExpr
+	if tableName == "" {
+		for rtIdx, rte := range ac.query.RangeTable {
+			if !inScope(rtIdx) {
+				continue
+			}
+			if v := ac.makeScalarFunctionWholeRowVar(rtIdx, rte, colName); v != nil {
+				if found != nil {
+					return nil, errAmbiguousColumn(colName)
+				}
+				found = v
+			}
+		}
+	}
+
+	if found == nil && ac.outerCols != nil {
+		// Try resolving in an enclosing level (correlated subquery).
+		// pg: src/backend/parser/parse_expr.c — transformColumnRef
+		// PG walks up the namespace chain to find outer references.
+		outerVar, err := ac.outerCols.findColumnRef(tableName, colName)
+		if err != nil {
+			return nil, err
+		}
+		return &VarExpr{
+			RangeIdx:  outerVar.RangeIdx,
+			AttNum:    outerVar.AttNum,
+			TypeOID:   outerVar.TypeOID,
+			TypeMod:   outerVar.TypeMod,
+			Collation: outerVar.Collation,
+			LevelsUp:  outerVar.LevelsUp + ac.outerColsUp,
+		}, nil
+	}
+
+	if found == nil {
+		if tableName != "" {
+			// No visible table has the name; one an ON condition hides
+			// is not found either.
+			return nil, errUndefinedTable(tableName)
+		}
+		return nil, errUndefinedColumn(colName)
+	}
+	return found, nil
+}
+
+// pickColumn chooses among the columns an unqualified name matches at one
+// query level. A column a reference alone added to a function whose columns
+// are unknown is inferred: any other column wins over it, whatever order
+// the references come in, since the query text does not say the function
+// has it. Columns the text does say exist, a table's or those an alias,
+// column definition list, or USING names, are matched alike, so two of them
+// are ambiguous. With only inferred candidates, the name is also ambiguous
+// while another visible function whose columns are unknown lacks it but
+// could have it, as it is before either has gained the column.
+func (ac *analyzeCtx) pickColumn(cands []*VarExpr, colName string, visible map[int]bool) (*VarExpr, error) {
+	var concrete []*VarExpr
+	owners := map[int]bool{}
+	for _, v := range cands {
+		if ac.query.RangeTable[v.RangeIdx].inferredColumn(v.AttNum) {
+			owners[v.RangeIdx] = true
+		} else {
+			concrete = append(concrete, v)
+		}
+	}
+	if len(concrete) > 0 {
+		cands = concrete
+	} else {
+		for i, rte := range ac.query.RangeTable {
+			if rte.UnknownColumns && !owners[i] && !slices.Contains(rte.ColNames, colName) && (visible == nil || visible[i]) {
+				return nil, errAmbiguousColumn(colName)
+			}
+		}
+	}
+	if len(cands) > 1 {
+		return nil, errAmbiguousColumn(colName)
+	}
+	return cands[0], nil
+}
+
+// findVarsInRTE returns the Var of each column of range table entry rtIdx
+// named colName.
+func (ac *analyzeCtx) findVarsInRTE(rtIdx int, colName string) []*VarExpr {
+	if rtIdx < 0 || rtIdx >= len(ac.query.RangeTable) {
+		return nil
+	}
+	var vars []*VarExpr
+	for colIdx, cn := range ac.query.RangeTable[rtIdx].ColNames {
+		if cn == colName {
+			vars = append(vars, ac.nsColumnVar(rtIdx, colIdx))
+		}
+	}
+	return vars
+}
+
+func makeRTEColumnVar(rtIdx int, rte *RangeTableEntry, colIdx int) *VarExpr {
+	var coll uint32
+	if colIdx < len(rte.ColCollations) {
+		coll = rte.ColCollations[colIdx]
+	}
+	return &VarExpr{
+		RangeIdx:  rtIdx,
+		AttNum:    int16(colIdx + 1),
+		TypeOID:   rte.ColTypes[colIdx],
+		TypeMod:   rte.ColTypMods[colIdx],
+		Collation: coll,
+	}
+}
+
+func (ac *analyzeCtx) makeScalarFunctionWholeRowVar(rtIdx int, rte *RangeTableEntry, name string) *VarExpr {
+	if rte.Kind != RTEFunction || rte.ERef != name || rte.Ordinality || len(rte.FuncExprs) != 1 {
+		return nil
+	}
+	fexpr := rte.FuncExprs[0]
+	if fexpr == nil || ac.catalog.getTypeFuncClass(fexpr.exprType()) != typeFuncScalar {
+		return nil
+	}
+	return &VarExpr{
+		RangeIdx:  rtIdx,
+		AttNum:    1,
+		TypeOID:   fexpr.exprType(),
+		TypeMod:   -1,
+		Collation: fexpr.exprCollation(),
+	}
+}
+
+// transformAConst transforms a constant value.
+//
+// pg: src/backend/parser/parse_expr.c — make_const
+func (ac *analyzeCtx) transformAConst(ac2 *nodes.A_Const) (AnalyzedExpr, error) {
+	if ac2.Isnull {
+		return &ConstExpr{TypeOID: UNKNOWNOID, TypeMod: -1, IsNull: true}, nil
+	}
+
+	switch v := ac2.Val.(type) {
+	case *nodes.Integer:
+		// pg: make_const — PG uses int4 for values that fit, int8 for larger.
+		// pgparser uses Go int64 for Integer, so check if it overflows int32.
+		if v.Ival < -2147483648 || v.Ival > 2147483647 {
+			return &ConstExpr{TypeOID: INT8OID, TypeMod: -1, Value: fmt.Sprintf("%d", v.Ival)}, nil
+		}
+		return &ConstExpr{TypeOID: INT4OID, TypeMod: -1, Value: fmt.Sprintf("%d", v.Ival)}, nil
+	case *nodes.Float:
+		// PG parser puts large integers and real floats here.
+		// pg: src/backend/parser/parse_node.c — make_const
+		// Check if it looks like an integer (no decimal point or exponent).
+		if !strings.Contains(v.Fval, ".") && !strings.ContainsAny(v.Fval, "eE") {
+			// Large integer that didn't fit int4. Try int8 first.
+			// PG: scanint8 check — if it fits int8, use INT8OID.
+			_, err := strconv.ParseInt(v.Fval, 10, 64)
+			if err == nil {
+				return &ConstExpr{TypeOID: INT8OID, TypeMod: -1, Value: v.Fval}, nil
+			}
+			// Doesn't fit int8 either → NUMERIC
+			return &ConstExpr{TypeOID: NUMERICOID, TypeMod: -1, Value: v.Fval}, nil
+		}
+		return &ConstExpr{TypeOID: NUMERICOID, TypeMod: -1, Value: v.Fval}, nil
+	case *nodes.String:
+		return &ConstExpr{TypeOID: UNKNOWNOID, TypeMod: -1, Collation: DEFAULT_COLLATION_OID, Value: v.Str}, nil
+	case *nodes.Boolean:
+		val := "false"
+		if v.Boolval {
+			val = "true"
+		}
+		return &ConstExpr{TypeOID: BOOLOID, TypeMod: -1, Value: val}, nil
+	default:
+		return &ConstExpr{TypeOID: UNKNOWNOID, TypeMod: -1}, nil
+	}
+}
+
+// transformFuncCall transforms a function call.
+//
+// pg: src/backend/parser/parse_func.c — ParseFuncOrColumn
+func (ac *analyzeCtx) transformFuncCall(fc *nodes.FuncCall) (AnalyzedExpr, error) {
+	_, funcName := qualifiedName(fc.Funcname)
+	funcName = strings.ToLower(funcName)
+
+	// Transform arguments.
+	var args []AnalyzedExpr
+	var argTypes []uint32
+	if fc.Args != nil {
+		for _, a := range fc.Args.Items {
+			expr, err := ac.transformExpr(a)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, expr)
+			argTypes = append(argTypes, expr.exprType())
+		}
+	}
+
+	// The ORDER BY inside the call, or the WITHIN GROUP ordering. The
+	// expressions of WITHIN GROUP are aggregated arguments: they follow the
+	// direct arguments when the function is looked up and coerced.
+	// pg: src/backend/parser/parse_expr.c — transformFuncCall (agg_within_group)
+	aggOrder, err := ac.transformAggOrder(fc.AggOrder)
+	if err != nil {
+		return nil, err
+	}
+	nDirect := len(args)
+	if fc.AggWithinGroup {
+		for _, sb := range aggOrder {
+			args = append(args, sb.Expr)
+			argTypes = append(argTypes, sb.Expr.exprType())
+		}
+	}
+	argNames, err := callArgNames(args)
+	if err != nil {
+		return nil, err
+	}
+	// pg: src/backend/parser/parse_func.c — ParseFuncOrColumn (agg_filter)
+	var aggFilter AnalyzedExpr
+	if fc.AggFilter != nil {
+		aggFilter, err = ac.transformExpr(fc.AggFilter)
+		if err != nil {
+			return nil, err
+		}
+		if aggFilter, err = ac.catalog.coerceToBoolean(aggFilter, "FILTER"); err != nil {
+			return nil, err
+		}
+	}
+
+	// count(*) special case.
+	if fc.AggStar && funcName == "count" {
+		if fc.AggWithinGroup {
+			return nil, errNotOrderedSetAggregate(funcName)
+		}
+		countOID := ac.catalog.countStarOID()
+		// If OVER is present, it's a window function.
+		if fc.Over != nil {
+			if ac.exprKind == analyzeExprKindColumnDefault {
+				return nil, errWindowFunctionInDefault()
+			}
+			winRef, err := ac.resolveWindowDef(fc.Over)
+			if err != nil {
+				return nil, err
+			}
+			return &WindowFuncExpr{
+				FuncOID:    countOID,
+				FuncName:   "count",
+				ResultType: INT8OID,
+				Args:       nil,
+				AggStar:    true,
+				AggFilter:  aggFilter,
+				WinRef:     winRef,
+			}, nil
+		}
+		if ac.exprKind == analyzeExprKindColumnDefault {
+			return nil, errAggregateInDefault()
+		}
+		return &AggExpr{
+			AggFuncOID: countOID,
+			AggName:    "count",
+			ResultType: INT8OID,
+			AggStar:    true,
+			AggFilter:  aggFilter,
+		}, nil
+	}
+
+	// Resolve function.
+	procs := ac.catalog.procByName[funcName]
+	if len(procs) == 0 {
+		if ac.opts.OpaqueUnknownFunctions {
+			return ac.opaqueFuncCall(fc, funcName, args, nDirect, aggOrder, aggFilter)
+		}
+		return nil, errUndefinedFunction(funcName, argTypes)
+	}
+
+	proc, matchedArgTypes, err := ac.catalog.resolveFuncOverload(procs, argTypes, argNames, fc.AggStar, fc.FuncVariadic)
+	if err != nil {
+		var catErr *Error
+		if ac.opts.OpaqueUnknownFunctions && errors.As(err, &catErr) && catErr.Code == CodeUndefinedFunction {
+			return ac.opaqueFuncCall(fc, funcName, args, nDirect, aggOrder, aggFilter)
+		}
+		return nil, err
+	}
+
+	if proc.Kind == 'a' && fc.AggWithinGroup && ac.catalog.aggKind(proc) == 'h' {
+		if err := ac.catalog.unifyHypotheticalArgs(args, argTypes, nDirect); err != nil {
+			return nil, err
+		}
+	}
+
+	// Insert coercions for mismatched argument types.
+	// Skip coercion when the target type is polymorphic — polymorphic types
+	// accept any actual type without coercion.
+	for i := range args {
+		if i < int(proc.NArgs) && argTypes[i] != matchedArgTypes[i] && !isPolymorphic(matchedArgTypes[i]) {
+			if na, ok := args[i].(*NamedArgExprQ); ok {
+				na.Arg, err = ac.catalog.coerceToTargetType(na.Arg, argTypes[i], matchedArgTypes[i], 'i')
+			} else {
+				args[i], err = ac.catalog.coerceToTargetType(args[i], argTypes[i], matchedArgTypes[i], 'i')
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// A named argument records the parameter it fills, and the return type
+	// is resolved from the arguments in parameter order.
+	// pg: src/backend/parser/parse_func.c — ParseFuncOrColumn (argnumber)
+	retArgTypes := argTypes
+	if argNames != nil {
+		if positions, ok := namedCallPositions(proc, argNames, fc.FuncVariadic); ok {
+			retArgTypes = make([]uint32, proc.NArgs)
+			for i, pos := range positions {
+				retArgTypes[pos] = argTypes[i]
+				if na, ok := args[i].(*NamedArgExprQ); ok {
+					na.ArgNum = pos
+				}
+			}
+		}
+	}
+	retType := ac.catalog.resolveReturnType(proc, ac.catalog.withDefaultArgTypes(proc, retArgTypes))
+
+	if err := checkFuncCallClauses(fc, funcName, proc, ac.catalog.aggKind(proc), aggOrder, aggFilter); err != nil {
+		return nil, err
+	}
+	// pg: src/backend/parser/parse_func.c — ParseFuncOrColumn (argnames)
+	if argNames != nil {
+		switch proc.Kind {
+		case 'a':
+			return nil, &Error{Code: CodeFeatureNotSupported, Message: "aggregates cannot use named arguments"}
+		case 'w':
+			return nil, &Error{Code: CodeFeatureNotSupported, Message: "window functions cannot use named arguments"}
+		}
+	}
+
+	// Window function: has OVER clause.
+	// pg: src/backend/parser/parse_func.c — ParseFuncOrColumn (window function path)
+	if fc.Over != nil {
+		if ac.exprKind == analyzeExprKindColumnDefault {
+			return nil, errWindowFunctionInDefault()
+		}
+		winRef, err := ac.resolveWindowDef(fc.Over)
+		if err != nil {
+			return nil, err
+		}
+		// Derive collation for window function result.
+		var winColl uint32
+		if ac.catalog.typeCollation(retType) != 0 {
+			winColl = resolveCollation(args...)
+			if winColl == 0 {
+				winColl = ac.catalog.typeCollation(retType)
+			}
+		}
+		return &WindowFuncExpr{
+			FuncOID:    proc.OID,
+			FuncName:   funcName,
+			ResultType: retType,
+			Collation:  winColl,
+			Args:       args,
+			AggStar:    fc.AggStar,
+			AggFilter:  aggFilter,
+			WinRef:     winRef,
+		}, nil
+	}
+
+	// Determine if this is an aggregate.
+	if proc.Kind == 'a' {
+		if ac.exprKind == analyzeExprKindColumnDefault {
+			return nil, errAggregateInDefault()
+		}
+		var aggColl uint32
+		if ac.catalog.typeCollation(retType) != 0 {
+			aggColl = resolveCollation(args...)
+			if aggColl == 0 {
+				aggColl = ac.catalog.typeCollation(retType)
+			}
+		}
+		if fc.AggWithinGroup {
+			if err := ac.catalog.checkOrderedSetArgs(proc, funcName, argTypes, nDirect, len(aggOrder)); err != nil {
+				return nil, err
+			}
+		} else if err := matchAggOrderToArgs(args, aggOrder, fc.AggDistinct); err != nil {
+			return nil, err
+		}
+		agg := newAggExpr(fc, proc.OID, funcName, retType, aggColl, args, nDirect, aggOrder, aggFilter)
+		if err := ac.catalog.prepareAggSort(agg.AggOrder); err != nil {
+			return nil, err
+		}
+		return agg, nil
+	}
+
+	if proc.RetSet && ac.exprKind == analyzeExprKindColumnDefault {
+		return nil, errSetReturningFunctionInDefault()
+	}
+
+	// Determine result collation: if result type is collatable, derive from args.
+	var funcColl uint32
+	if ac.catalog.typeCollation(retType) != 0 {
+		funcColl = resolveCollation(args...)
+		if funcColl == 0 {
+			funcColl = ac.catalog.typeCollation(retType)
+		}
+	}
+
+	return &FuncCallExpr{
+		FuncOID:      proc.OID,
+		FuncName:     funcName,
+		ResultType:   retType,
+		ResultTypMod: -1,
+		Collation:    funcColl,
+		Args:         args,
+	}, nil
+}
+
+// newAggExpr builds the AggExpr of an aggregate call. For WITHIN GROUP, args
+// holds the direct arguments followed by the ordering expressions, coerced to
+// the aggregate's parameter types; those go back to their sort items.
+func newAggExpr(fc *nodes.FuncCall, oid uint32, name string, retType, coll uint32, args []AnalyzedExpr, nDirect int, aggOrder []*AggSortBy, aggFilter AnalyzedExpr) *AggExpr {
+	agg := &AggExpr{
+		AggFuncOID:     oid,
+		AggName:        name,
+		ResultType:     retType,
+		Collation:      coll,
+		Args:           args,
+		AggStar:        fc.AggStar,
+		AggDistinct:    fc.AggDistinct,
+		AggOrder:       aggOrder,
+		AggWithinGroup: fc.AggWithinGroup,
+		AggFilter:      aggFilter,
+	}
+	if fc.AggWithinGroup {
+		for i, sb := range aggOrder {
+			sb.Expr = args[nDirect+i]
+		}
+		agg.Args = args[:nDirect:nDirect]
+	}
+	return agg
+}
+
+// checkFuncCallClauses rejects the aggregate and window clauses a resolved
+// function cannot take, so that none of them is silently dropped.
+//
+// pg: src/backend/parser/parse_func.c — ParseFuncOrColumn
+// pg: src/backend/parser/parse_agg.c — transformWindowFuncCall
+func checkFuncCallClauses(fc *nodes.FuncCall, name string, proc *BuiltinProc, aggKind byte, aggOrder []*AggSortBy, aggFilter AnalyzedExpr) error {
+	wrongType := func(format string, a ...any) error {
+		return &Error{Code: CodeWrongObjectType, Message: fmt.Sprintf(format, a...)}
+	}
+	notSupported := func(format string, a ...any) error {
+		return &Error{Code: CodeFeatureNotSupported, Message: fmt.Sprintf(format, a...)}
+	}
+	switch proc.Kind {
+	case 'a':
+		switch {
+		case aggKind == 'n' && fc.AggWithinGroup:
+			return errNotOrderedSetAggregate(name)
+		case aggKind != 'n' && !fc.AggWithinGroup:
+			return wrongType("WITHIN GROUP is required for ordered-set aggregate %s", name)
+		}
+		if fc.Over != nil {
+			if fc.AggWithinGroup {
+				return notSupported("OVER is not supported for ordered-set aggregate %s", name)
+			}
+			if len(aggOrder) > 0 {
+				return notSupported("aggregate ORDER BY is not implemented for window functions")
+			}
+		}
+	case 'w':
+		if fc.Over == nil {
+			return wrongType("window function %s requires an OVER clause", name)
+		}
+		if fc.AggWithinGroup {
+			return wrongType("window function %s cannot have WITHIN GROUP", name)
+		}
+		if len(aggOrder) > 0 {
+			return notSupported("aggregate ORDER BY is not implemented for window functions")
+		}
+		if aggFilter != nil {
+			return notSupported("FILTER is not implemented for non-aggregate window functions")
+		}
+	default:
+		switch {
+		case fc.AggStar:
+			return wrongType("%s(*) specified, but %s is not an aggregate function", name, name)
+		case fc.AggDistinct:
+			return wrongType("DISTINCT specified, but %s is not an aggregate function", name)
+		case fc.AggWithinGroup:
+			return wrongType("WITHIN GROUP specified, but %s is not an aggregate function", name)
+		case len(aggOrder) > 0:
+			return wrongType("ORDER BY specified, but %s is not an aggregate function", name)
+		case aggFilter != nil:
+			return wrongType("FILTER specified, but %s is not an aggregate function", name)
+		case fc.Over != nil:
+			return wrongType("OVER specified, but %s is not a window function nor an aggregate function", name)
+		}
+	}
+	return nil
+}
+
+// checkOrderedSetArgs checks that an ordered-set or hypothetical-set
+// aggregate call has the number of direct arguments the aggregate declares.
+// A hypothetical-set aggregate whose direct and aggregated arguments are
+// both variadic needs one direct argument per ordering column.
+//
+// pg: src/backend/parser/parse_func.c — ParseFuncOrColumn (AGGKIND_IS_ORDERED_SET)
+func (c *Catalog) checkOrderedSetArgs(proc *BuiltinProc, name string, argTypes []uint32, nDirect, nOrder int) error {
+	catDirect := c.aggNumDirectArgs(proc)
+	if catDirect < 0 {
+		return nil
+	}
+	pronargs := int(proc.NArgs)
+	nvargs := nDirect + nOrder - pronargs + 1
+	ok := nDirect == catDirect
+	if proc.Variadic != 0 && catDirect >= pronargs {
+		if c.aggKind(proc) == 'h' {
+			ok = nvargs == 2*nOrder
+		} else {
+			ok = nvargs > nOrder
+		}
+	}
+	if !ok {
+		return errUndefinedFunction(name, argTypes)
+	}
+	return nil
+}
+
+// matchAggOrderToArgs resolves each ORDER BY expression of an aggregate call
+// that is one of its arguments, ignoring the implicit casts the argument
+// got, to that argument, as PostgreSQL sorts by the argument itself. With
+// DISTINCT every ORDER BY expression must be an argument.
+//
+// pg: src/backend/parser/parse_agg.c — transformAggregateCall
+// pg: src/backend/parser/parse_clause.c — findTargetlistEntrySQL99
+func matchAggOrderToArgs(args []AnalyzedExpr, aggOrder []*AggSortBy, distinct bool) error {
+	for _, sb := range aggOrder {
+		found := false
+		for _, arg := range args {
+			if reflect.DeepEqual(sb.Expr, stripImplicitCoercions(arg)) {
+				sb.Expr = arg
+				found = true
+				break
+			}
+		}
+		if !found && distinct {
+			return &Error{Code: CodeInvalidColumnReference, Message: "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"}
+		}
+	}
+	return nil
+}
+
+// unifyHypotheticalArgs coerces each hypothetical direct argument of a
+// hypothetical-set aggregate call and its ordering column to their common
+// type, preferring the ordering column's.
+//
+// pg: src/backend/parser/parse_func.c — unify_hypothetical_args
+func (c *Catalog) unifyHypotheticalArgs(args []AnalyzedExpr, argTypes []uint32, nDirect int) error {
+	nOrder := len(args) - nDirect
+	nonHypothetical := nDirect - nOrder
+	if nonHypothetical < 0 {
+		return nil
+	}
+	for h := nonHypothetical; h < nDirect; h++ {
+		a := nDirect + h - nonHypothetical
+		common, err := c.selectCommonType([]AnalyzedExpr{args[a], args[h]}, "WITHIN GROUP")
+		if err != nil {
+			return err
+		}
+		for _, i := range []int{h, a} {
+			if argTypes[i] == common {
+				continue
+			}
+			if args[i], err = c.coerceToTargetType(args[i], argTypes[i], common, 'i'); err != nil {
+				return err
+			}
+			argTypes[i] = common
+		}
+	}
+	return nil
+}
+
+// prepareAggSort readies the ORDER BY items of an aggregate call for
+// sorting: an unknown literal is sorted as text, and every item's type must
+// have the ordering operator its direction uses.
+//
+// pg: src/backend/parser/parse_clause.c — addTargetToSortList
+func (c *Catalog) prepareAggSort(aggOrder []*AggSortBy) error {
+	for _, sb := range aggOrder {
+		typ := sb.Expr.exprType()
+		if typ == UNKNOWNOID {
+			coerced, err := c.coerceToTargetType(sb.Expr, UNKNOWNOID, TEXTOID, 'i')
+			if err != nil {
+				return err
+			}
+			sb.Expr, typ = coerced, TEXTOID
+		}
+		op := "<"
+		if sb.Descending {
+			op = ">"
+		}
+		if !c.hasOrderingOp(typ, op) {
+			return &Error{Code: CodeUndefinedFunction, Message: fmt.Sprintf("could not identify an ordering operator for type %s", c.typeName(typ))}
+		}
+	}
+	return nil
+}
+
+// hasOrderingOp reports whether a type can be sorted with op, < or >: it has
+// the operator and a default btree operator class, or for an array its
+// element type can be sorted. The catalog does not record operator classes,
+// so the built-in types whose < and > are not btree members are listed in
+// builtinTypesWithoutBtreeOrder; a user-defined type with < is accepted.
+func (c *Catalog) hasOrderingOp(typ uint32, op string) bool {
+	if t := c.typeByOID[typ]; t != nil && t.Category == 'A' && t.Elem != 0 {
+		return c.hasOrderingOp(t.Elem, op)
+	}
+	if builtinTypesWithoutBtreeOrder[typ] {
+		return false
+	}
+	_, _, _, err := c.resolveOperator(op, typ, typ, false)
+	return err == nil
+}
+
+// coerceToBoolean casts the expression of a boolean clause, such as FILTER,
+// to boolean, or fails when it has no cast in assignment context.
+//
+// pg: src/backend/parser/parse_coerce.c — coerce_to_boolean
+func (c *Catalog) coerceToBoolean(expr AnalyzedExpr, construct string) (AnalyzedExpr, error) {
+	typ := expr.exprType()
+	if typ == BOOLOID {
+		return expr, nil
+	}
+	coerced, err := c.coerceToTargetTypeWithFormat(expr, typ, BOOLOID, 'a', 'i')
+	if err != nil {
+		return nil, &Error{Code: CodeDatatypeMismatch, Message: fmt.Sprintf("argument of %s must be type boolean, not type %s", construct, c.typeName(typ))}
+	}
+	return coerced, nil
+}
+
+// stripImplicitCoercions removes the implicit casts at the top of an
+// expression.
+//
+// pg: src/backend/nodes/nodeFuncs.c — strip_implicit_coercions
+func stripImplicitCoercions(e AnalyzedExpr) AnalyzedExpr {
+	for {
+		switch v := e.(type) {
+		case *RelabelExpr:
+			if v.Format != 'i' {
+				return e
+			}
+			e = v.Arg
+		case *CoerceViaIOExpr:
+			if v.Format != 'i' {
+				return e
+			}
+			e = v.Arg
+		case *ArrayCoerceExprQ:
+			if v.Format != 'i' {
+				return e
+			}
+			e = v.Arg
+		case *FuncCallExpr:
+			if v.CoerceFormat != 'i' || len(v.Args) == 0 {
+				return e
+			}
+			e = v.Args[0]
+		default:
+			return e
+		}
+	}
+}
+
+func errNotOrderedSetAggregate(name string) error {
+	return &Error{Code: CodeWrongObjectType, Message: fmt.Sprintf("%s is not an ordered-set aggregate, so it cannot have WITHIN GROUP", name)}
+}
+
+// opaqueFuncCall analyzes a call to a function the catalog has no match for,
+// under AnalyzeOptions.OpaqueUnknownFunctions. The call keeps its analyzed
+// arguments and clauses; its function OID is 0 and its result type unknown.
+func (ac *analyzeCtx) opaqueFuncCall(fc *nodes.FuncCall, name string, args []AnalyzedExpr, nDirect int, aggOrder []*AggSortBy, aggFilter AnalyzedExpr) (AnalyzedExpr, error) {
+	if fc.Over != nil {
+		if len(aggOrder) > 0 {
+			return nil, &Error{Code: CodeFeatureNotSupported, Message: "aggregate ORDER BY is not implemented for window functions"}
+		}
+		winRef, err := ac.resolveWindowDef(fc.Over)
+		if err != nil {
+			return nil, err
+		}
+		return &WindowFuncExpr{
+			FuncName:   name,
+			ResultType: UNKNOWNOID,
+			Args:       args,
+			AggStar:    fc.AggStar,
+			AggFilter:  aggFilter,
+			WinRef:     winRef,
+		}, nil
+	}
+	if fc.AggStar || fc.AggDistinct || len(aggOrder) > 0 || aggFilter != nil {
+		return newAggExpr(fc, 0, name, UNKNOWNOID, 0, args, nDirect, aggOrder, aggFilter), nil
+	}
+	return &FuncCallExpr{
+		FuncName:     name,
+		ResultType:   UNKNOWNOID,
+		ResultTypMod: -1,
+		Args:         args,
+	}, nil
+}
+
+// transformAggOrder transforms the ORDER BY items of an aggregate call.
+//
+// pg: src/backend/parser/parse_clause.c — addTargetToSortList (direction and NULLS)
+func (ac *analyzeCtx) transformAggOrder(list *nodes.List) ([]*AggSortBy, error) {
+	if list == nil {
+		return nil, nil
+	}
+	out := make([]*AggSortBy, 0, len(list.Items))
+	for _, item := range list.Items {
+		sb, ok := item.(*nodes.SortBy)
+		if !ok {
+			return nil, fmt.Errorf("unexpected aggregate ORDER BY item %T", item)
+		}
+		expr, err := ac.transformExpr(sb.Node)
+		if err != nil {
+			return nil, err
+		}
+		desc := false
+		switch sb.SortbyDir {
+		case nodes.SORTBY_DESC:
+			desc = true
+		case nodes.SORTBY_USING:
+			// Only the built-in < and >, unqualified or in pg_catalog, can
+			// be kept, as ASC and DESC.
+			var parts []string
+			if sb.UseOp != nil {
+				for _, item := range sb.UseOp.Items {
+					parts = append(parts, stringVal(item))
+				}
+			}
+			op := ""
+			if len(parts) == 1 || (len(parts) == 2 && parts[0] == "pg_catalog") {
+				op = parts[len(parts)-1]
+			}
+			switch op {
+			case "<":
+			case ">":
+				desc = true
+			default:
+				return nil, &Error{Code: CodeFeatureNotSupported, Message: fmt.Sprintf("ORDER BY USING %s in an aggregate call is not supported", strings.Join(parts, "."))}
+			}
+		}
+		nullsFirst := desc
+		switch sb.SortbyNulls {
+		case nodes.SORTBY_NULLS_FIRST:
+			nullsFirst = true
+		case nodes.SORTBY_NULLS_LAST:
+			nullsFirst = false
+		}
+		out = append(out, &AggSortBy{Expr: expr, Descending: desc, NullsFirst: nullsFirst})
+	}
+	return out, nil
+}
+
+// transformAExpr transforms an operator expression.
+//
+// pg: src/backend/parser/parse_expr.c — transformAExprOp
+func (ac *analyzeCtx) transformAExpr(ae *nodes.A_Expr) (AnalyzedExpr, error) {
+	// Handle special A_Expr kinds before normal operator resolution.
+	// pg: src/backend/parser/parse_expr.c — transformExprRecurse (A_Expr cases)
+	switch ae.Kind {
+	case nodes.AEXPR_NULLIF:
+		return ac.transformNullIf(ae)
+	case nodes.AEXPR_IN:
+		return ac.transformAExprIn(ae)
+	case nodes.AEXPR_BETWEEN, nodes.AEXPR_NOT_BETWEEN:
+		return ac.transformBetween(ae)
+	case nodes.AEXPR_BETWEEN_SYM, nodes.AEXPR_NOT_BETWEEN_SYM:
+		return ac.transformBetween(ae)
+	case nodes.AEXPR_DISTINCT, nodes.AEXPR_NOT_DISTINCT:
+		return ac.transformDistinct(ae)
+	case nodes.AEXPR_OP, nodes.AEXPR_LIKE, nodes.AEXPR_ILIKE, nodes.AEXPR_SIMILAR:
+		// These all use normal operator resolution — fall through.
+	case nodes.AEXPR_OP_ANY:
+		return ac.transformAExprOpAny(ae)
+	case nodes.AEXPR_OP_ALL:
+		return ac.transformAExprOpAll(ae)
+	}
+
+	opName := ""
+	if ae.Name != nil && len(ae.Name.Items) > 0 {
+		opName = stringVal(ae.Name.Items[len(ae.Name.Items)-1])
+	}
+
+	var left AnalyzedExpr
+	var leftOID uint32
+	if ae.Lexpr != nil {
+		var err error
+		left, err = ac.transformExpr(ae.Lexpr)
+		if err != nil {
+			return nil, err
+		}
+		leftOID = left.exprType()
+	}
+
+	right, err := ac.transformExpr(ae.Rexpr)
+	if err != nil {
+		return nil, err
+	}
+	rightOID := right.exprType()
+
+	// Row comparison: (a,b) op (c,d) → RowCompareExpr.
+	// pg: src/backend/parser/parse_expr.c — make_row_comparison_op
+	if leftRow, lok := left.(*RowExprQ); lok {
+		if rightRow, rok := right.(*RowExprQ); rok {
+			rcType := opNameToRowCompareType(opName)
+			if rcType != 0 {
+				// Resolve operators per-column.
+				var opNos []uint32
+				for i := range leftRow.Args {
+					if i >= len(rightRow.Args) {
+						break
+					}
+					lType := leftRow.Args[i].exprType()
+					rType := rightRow.Args[i].exprType()
+					colOp, _, _, err := ac.catalog.resolveOperator(opName, lType, rType, false)
+					if err != nil {
+						return nil, err
+					}
+					opNos = append(opNos, colOp.OID)
+				}
+				return &RowCompareExprQ{
+					RCType: rcType,
+					LArgs:  leftRow.Args,
+					RArgs:  rightRow.Args,
+					OpNos:  opNos,
+				}, nil
+			}
+		}
+	}
+
+	isPrefix := ae.Lexpr == nil
+
+	// Resolve operator.
+	op, resolvedLeft, resolvedRight, err := ac.catalog.resolveOperator(opName, leftOID, rightOID, isPrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	// Insert coercions if needed.
+	if left != nil && leftOID != resolvedLeft {
+		left, err = ac.catalog.coerceToTargetType(left, leftOID, resolvedLeft, 'i')
+		if err != nil {
+			return nil, err
+		}
+	}
+	if rightOID != resolvedRight {
+		right, err = ac.catalog.coerceToTargetType(right, rightOID, resolvedRight, 'i')
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Determine result collation for operator.
+	var opColl uint32
+	if ac.catalog.typeCollation(op.Result) != 0 {
+		opColl = resolveCollation(left, right)
+		if opColl == 0 {
+			opColl = ac.catalog.typeCollation(op.Result)
+		}
+	}
+
+	return &OpExpr{
+		OpOID:      op.OID,
+		OpName:     op.Name,
+		ResultType: op.Result,
+		Collation:  opColl,
+		Left:       left,
+		Right:      right,
+	}, nil
+}
+
+// transformTypeCast transforms an explicit type cast.
+//
+// pg: src/backend/parser/parse_expr.c — transformTypeCast
+func (ac *analyzeCtx) transformTypeCast(tc *nodes.TypeCast) (AnalyzedExpr, error) {
+	arg, err := ac.transformExpr(tc.Arg)
+	if err != nil {
+		return nil, err
+	}
+
+	targetOID, targetTypMod, err := ac.catalog.resolveTypeName(tc.TypeName)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the argument is a NULL constant, directly change its type rather than
+	// wrapping in a coercion node. PG does this in coerce_type() for Const nodes.
+	if c, ok := arg.(*ConstExpr); ok && c.IsNull {
+		return &ConstExpr{
+			TypeOID: targetOID,
+			TypeMod: targetTypMod,
+			IsNull:  true,
+		}, nil
+	}
+
+	srcType := arg.exprType()
+	if srcType == targetOID {
+		// Same type — may still need typmod coercion.
+		if targetTypMod != -1 {
+			return &RelabelExpr{
+				Arg:        arg,
+				ResultType: targetOID,
+				TypeMod:    targetTypMod,
+				Format:     'e',
+			}, nil
+		}
+		return arg, nil
+	}
+
+	result, err := ac.catalog.coerceToTargetType(arg, srcType, targetOID, 'e')
+	if err != nil {
+		return nil, err
+	}
+	// Apply typmod if present (e.g., varchar(50) → typmod=54).
+	// pg: coerce_type_typmod applies length coercion after type coercion.
+	if targetTypMod != -1 {
+		switch r := result.(type) {
+		case *RelabelExpr:
+			r.TypeMod = targetTypMod
+		case *FuncCallExpr:
+			r.ResultTypMod = targetTypMod
+		case *CoerceViaIOExpr:
+			// CoerceViaIO doesn't carry typmod directly; wrap in RelabelExpr.
+			result = &RelabelExpr{
+				Arg:        result,
+				ResultType: targetOID,
+				TypeMod:    targetTypMod,
+				Format:     'i', // implicit
+			}
+		}
+	}
+	return result, nil
+}
+
+// transformBoolExpr transforms AND/OR/NOT expressions.
+//
+// pg: src/backend/parser/parse_expr.c — transformBoolExpr
+func (ac *analyzeCtx) transformBoolExpr(be *nodes.BoolExpr) (AnalyzedExpr, error) {
+	op := BoolAnd
+	switch be.Boolop {
+	case nodes.OR_EXPR:
+		op = BoolOr
+	case nodes.NOT_EXPR:
+		op = BoolNot
+	}
+
+	var args []AnalyzedExpr
+	if be.Args != nil {
+		for _, a := range be.Args.Items {
+			expr, err := ac.transformExpr(a)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, expr)
+		}
+	}
+
+	return &BoolExprQ{Op: op, Args: args}, nil
+}
+
+// transformCaseExpr transforms a CASE expression.
+//
+// pg: src/backend/parser/parse_expr.c — transformCaseExpr
+func (ac *analyzeCtx) transformCaseExpr(ce *nodes.CaseExpr) (AnalyzedExpr, error) {
+	// Transform the CASE argument for simple CASE (CASE arg WHEN val THEN ...).
+	// pg: src/backend/parser/parse_expr.c — transformCaseExpr
+	var caseArg AnalyzedExpr
+	if ce.Arg != nil {
+		var err error
+		caseArg, err = ac.transformExpr(ce.Arg)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var whens []*CaseWhenQ
+	var resultExprs []AnalyzedExpr
+
+	if ce.Args != nil {
+		for _, a := range ce.Args.Items {
+			cw, ok := a.(*nodes.CaseWhen)
+			if !ok {
+				continue
+			}
+			cond, err := ac.transformExpr(cw.Expr)
+			if err != nil {
+				return nil, err
+			}
+			result, err := ac.transformExpr(cw.Result)
+			if err != nil {
+				return nil, err
+			}
+			whens = append(whens, &CaseWhenQ{Condition: cond, Result: result})
+			resultExprs = append(resultExprs, result)
+		}
+	}
+
+	var defResult AnalyzedExpr
+	if ce.Defresult != nil {
+		var err error
+		defResult, err = ac.transformExpr(ce.Defresult)
+		if err != nil {
+			return nil, err
+		}
+		resultExprs = append(resultExprs, defResult)
+	} else {
+		resultExprs = append(resultExprs, &ConstExpr{TypeOID: UNKNOWNOID})
+	}
+
+	common, err := ac.catalog.selectCommonType(resultExprs, "CASE")
+	if err != nil {
+		return nil, err
+	}
+
+	// Coerce results to common type.
+	// pg: src/backend/parser/parse_expr.c — transformCaseExpr
+	// PG coerces ALL branch results including UNKNOWN (string literals).
+	for i, w := range whens {
+		rt := w.Result.exprType()
+		if rt != common {
+			whens[i].Result, err = ac.catalog.coerceToTargetType(w.Result, rt, common, 'i')
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if defResult != nil {
+		dt := defResult.exprType()
+		if dt != common {
+			defResult, err = ac.catalog.coerceToTargetType(defResult, dt, common, 'i')
+			if err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		// pg: transformCaseExpr — PG always adds an implicit ELSE NULL::resultType
+		// when there is no ELSE clause.
+		defResult = &ConstExpr{TypeOID: common, IsNull: true}
+	}
+
+	// Derive collation from all result expressions.
+	var caseColl uint32
+	if ac.catalog.typeCollation(common) != 0 {
+		var allResults []AnalyzedExpr
+		for _, w := range whens {
+			allResults = append(allResults, w.Result)
+		}
+		if defResult != nil {
+			allResults = append(allResults, defResult)
+		}
+		caseColl = resolveCollation(allResults...)
+		if caseColl == 0 {
+			caseColl = ac.catalog.typeCollation(common)
+		}
+	}
+
+	return &CaseExprQ{
+		Arg:        caseArg,
+		When:       whens,
+		Default:    defResult,
+		ResultType: common,
+		Collation:  caseColl,
+	}, nil
+}
+
+// transformCoalesceExpr transforms a COALESCE expression.
+//
+// pg: src/backend/parser/parse_expr.c — transformCoalesceExpr
+func (ac *analyzeCtx) transformCoalesceExpr(ce *nodes.CoalesceExpr) (AnalyzedExpr, error) {
+	var args []AnalyzedExpr
+
+	if ce.Args != nil {
+		for _, a := range ce.Args.Items {
+			expr, err := ac.transformExpr(a)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, expr)
+		}
+	}
+
+	common, err := ac.catalog.selectCommonType(args, "COALESCE")
+	if err != nil {
+		return nil, err
+	}
+
+	// Coerce args to common type.
+	// pg: src/backend/parser/parse_expr.c — transformCoalesceExpr
+	// PG coerces ALL args including UNKNOWN (string literals).
+	for i, arg := range args {
+		at := arg.exprType()
+		if at != common {
+			args[i], err = ac.catalog.coerceToTargetType(arg, at, common, 'i')
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Derive collation from args.
+	var coalColl uint32
+	if ac.catalog.typeCollation(common) != 0 {
+		coalColl = resolveCollation(args...)
+		if coalColl == 0 {
+			coalColl = ac.catalog.typeCollation(common)
+		}
+	}
+
+	return &CoalesceExprQ{Args: args, ResultType: common, Collation: coalColl}, nil
+}
+
+// transformSubLink transforms a subquery expression (scalar or EXISTS).
+//
+// pg: src/backend/parser/parse_expr.c — transformSubLink
+func (ac *analyzeCtx) transformSubLink(sl *nodes.SubLink) (AnalyzedExpr, error) {
+	if ac.exprKind == analyzeExprKindColumnDefault {
+		return nil, &Error{Code: CodeFeatureNotSupported, Message: "cannot use subquery in DEFAULT expression"}
+	}
+
+	sub, ok := sl.Subselect.(*nodes.SelectStmt)
+	if !ok {
+		return nil, fmt.Errorf("subquery is not a SELECT")
+	}
+
+	// Analyze subquery with parent context for correlated subqueries.
+	subQuery, err := ac.analyzeSubSelect(sub)
+	if err != nil {
+		return nil, err
+	}
+
+	switch nodes.SubLinkType(sl.SubLinkType) {
+	case nodes.EXISTS_SUBLINK:
+		return &SubLinkExpr{
+			SubLinkType: SubLinkExistsType,
+			SubQuery:    subQuery,
+			ResultType:  BOOLOID,
+		}, nil
+	case nodes.ANY_SUBLINK:
+		outputTargetList := nonJunkTargetEntries(subQuery.TargetList)
+		if len(outputTargetList) != 1 {
+			return nil, &Error{Code: CodeTooManyColumns, Message: "subquery must return only one column"}
+		}
+		var testExpr AnalyzedExpr
+		if sl.Testexpr != nil {
+			testExpr, err = ac.transformExpr(sl.Testexpr)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &SubLinkExpr{
+			SubLinkType: SubLinkAnyType,
+			TestExpr:    testExpr,
+			SubQuery:    subQuery,
+			ResultType:  BOOLOID,
+		}, nil
+	case nodes.ALL_SUBLINK:
+		outputTargetList := nonJunkTargetEntries(subQuery.TargetList)
+		if len(outputTargetList) != 1 {
+			return nil, &Error{Code: CodeTooManyColumns, Message: "subquery must return only one column"}
+		}
+		var testExpr AnalyzedExpr
+		if sl.Testexpr != nil {
+			testExpr, err = ac.transformExpr(sl.Testexpr)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &SubLinkExpr{
+			SubLinkType: SubLinkAllType,
+			TestExpr:    testExpr,
+			SubQuery:    subQuery,
+			ResultType:  BOOLOID,
+		}, nil
+	default:
+		// EXPR_SUBLINK (scalar subquery)
+		outputTargetList := nonJunkTargetEntries(subQuery.TargetList)
+		if len(outputTargetList) != 1 {
+			return nil, &Error{Code: CodeTooManyColumns, Message: "subquery must return only one column"}
+		}
+		return &SubLinkExpr{
+			SubLinkType: SubLinkExprType,
+			SubQuery:    subQuery,
+			ResultType:  outputTargetList[0].Expr.exprType(),
+		}, nil
+	}
+}
+
+// transformNullTest transforms IS [NOT] NULL.
+//
+// pg: src/backend/parser/parse_expr.c — transformNullTest (simplified)
+func (ac *analyzeCtx) transformNullTest(nt *nodes.NullTest) (AnalyzedExpr, error) {
+	arg, err := ac.transformExpr(nt.Arg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &NullTestExpr{
+		Arg:    arg,
+		IsNull: nt.Nulltesttype == nodes.IS_NULL,
+	}, nil
+}
+
+// analyzeSubSelect analyzes a subquery SELECT with parent context for correlation.
+//
+// pg: src/backend/parser/analyze.c — transformSelectStmt (with parent pstate)
+func (ac *analyzeCtx) analyzeSubSelect(stmt *nodes.SelectStmt) (*Query, error) {
+	return ac.analyzeSubSelectWithOptions(stmt, false)
+}
+
+func (ac *analyzeCtx) analyzeSubSelectWithOptions(stmt *nodes.SelectStmt, disallowParentCols bool) (*Query, error) {
+	if stmt == nil {
+		return nil, fmt.Errorf("NULL select statement")
+	}
+
+	// Set operation — keep the current parent/CTE context visible to branches.
+	if stmt.Op != nodes.SETOP_NONE {
+		return ac.subContext(disallowParentCols).analyzeSetOp(stmt)
+	}
+
+	// Simple SELECT with parent context.
+	subAc := ac.subContext(disallowParentCols)
+	q := subAc.query
+
+	// Process WITH clause if present.
+	if stmt.WithClause != nil {
+		if err := subAc.analyzeCTEs(stmt.WithClause); err != nil {
+			return nil, err
+		}
+	}
+
+	if stmt.FromClause != nil {
+		for _, item := range stmt.FromClause.Items {
+			jn, err := subAc.transformFromClauseItem(item)
+			if err != nil {
+				return nil, err
+			}
+			if q.JoinTree == nil {
+				q.JoinTree = &JoinTree{}
+			}
+			q.JoinTree.FromList = append(q.JoinTree.FromList, jn)
+		}
+	}
+
+	if stmt.TargetList != nil {
+		for _, item := range stmt.TargetList.Items {
+			rt, ok := item.(*nodes.ResTarget)
+			if !ok {
+				continue
+			}
+			entries, err := subAc.transformTargetEntry(rt, len(q.TargetList))
+			if err != nil {
+				return nil, err
+			}
+			q.TargetList = append(q.TargetList, entries...)
+		}
+	}
+
+	if stmt.WhereClause != nil {
+		qual, err := subAc.transformExpr(stmt.WhereClause)
+		if err != nil {
+			return nil, err
+		}
+		if q.JoinTree == nil {
+			q.JoinTree = &JoinTree{}
+		}
+		q.JoinTree.Quals = qual
+	}
+
+	// GROUP BY.
+	if stmt.GroupClause != nil {
+		hasGroupingSets := false
+		for _, item := range stmt.GroupClause.Items {
+			if _, ok := item.(*nodes.GroupingSet); ok {
+				hasGroupingSets = true
+				break
+			}
+		}
+		if hasGroupingSets {
+			for _, item := range stmt.GroupClause.Items {
+				gs, err := subAc.transformGroupingSet(item, q.TargetList)
+				if err != nil {
+					return nil, err
+				}
+				q.GroupingSets = append(q.GroupingSets, gs)
+				subAc.flattenGroupingSetRefs(gs, q)
+			}
+		} else {
+			for _, item := range stmt.GroupClause.Items {
+				tle, err := subAc.findTargetlistEntry(item, q.TargetList)
+				if err != nil {
+					return nil, err
+				}
+				ref := subAc.assignSortGroupRef(tle, q.TargetList)
+				isDup := false
+				for _, existing := range q.GroupClause {
+					if existing.TLESortGroupRef == ref {
+						isDup = true
+						break
+					}
+				}
+				if !isDup {
+					q.GroupClause = append(q.GroupClause, &SortGroupClause{TLESortGroupRef: ref})
+				}
+			}
+		}
+	}
+
+	if stmt.HavingClause != nil {
+		having, err := subAc.transformExpr(stmt.HavingClause)
+		if err != nil {
+			return nil, err
+		}
+		q.HavingQual = having
+	}
+
+	if stmt.SortClause != nil {
+		for _, item := range stmt.SortClause.Items {
+			sb, ok := item.(*nodes.SortBy)
+			if !ok {
+				continue
+			}
+			tle, err := subAc.findTargetlistEntry(sb.Node, q.TargetList)
+			if err != nil {
+				return nil, err
+			}
+			ref := subAc.assignSortGroupRef(tle, q.TargetList)
+			isDup := false
+			for _, existing := range q.SortClause {
+				if existing.TLESortGroupRef == ref {
+					isDup = true
+					break
+				}
+			}
+			if !isDup {
+				desc := sb.SortbyDir == nodes.SORTBY_DESC
+				nullsFirst := false
+				switch sb.SortbyNulls {
+				case nodes.SORTBY_NULLS_FIRST:
+					nullsFirst = true
+				case nodes.SORTBY_NULLS_LAST:
+					nullsFirst = false
+				default:
+					nullsFirst = desc
+				}
+				q.SortClause = append(q.SortClause, &SortGroupClause{
+					TLESortGroupRef: ref,
+					Descending:      desc,
+					NullsFirst:      nullsFirst,
+				})
+			}
+		}
+	}
+
+	if stmt.LimitCount != nil {
+		lc, err := subAc.transformExpr(stmt.LimitCount)
+		if err != nil {
+			return nil, err
+		}
+		q.LimitCount = lc
+	}
+	if stmt.LimitOffset != nil {
+		lo, err := subAc.transformExpr(stmt.LimitOffset)
+		if err != nil {
+			return nil, err
+		}
+		q.LimitOffset = lo
+	}
+
+	if stmt.DistinctClause != nil {
+		q.Distinct = true
+	}
+
+	orderTargetList(q)
+	return q, nil
+}
+
+// transformMinMaxExpr transforms a GREATEST/LEAST expression.
+//
+// pg: src/backend/parser/parse_expr.c — transformMinMaxExpr
+func (ac *analyzeCtx) transformMinMaxExpr(mme *nodes.MinMaxExpr) (AnalyzedExpr, error) {
+	var args []AnalyzedExpr
+
+	if mme.Args != nil {
+		for _, a := range mme.Args.Items {
+			expr, err := ac.transformExpr(a)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, expr)
+		}
+	}
+
+	mmContext := "GREATEST"
+	if mme.Op == nodes.IS_LEAST {
+		mmContext = "LEAST"
+	}
+	common, err := ac.catalog.selectCommonType(args, mmContext)
+	if err != nil {
+		return nil, err
+	}
+
+	// Coerce args to common type.
+	for i, arg := range args {
+		at := arg.exprType()
+		if at != common {
+			args[i], err = ac.catalog.coerceToTargetType(arg, at, common, 'i')
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	op := MinMaxGreatest
+	if mme.Op == nodes.IS_LEAST {
+		op = MinMaxLeast
+	}
+
+	// Derive collation from args.
+	var mmColl uint32
+	if ac.catalog.typeCollation(common) != 0 {
+		mmColl = resolveCollation(args...)
+		if mmColl == 0 {
+			mmColl = ac.catalog.typeCollation(common)
+		}
+	}
+
+	return &MinMaxExprQ{
+		Op:         op,
+		Args:       args,
+		ResultType: common,
+		Collation:  mmColl,
+	}, nil
+}
+
+// transformBooleanTest transforms IS [NOT] TRUE/FALSE/UNKNOWN.
+//
+// pg: src/backend/parser/parse_expr.c — transformBooleanTest
+func (ac *analyzeCtx) transformBooleanTest(bt *nodes.BooleanTest) (AnalyzedExpr, error) {
+	arg, err := ac.transformExpr(bt.Arg)
+	if err != nil {
+		return nil, err
+	}
+
+	var testType BoolTestType
+	switch bt.Booltesttype {
+	case nodes.IS_TRUE:
+		testType = BoolIsTrue
+	case nodes.IS_NOT_TRUE:
+		testType = BoolIsNotTrue
+	case nodes.IS_FALSE:
+		testType = BoolIsFalse
+	case nodes.IS_NOT_FALSE:
+		testType = BoolIsNotFalse
+	case nodes.IS_UNKNOWN:
+		testType = BoolIsUnknown
+	case nodes.IS_NOT_UNKNOWN:
+		testType = BoolIsNotUnknown
+	}
+
+	return &BooleanTestExpr{
+		Arg:      arg,
+		TestType: testType,
+	}, nil
+}
+
+// transformSQLValueFunction transforms CURRENT_DATE, CURRENT_TIMESTAMP, etc.
+//
+// pg: src/backend/parser/parse_expr.c — transformSQLValueFunction
+func (ac *analyzeCtx) transformSQLValueFunction(svf *nodes.SQLValueFunction) (AnalyzedExpr, error) {
+	var op SVFOp
+	var typeOID uint32
+	typMod := int32(-1)
+
+	switch svf.Op {
+	case nodes.SVFOP_CURRENT_DATE:
+		op = SVFCurrentDate
+		typeOID = DATEOID
+	case nodes.SVFOP_CURRENT_TIME:
+		op = SVFCurrentTime
+		typeOID = TIMETZOID
+	case nodes.SVFOP_CURRENT_TIME_N:
+		op = SVFCurrentTimeN
+		typeOID = TIMETZOID
+		typMod = int32(svf.Typmod)
+	case nodes.SVFOP_CURRENT_TIMESTAMP:
+		op = SVFCurrentTimestamp
+		typeOID = TIMESTAMPTZOID
+	case nodes.SVFOP_CURRENT_TIMESTAMP_N:
+		op = SVFCurrentTimestampN
+		typeOID = TIMESTAMPTZOID
+		typMod = int32(svf.Typmod)
+	case nodes.SVFOP_LOCALTIME:
+		op = SVFLocaltime
+		typeOID = TIMEOID
+	case nodes.SVFOP_LOCALTIME_N:
+		op = SVFLocaltimeN
+		typeOID = TIMEOID
+		typMod = int32(svf.Typmod)
+	case nodes.SVFOP_LOCALTIMESTAMP:
+		op = SVFLocaltimestamp
+		typeOID = TIMESTAMPOID
+	case nodes.SVFOP_LOCALTIMESTAMP_N:
+		op = SVFLocaltimestampN
+		typeOID = TIMESTAMPOID
+		typMod = int32(svf.Typmod)
+	case nodes.SVFOP_CURRENT_ROLE:
+		op = SVFCurrentRole
+		typeOID = NAMEOID
+	case nodes.SVFOP_CURRENT_USER:
+		op = SVFCurrentUser
+		typeOID = NAMEOID
+	case nodes.SVFOP_USER:
+		op = SVFUser
+		typeOID = NAMEOID
+	case nodes.SVFOP_SESSION_USER:
+		op = SVFSessionUser
+		typeOID = NAMEOID
+	case nodes.SVFOP_CURRENT_CATALOG:
+		op = SVFCurrentCatalog
+		typeOID = NAMEOID
+	case nodes.SVFOP_CURRENT_SCHEMA:
+		op = SVFCurrentSchema
+		typeOID = NAMEOID
+	default:
+		return nil, fmt.Errorf("unrecognized SQLValueFunction op: %d", svf.Op)
+	}
+
+	return &SQLValueFuncExpr{
+		Op:      op,
+		TypeOID: typeOID,
+		TypeMod: typMod,
+	}, nil
+}
+
+// transformNullIf transforms a NULLIF(a, b) expression.
+//
+// pg: src/backend/parser/parse_expr.c — transformAExprNullIf
+func (ac *analyzeCtx) transformNullIf(ae *nodes.A_Expr) (AnalyzedExpr, error) {
+	left, err := ac.transformExpr(ae.Lexpr)
+	if err != nil {
+		return nil, err
+	}
+	right, err := ac.transformExpr(ae.Rexpr)
+	if err != nil {
+		return nil, err
+	}
+
+	leftOID := left.exprType()
+	rightOID := right.exprType()
+
+	// Resolve the equality operator for the two args.
+	op, resolvedLeft, resolvedRight, err := ac.catalog.resolveOperator("=", leftOID, rightOID, false)
+	if err != nil {
+		return nil, err
+	}
+
+	if leftOID != resolvedLeft {
+		left, err = ac.catalog.coerceToTargetType(left, leftOID, resolvedLeft, 'i')
+		if err != nil {
+			return nil, err
+		}
+	}
+	if rightOID != resolvedRight {
+		right, err = ac.catalog.coerceToTargetType(right, rightOID, resolvedRight, 'i')
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// NULLIF result type is the type of the first argument.
+	// pg: src/backend/parser/parse_expr.c — transformAExprNullIf
+	return &NullIfExprQ{
+		OpOID:      op.OID,
+		Args:       []AnalyzedExpr{left, right},
+		ResultType: left.exprType(),
+	}, nil
+}
+
+// makeScalarArrayOp builds a ScalarArrayOpExpr from a scalar and an array expression.
+// This is the shared core for IN-list, = ANY(array), and op ALL(array).
+//
+// pg: src/backend/parser/parse_oper.c — make_scalar_array_op
+func (ac *analyzeCtx) makeScalarArrayOp(opName string, useOr bool,
+	left, right AnalyzedExpr) (AnalyzedExpr, error) {
+	leftOID := left.exprType()
+	rightOID := right.exprType()
+
+	// Extract element type from array.
+	// pg: make_scalar_array_op — get_base_element_type(rtypeId)
+	elemOID := ac.catalog.getBaseElementType(rightOID)
+	if elemOID == 0 {
+		if rightOID == UNKNOWNOID {
+			elemOID = UNKNOWNOID
+		} else {
+			return nil, &Error{
+				Code:    CodeDatatypeMismatch,
+				Message: fmt.Sprintf("op %s requires array on right side, got %s", opName, ac.catalog.typeName(rightOID)),
+			}
+		}
+	}
+
+	// Resolve operator on element types (not array types).
+	op, resolvedLeft, resolvedRight, err := ac.catalog.resolveOperator(opName, leftOID, elemOID, false)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate return type is boolean.
+	if op.Result != BOOLOID {
+		return nil, &Error{
+			Code:    CodeDatatypeMismatch,
+			Message: fmt.Sprintf("op %s must return boolean for ANY/ALL, got %s", opName, ac.catalog.typeName(op.Result)),
+		}
+	}
+
+	// Coerce left argument if needed.
+	if leftOID != resolvedLeft {
+		left, err = ac.catalog.coerceToTargetType(left, leftOID, resolvedLeft, 'i')
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Map resolved right type back to its array type for coercion.
+	if resolvedRight != elemOID && resolvedRight != UNKNOWNOID {
+		arrayType := ac.catalog.findArrayType(resolvedRight)
+		if arrayType != 0 && arrayType != rightOID {
+			right, err = ac.catalog.coerceToTargetType(right, rightOID, arrayType, 'i')
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return &ScalarArrayOpExpr{
+		OpOID:  op.OID,
+		OpName: op.Name,
+		UseOr:  useOr,
+		Left:   left,
+		Right:  right,
+	}, nil
+}
+
+// transformAExprIn transforms x IN (a, b, c) to ScalarArrayOpExpr.
+//
+// pg: src/backend/parser/parse_expr.c — transformAExprIn
+func (ac *analyzeCtx) transformAExprIn(ae *nodes.A_Expr) (AnalyzedExpr, error) {
+	left, err := ac.transformExpr(ae.Lexpr)
+	if err != nil {
+		return nil, err
+	}
+
+	// The right side is a List of expressions.
+	opName := "="
+	if ae.Name != nil && len(ae.Name.Items) > 0 {
+		opName = stringVal(ae.Name.Items[len(ae.Name.Items)-1])
+	}
+
+	useOr := opName == "=" // IN → = ANY, NOT IN → <> ALL
+
+	var rightExprs []AnalyzedExpr
+	switch r := ae.Rexpr.(type) {
+	case *nodes.List:
+		for _, item := range r.Items {
+			expr, err := ac.transformExpr(item)
+			if err != nil {
+				return nil, err
+			}
+			rightExprs = append(rightExprs, expr)
+		}
+	default:
+		expr, err := ac.transformExpr(ae.Rexpr)
+		if err != nil {
+			return nil, err
+		}
+		rightExprs = append(rightExprs, expr)
+	}
+
+	// Determine common element type and build ArrayExprQ.
+	// pg: src/backend/parser/parse_expr.c — transformAExprIn
+	// PG includes the left expression: allexprs = list_concat(list_make1(lexpr), rnonvars)
+	allExprs := make([]AnalyzedExpr, 0, 1+len(rightExprs))
+	allExprs = append(allExprs, left)
+	allExprs = append(allExprs, rightExprs...)
+	elemType, err := ac.catalog.selectCommonType(allExprs, "")
+	if err != nil {
+		return nil, err
+	}
+
+	// Coerce elements to common type.
+	for i, elem := range rightExprs {
+		et := elem.exprType()
+		if et != elemType {
+			rightExprs[i], err = ac.catalog.coerceToTargetType(elem, et, elemType, 'i')
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	arrayType := ac.catalog.findArrayType(elemType)
+	arrayExpr := &ArrayExprQ{
+		ElementType: elemType,
+		ArrayType:   arrayType,
+		Elements:    rightExprs,
+	}
+
+	return ac.makeScalarArrayOp(opName, useOr, left, arrayExpr)
+}
+
+// transformBetween transforms x BETWEEN a AND b (or NOT BETWEEN / SYMMETRIC).
+// PG transforms BETWEEN to (x >= a AND x <= b).
+//
+// pg: src/backend/parser/parse_expr.c — transformAExprBetween
+func (ac *analyzeCtx) transformBetween(ae *nodes.A_Expr) (AnalyzedExpr, error) {
+	left, err := ac.transformExpr(ae.Lexpr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Rexpr is a list of exactly 2 items: [low, high].
+	rList, ok := ae.Rexpr.(*nodes.List)
+	if !ok || len(rList.Items) != 2 {
+		return nil, fmt.Errorf("BETWEEN requires exactly 2 arguments on the right side")
+	}
+
+	low, err := ac.transformExpr(rList.Items[0])
+	if err != nil {
+		return nil, err
+	}
+	high, err := ac.transformExpr(rList.Items[1])
+	if err != nil {
+		return nil, err
+	}
+
+	leftOID := left.exprType()
+	lowOID := low.exprType()
+	highOID := high.exprType()
+
+	// Resolve >= operator.
+	geOp, resolvedLeftGe, resolvedRightGe, err := ac.catalog.resolveOperator(">=", leftOID, lowOID, false)
+	if err != nil {
+		return nil, err
+	}
+	// Resolve <= operator.
+	leOp, resolvedLeftLe, resolvedRightLe, err := ac.catalog.resolveOperator("<=", leftOID, highOID, false)
+	if err != nil {
+		return nil, err
+	}
+
+	// Coerce if needed.
+	leftForGe := left
+	if leftOID != resolvedLeftGe {
+		leftForGe, err = ac.catalog.coerceToTargetType(left, leftOID, resolvedLeftGe, 'i')
+		if err != nil {
+			return nil, err
+		}
+	}
+	if lowOID != resolvedRightGe {
+		low, err = ac.catalog.coerceToTargetType(low, lowOID, resolvedRightGe, 'i')
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	leftForLe := left
+	if leftOID != resolvedLeftLe {
+		leftForLe, err = ac.catalog.coerceToTargetType(left, leftOID, resolvedLeftLe, 'i')
+		if err != nil {
+			return nil, err
+		}
+	}
+	if highOID != resolvedRightLe {
+		high, err = ac.catalog.coerceToTargetType(high, highOID, resolvedRightLe, 'i')
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	geExpr := &OpExpr{OpOID: geOp.OID, OpName: geOp.Name, ResultType: geOp.Result, Left: leftForGe, Right: low}
+	leExpr := &OpExpr{OpOID: leOp.OID, OpName: leOp.Name, ResultType: leOp.Result, Left: leftForLe, Right: high}
+
+	result := AnalyzedExpr(&BoolExprQ{Op: BoolAnd, Args: []AnalyzedExpr{geExpr, leExpr}})
+
+	// NOT BETWEEN / NOT BETWEEN SYMMETRIC wraps in NOT.
+	if ae.Kind == nodes.AEXPR_NOT_BETWEEN || ae.Kind == nodes.AEXPR_NOT_BETWEEN_SYM {
+		result = &BoolExprQ{Op: BoolNot, Args: []AnalyzedExpr{result}}
+	}
+
+	return result, nil
+}
+
+// transformDistinct transforms IS [NOT] DISTINCT FROM.
+//
+// pg: src/backend/parser/parse_expr.c — transformAExprDistinct
+func (ac *analyzeCtx) transformDistinct(ae *nodes.A_Expr) (AnalyzedExpr, error) {
+	left, err := ac.transformExpr(ae.Lexpr)
+	if err != nil {
+		return nil, err
+	}
+	right, err := ac.transformExpr(ae.Rexpr)
+	if err != nil {
+		return nil, err
+	}
+
+	leftOID := left.exprType()
+	rightOID := right.exprType()
+
+	// Resolve the equality operator.
+	op, resolvedLeft, resolvedRight, err := ac.catalog.resolveOperator("=", leftOID, rightOID, false)
+	if err != nil {
+		return nil, err
+	}
+
+	if leftOID != resolvedLeft {
+		left, err = ac.catalog.coerceToTargetType(left, leftOID, resolvedLeft, 'i')
+		if err != nil {
+			return nil, err
+		}
+	}
+	if rightOID != resolvedRight {
+		right, err = ac.catalog.coerceToTargetType(right, rightOID, resolvedRight, 'i')
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &DistinctExprQ{
+		OpOID:      op.OID,
+		OpName:     op.Name,
+		ResultType: BOOLOID,
+		Left:       left,
+		Right:      right,
+		IsNot:      ae.Kind == nodes.AEXPR_NOT_DISTINCT,
+	}, nil
+}
+
+// transformAExprOpAny transforms op ANY (array) expressions.
+//
+// pg: src/backend/parser/parse_expr.c — transformAExprOpAny
+func (ac *analyzeCtx) transformAExprOpAny(ae *nodes.A_Expr) (AnalyzedExpr, error) {
+	left, err := ac.transformExpr(ae.Lexpr)
+	if err != nil {
+		return nil, err
+	}
+	right, err := ac.transformExpr(ae.Rexpr)
+	if err != nil {
+		return nil, err
+	}
+
+	opName := ""
+	if ae.Name != nil && len(ae.Name.Items) > 0 {
+		opName = stringVal(ae.Name.Items[len(ae.Name.Items)-1])
+	}
+
+	return ac.makeScalarArrayOp(opName, true, left, right)
+}
+
+// transformAExprOpAll transforms op ALL (array) expressions.
+//
+// pg: src/backend/parser/parse_expr.c — transformAExprOpAll
+func (ac *analyzeCtx) transformAExprOpAll(ae *nodes.A_Expr) (AnalyzedExpr, error) {
+	left, err := ac.transformExpr(ae.Lexpr)
+	if err != nil {
+		return nil, err
+	}
+	right, err := ac.transformExpr(ae.Rexpr)
+	if err != nil {
+		return nil, err
+	}
+
+	opName := ""
+	if ae.Name != nil && len(ae.Name.Items) > 0 {
+		opName = stringVal(ae.Name.Items[len(ae.Name.Items)-1])
+	}
+
+	return ac.makeScalarArrayOp(opName, false, left, right)
+}
+
+// transformAArrayExpr transforms a raw ARRAY[...] constructor (from parser).
+//
+// pg: src/backend/parser/parse_expr.c — transformArrayExpr
+func (ac *analyzeCtx) transformAArrayExpr(ae *nodes.A_ArrayExpr) (AnalyzedExpr, error) {
+	var elems []AnalyzedExpr
+
+	if ae.Elements != nil {
+		for _, item := range ae.Elements.Items {
+			expr, err := ac.transformExpr(item)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, expr)
+		}
+	}
+
+	// Determine common element type.
+	var elemType uint32
+	if len(elems) > 0 {
+		var err error
+		elemType, err = ac.catalog.selectCommonType(elems, "ARRAY")
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		elemType = TEXTOID
+	}
+
+	// Coerce elements to common type.
+	for i, elem := range elems {
+		et := elem.exprType()
+		if et != elemType {
+			var err error
+			elems[i], err = ac.catalog.coerceToTargetType(elem, et, elemType, 'i')
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	arrayType := ac.catalog.findArrayType(elemType)
+
+	return &ArrayExprQ{
+		ElementType: elemType,
+		ArrayType:   arrayType,
+		Elements:    elems,
+	}, nil
+}
+
+// transformArrayExpr transforms an ARRAY[...] constructor.
+//
+// pg: src/backend/parser/parse_expr.c — transformArrayExpr
+func (ac *analyzeCtx) transformArrayExpr(ae *nodes.ArrayExpr) (AnalyzedExpr, error) {
+	var elems []AnalyzedExpr
+
+	if ae.Elements != nil {
+		for _, item := range ae.Elements.Items {
+			expr, err := ac.transformExpr(item)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, expr)
+		}
+	}
+
+	// Determine common element type.
+	var elemType uint32
+	if len(elems) > 0 {
+		var err error
+		elemType, err = ac.catalog.selectCommonType(elems, "ARRAY")
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		elemType = TEXTOID
+	}
+
+	// Coerce elements to common type.
+	for i, elem := range elems {
+		et := elem.exprType()
+		if et != elemType {
+			var err error
+			elems[i], err = ac.catalog.coerceToTargetType(elem, et, elemType, 'i')
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Find array type for element type.
+	arrayType := ac.catalog.findArrayType(elemType)
+
+	return &ArrayExprQ{
+		ElementType: elemType,
+		ArrayType:   arrayType,
+		Elements:    elems,
+	}, nil
+}
+
+// transformRowExpr transforms a ROW(...) expression.
+//
+// pg: src/backend/parser/parse_expr.c — transformRowExpr
+func (ac *analyzeCtx) transformRowExpr(re *nodes.RowExpr) (AnalyzedExpr, error) {
+	var args []AnalyzedExpr
+	if re.Args != nil {
+		for _, item := range re.Args.Items {
+			expr, err := ac.transformExpr(item)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, expr)
+		}
+	}
+
+	var format byte
+	if re.RowFormat == nodes.COERCE_EXPLICIT_CALL {
+		format = 'e' // explicit ROW keyword
+	}
+
+	return &RowExprQ{
+		Args:       args,
+		ResultType: RECORDOID,
+		RowFormat:  format,
+	}, nil
+}
+
+// transformIndirection transforms an A_Indirection node into either
+// a FieldSelectExprQ (for field access like rec.field) or a SubscriptingRefExpr
+// (for array subscript like arr[1]).
+//
+// pg: src/backend/parser/parse_expr.c — transformIndirection
+func (ac *analyzeCtx) transformIndirection(ind *nodes.A_Indirection) (AnalyzedExpr, error) {
+	// Transform the base expression.
+	result, err := ac.transformExpr(ind.Arg)
+	if err != nil {
+		return nil, err
+	}
+
+	if ind.Indirection == nil {
+		return result, nil
+	}
+
+	for _, item := range ind.Indirection.Items {
+		switch idx := item.(type) {
+		case *nodes.A_Indices:
+			// Array subscript: arr[expr] or arr[lower:upper]
+			containerType := result.exprType()
+			// Determine element type.
+			elemType := ac.catalog.getArrayElementType(containerType)
+			if elemType == 0 {
+				elemType = containerType // fallback
+			}
+
+			if idx.IsSlice {
+				// Slice: arr[lower:upper]
+				var lower, upper AnalyzedExpr
+				if idx.Lidx != nil {
+					lower, err = ac.transformExpr(idx.Lidx)
+					if err != nil {
+						return nil, err
+					}
+				}
+				if idx.Uidx != nil {
+					upper, err = ac.transformExpr(idx.Uidx)
+					if err != nil {
+						return nil, err
+					}
+				}
+				result = &SubscriptingRefExpr{
+					ContainerExpr:  result,
+					SubscriptExprs: []AnalyzedExpr{upper},
+					LowerExprs:     []AnalyzedExpr{lower},
+					ResultType:     containerType, // slice returns array type
+					IsSlice:        true,
+				}
+			} else {
+				// Simple subscript: arr[expr]
+				sub, err := ac.transformExpr(idx.Uidx)
+				if err != nil {
+					return nil, err
+				}
+				result = &SubscriptingRefExpr{
+					ContainerExpr:  result,
+					SubscriptExprs: []AnalyzedExpr{sub},
+					ResultType:     elemType,
+					IsSlice:        false,
+				}
+			}
+		case *nodes.String:
+			// Field access: rec.field — already handled as FieldSelectExprQ
+			fieldName := idx.Str
+			resultType := result.exprType()
+			// Try to resolve the field from composite type.
+			fieldType, fieldTypMod, fieldColl, fieldNum := ac.catalog.resolveCompositeField(resultType, fieldName)
+			result = &FieldSelectExprQ{
+				Arg:        result,
+				FieldNum:   int16(fieldNum),
+				FieldName:  fieldName,
+				ResultType: fieldType,
+				TypeMod:    fieldTypMod,
+				Collation:  fieldColl,
+			}
+		default:
+			// A_Star or other — skip
+		}
+	}
+
+	return result, nil
+}
+
+// transformNamedArgExpr transforms a named argument expression (arg_name => value).
+//
+// pg: src/backend/parser/parse_expr.c — transformExprRecurse (NamedArgExpr case)
+func (ac *analyzeCtx) transformNamedArgExpr(nae *nodes.NamedArgExpr) (AnalyzedExpr, error) {
+	arg, err := ac.transformExpr(nae.Arg)
+	if err != nil {
+		return nil, err
+	}
+	return &NamedArgExprQ{
+		Name:   nae.Name,
+		Arg:    arg,
+		ArgNum: nae.Argnumber,
+	}, nil
+}
+
+// transformParamRef transforms a $N parameter reference.
+//
+// pg: src/backend/parser/parse_param.c — variable_paramref_hook
+func (ac *analyzeCtx) transformParamRef(pr *nodes.ParamRef) (AnalyzedExpr, error) {
+	return &ParamExpr{
+		ParamNum:  pr.Number,
+		ParamType: UNKNOWNOID,
+	}, nil
+}
+
+// transformCollateClause transforms a COLLATE clause.
+//
+// pg: src/backend/parser/parse_expr.c — transformCollateClause
+func (ac *analyzeCtx) transformCollateClause(cc *nodes.CollateClause) (AnalyzedExpr, error) {
+	arg, err := ac.transformExpr(cc.Arg)
+	if err != nil {
+		return nil, err
+	}
+
+	collName := ""
+	if cc.Collname != nil && len(cc.Collname.Items) > 0 {
+		collName = stringVal(cc.Collname.Items[len(cc.Collname.Items)-1])
+	}
+
+	return &CollateExprQ{
+		Arg:      arg,
+		CollOID:  builtinCollationOID(collName),
+		CollName: collName,
+	}, nil
+}
+
+// resolveWindowDef resolves a WINDOW clause reference, creating or finding the WindowClauseQ.
+//
+// pg: src/backend/parser/parse_clause.c — transformWindowDefinitions
+func (ac *analyzeCtx) resolveWindowDef(overNode nodes.Node) (uint32, error) {
+	wd, ok := overNode.(*nodes.WindowDef)
+	if !ok {
+		return 0, fmt.Errorf("unsupported OVER clause type: %T", overNode)
+	}
+
+	// If referencing a named window, find it.
+	if wd.Refname != "" {
+		for i, wc := range ac.query.WindowClause {
+			if wc.Name == wd.Refname {
+				return uint32(i), nil
+			}
+		}
+		return 0, &Error{Code: CodeUndefinedObject, Message: fmt.Sprintf("window %q does not exist", wd.Refname)}
+	}
+
+	// Build WindowClauseQ.
+	wc := &WindowClauseQ{
+		Name:         wd.Name,
+		FrameOptions: wd.FrameOptions,
+	}
+
+	// PARTITION BY.
+	if wd.PartitionClause != nil {
+		for _, item := range wd.PartitionClause.Items {
+			tle, err := ac.findTargetlistEntry(item, ac.query.TargetList)
+			if err != nil {
+				return 0, err
+			}
+			ref := ac.assignSortGroupRef(tle, ac.query.TargetList)
+			wc.PartitionBy = append(wc.PartitionBy, &SortGroupClause{
+				TLESortGroupRef: ref,
+			})
+		}
+	}
+
+	// ORDER BY.
+	if wd.OrderClause != nil {
+		for _, item := range wd.OrderClause.Items {
+			sb, ok := item.(*nodes.SortBy)
+			if !ok {
+				continue
+			}
+			tle, err := ac.findTargetlistEntry(sb.Node, ac.query.TargetList)
+			if err != nil {
+				return 0, err
+			}
+			ref := ac.assignSortGroupRef(tle, ac.query.TargetList)
+			desc := sb.SortbyDir == nodes.SORTBY_DESC
+			nullsFirst := false
+			switch sb.SortbyNulls {
+			case nodes.SORTBY_NULLS_FIRST:
+				nullsFirst = true
+			case nodes.SORTBY_NULLS_LAST:
+				nullsFirst = false
+			default:
+				nullsFirst = desc
+			}
+			wc.OrderBy = append(wc.OrderBy, &SortGroupClause{
+				TLESortGroupRef: ref,
+				Descending:      desc,
+				NullsFirst:      nullsFirst,
+			})
+		}
+	}
+
+	// Frame offsets.
+	if wd.StartOffset != nil {
+		var err error
+		wc.StartOffset, err = ac.transformExpr(wd.StartOffset)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if wd.EndOffset != nil {
+		var err error
+		wc.EndOffset, err = ac.transformExpr(wd.EndOffset)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	// Check if this matches an existing unnamed window clause.
+	idx := uint32(len(ac.query.WindowClause))
+	ac.query.WindowClause = append(ac.query.WindowClause, wc)
+	return idx, nil
+}
+
+// analyzeCTEs processes a WITH clause.
+//
+// pg: src/backend/parser/parse_cte.c — analyzeCTEList
+func (ac *analyzeCtx) analyzeCTEs(withClause *nodes.WithClause) error {
+	ac.query.IsRecursive = withClause.Recursive
+
+	if withClause.Ctes == nil {
+		return nil
+	}
+
+	for _, item := range withClause.Ctes.Items {
+		cte, ok := item.(*nodes.CommonTableExpr)
+		if !ok {
+			continue
+		}
+
+		sub, ok := cte.Ctequery.(*nodes.SelectStmt)
+		if !ok {
+			return fmt.Errorf("CTE query is not a SELECT")
+		}
+
+		// Collect column aliases.
+		var aliases []string
+		if cte.Aliascolnames != nil {
+			for _, item := range cte.Aliascolnames.Items {
+				aliases = append(aliases, stringVal(item))
+			}
+		}
+
+		// pgparser sets Cterecursive=false on individual CTEs; only
+		// WithClause.Recursive is set by the parser. PG's analyzer determines
+		// whether each CTE actually self-references. We use a simple heuristic:
+		// if the WITH clause is RECURSIVE and the CTE body is a UNION, treat
+		// it as potentially recursive.
+		isRecursive := withClause.Recursive && sub.Op != nodes.SETOP_NONE && sub.Larg != nil
+		if isRecursive {
+			// Recursive CTE: two-phase analysis.
+			// pg: src/backend/parser/analyze.c — determineRecursiveColTypes
+			//
+			// 1. The CTE query must be a UNION (PG requires this).
+			if sub.Op == nodes.SETOP_NONE || sub.Larg == nil {
+				return fmt.Errorf("recursive query \"%s\" does not have the form non-recursive-term UNION [ALL] recursive-term", cte.Ctename)
+			}
+
+			// 2. Analyze only the non-recursive term (larg).
+			nrQuery, err := ac.catalog.analyzeSelectStmtWithOptions(sub.Larg, ac.opts)
+			if err != nil {
+				return err
+			}
+
+			// 3. Build a temporary CTE entry with non-recursive term types
+			//    so the recursive term can reference it.
+			tmpCTE := &CommonTableExprQ{
+				Name:      cte.Ctename,
+				Aliases:   aliases,
+				Query:     nrQuery,
+				Recursive: true,
+			}
+			ac.query.CTEList = append(ac.query.CTEList, tmpCTE)
+
+			// 4. Set visibleCTEs so nested analyzeSelectStmt calls can see
+			//    the partially-defined CTE.
+			ac.catalog.visibleCTEs = ac.query.CTEList
+
+			// 5. Now analyze the full UNION — the recursive term can see the CTE.
+			fullQuery, err := ac.analyzeSubSelect(sub)
+
+			// Clear visibleCTEs regardless of error.
+			ac.catalog.visibleCTEs = nil
+
+			if err != nil {
+				return err
+			}
+			if err := validateCTEAliasCount(cte.Ctename, aliases, fullQuery); err != nil {
+				return err
+			}
+
+			// 6. Update the CTE entry with the full query.
+			tmpCTE.Query = fullQuery
+			tmpCTE.Materialized = cte.Ctematerialized
+		} else {
+			// Non-recursive CTE: analyze normally.
+			subQuery, err := ac.analyzeSubSelect(sub)
+			if err != nil {
+				return err
+			}
+			if err := validateCTEAliasCount(cte.Ctename, aliases, subQuery); err != nil {
+				return err
+			}
+
+			cteQ := &CommonTableExprQ{
+				Name:         cte.Ctename,
+				Aliases:      aliases,
+				Query:        subQuery,
+				Recursive:    cte.Cterecursive,
+				Materialized: cte.Ctematerialized,
+			}
+			ac.query.CTEList = append(ac.query.CTEList, cteQ)
+		}
+	}
+
+	return nil
+}
+
+func validateCTEAliasCount(name string, aliases []string, query *Query) error {
+	if len(aliases) == 0 || query == nil || len(aliases) <= len(query.TargetList) {
+		return nil
+	}
+	return fmt.Errorf("WITH query %q has %d columns available but %d columns specified", name, len(query.TargetList), len(aliases))
+}
+
+// transformCTERef creates a range table entry for a CTE reference.
+//
+// pg: src/backend/parser/parse_clause.c — getRTEForSpecialRelationTypes (CTE case)
+func (ac *analyzeCtx) transformCTERef(cteName, alias string, cteIdx int) (JoinNode, error) {
+	cte := ac.query.CTEList[cteIdx]
+	subQuery := cte.Query
+
+	eref := cteName
+	if alias != "" {
+		eref = alias
+	}
+
+	colNames := make([]string, 0, len(subQuery.TargetList))
+	colTypes := make([]uint32, 0, len(subQuery.TargetList))
+	colTypMods := make([]int32, 0, len(subQuery.TargetList))
+	colCollations := make([]uint32, 0, len(subQuery.TargetList))
+	for i, te := range subQuery.TargetList {
+		if te.ResJunk {
+			continue
+		}
+		name := te.ResName
+		if i < len(cte.Aliases) {
+			name = cte.Aliases[i]
+		}
+		colNames = append(colNames, name)
+		colTypes = append(colTypes, te.Expr.exprType())
+		colTypMods = append(colTypMods, int32(-1))
+		colCollations = append(colCollations, te.Expr.exprCollation())
+	}
+
+	rtIdx := len(ac.query.RangeTable)
+	rte := &RangeTableEntry{
+		Kind:          RTECTE,
+		Alias:         alias,
+		ERef:          eref,
+		ColNames:      colNames,
+		ColTypes:      colTypes,
+		ColTypMods:    colTypMods,
+		ColCollations: colCollations,
+		CTEName:       cteName,
+		CTEIndex:      cteIdx,
+	}
+	ac.query.RangeTable = append(ac.query.RangeTable, rte)
+
+	return &RangeTableRef{RTIndex: rtIdx}, nil
+}
+
+// transformVisibleCTERef creates a range table entry for a CTE reference found
+// in the catalog's visibleCTEs list (used during recursive CTE analysis).
+//
+// (pgddl helper — bridges the gap when the recursive term is analyzed in a
+// fresh analyzeCtx that doesn't have the parent's CTEList.)
+func (ac *analyzeCtx) transformVisibleCTERef(cte *CommonTableExprQ, cteName, alias string, cteIdx int) (JoinNode, error) {
+	subQuery := cte.Query
+
+	eref := cteName
+	if alias != "" {
+		eref = alias
+	}
+
+	colNames := make([]string, 0, len(subQuery.TargetList))
+	colTypes := make([]uint32, 0, len(subQuery.TargetList))
+	colTypMods := make([]int32, 0, len(subQuery.TargetList))
+	colCollations := make([]uint32, 0, len(subQuery.TargetList))
+	for i, te := range subQuery.TargetList {
+		if te.ResJunk {
+			continue
+		}
+		name := te.ResName
+		if i < len(cte.Aliases) {
+			name = cte.Aliases[i]
+		}
+		colNames = append(colNames, name)
+		colTypes = append(colTypes, te.Expr.exprType())
+		colTypMods = append(colTypMods, int32(-1))
+		colCollations = append(colCollations, te.Expr.exprCollation())
+	}
+
+	rtIdx := len(ac.query.RangeTable)
+	rte := &RangeTableEntry{
+		Kind:          RTECTE,
+		Alias:         alias,
+		ERef:          eref,
+		ColNames:      colNames,
+		ColTypes:      colTypes,
+		ColTypMods:    colTypMods,
+		ColCollations: colCollations,
+		CTEName:       cteName,
+		CTEIndex:      cteIdx,
+	}
+	ac.query.RangeTable = append(ac.query.RangeTable, rte)
+
+	return &RangeTableRef{RTIndex: rtIdx}, nil
+}
+
+// findArrayType returns the array type OID for a given element type.
+// Returns 0 if no array type is found.
+//
+// (pgddl helper — PG uses get_array_type)
+func (c *Catalog) findArrayType(elemType uint32) uint32 {
+	if bt := c.typeByOID[elemType]; bt != nil && bt.Array != 0 {
+		return bt.Array
+	}
+	return 0
+}
+
+// opNameToRowCompareType maps operator names to RowCompare type constants.
+func opNameToRowCompareType(opName string) int {
+	switch opName {
+	case "<":
+		return RowCompareLT
+	case "<=":
+		return RowCompareLE
+	case "=":
+		return RowCompareEQ
+	case ">=":
+		return RowCompareGE
+	case ">":
+		return RowCompareGT
+	case "<>", "!=":
+		return RowCompareNE
+	default:
+		return 0
+	}
+}
+
+// rowCompareOpName returns the operator name for a RowCompare type.
+func rowCompareOpName(rcType int) string {
+	switch rcType {
+	case RowCompareLT:
+		return "<"
+	case RowCompareLE:
+		return "<="
+	case RowCompareEQ:
+		return "="
+	case RowCompareGE:
+		return ">="
+	case RowCompareGT:
+		return ">"
+	case RowCompareNE:
+		return "<>"
+	default:
+		return "="
+	}
+}
+
+// getArrayElementType returns the element type OID for an array type, or 0 if not an array.
+func (c *Catalog) getArrayElementType(arrayType uint32) uint32 {
+	bt := c.typeByOID[arrayType]
+	if bt == nil {
+		return 0
+	}
+	if bt.Category == 'A' && bt.Elem != 0 {
+		return bt.Elem
+	}
+	return 0
+}
+
+// resolveCompositeField resolves a field name within a composite type.
+// Returns the field's type OID, type modifier, collation, and field number (1-based).
+// If the composite type or field cannot be resolved, returns UNKNOWNOID with reasonable defaults.
+func (c *Catalog) resolveCompositeField(compositeType uint32, fieldName string) (uint32, int32, uint32, int) {
+	// Look up composite type's relation.
+	bt := c.typeByOID[compositeType]
+	if bt == nil {
+		return UNKNOWNOID, -1, 0, 0
+	}
+	// Find the relation that defines this composite type.
+	rel := c.typeRelation(compositeType)
+	if rel == nil {
+		return UNKNOWNOID, -1, 0, 0
+	}
+	for i, col := range rel.Columns {
+		if col.Name == fieldName {
+			return col.TypeOID, col.TypeMod, col.Collation, i + 1
+		}
+	}
+	return UNKNOWNOID, -1, 0, 0
+}
+
+// typeRelation looks up the relation that defines a composite type.
+func (c *Catalog) typeRelation(typeOID uint32) *Relation {
+	for _, s := range c.schemas {
+		for _, r := range s.Relations {
+			if r.RowTypeOID == typeOID {
+				return r
+			}
+		}
+	}
+	return nil
+}
+
+// --- Helper functions ---
+
+// coerceToTargetType creates a coercion node for the given pathway.
+func (c *Catalog) coerceToTargetType(expr AnalyzedExpr, srcType, targetType uint32, context byte) (AnalyzedExpr, error) {
+	return c.coerceToTargetTypeWithFormat(expr, srcType, targetType, context, context)
+}
+
+func (c *Catalog) coerceToTargetTypeWithFormat(expr AnalyzedExpr, srcType, targetType uint32, context, format byte) (AnalyzedExpr, error) {
+	if srcType == targetType {
+		return expr, nil
+	}
+	if srcType == UNKNOWNOID {
+		// pg: src/backend/parser/parse_coerce.c — coerce_type
+		// For UNKNOWN Const, PG directly changes the Const's type rather than
+		// wrapping in a coercion node.
+		if c, ok := expr.(*ConstExpr); ok {
+			return &ConstExpr{
+				TypeOID: targetType,
+				TypeMod: -1,
+				IsNull:  c.IsNull,
+				Value:   c.Value,
+			}, nil
+		}
+		return &RelabelExpr{
+			Arg:        expr,
+			ResultType: targetType,
+			TypeMod:    -1,
+			Format:     format,
+		}, nil
+	}
+
+	pathway, funcOID := c.FindCoercionPathway(srcType, targetType, context)
+	switch pathway {
+	case CoercionRelabel:
+		return &RelabelExpr{
+			Arg:        expr,
+			ResultType: targetType,
+			TypeMod:    -1,
+			Format:     format,
+		}, nil
+	case CoercionFunc:
+		proc := c.procByOID[funcOID]
+		funcName := ""
+		if proc != nil {
+			funcName = proc.Name
+		}
+		return &FuncCallExpr{
+			FuncOID:      funcOID,
+			FuncName:     funcName,
+			ResultType:   targetType,
+			ResultTypMod: -1,
+			Args:         []AnalyzedExpr{expr},
+			CoerceFormat: format,
+		}, nil
+	case CoercionIO:
+		return &CoerceViaIOExpr{
+			Arg:        expr,
+			ResultType: targetType,
+			Format:     format,
+		}, nil
+	default:
+		return nil, errDatatypeMismatch(fmt.Sprintf(
+			"cannot cast type %s to %s",
+			c.typeName(srcType), c.typeName(targetType),
+		))
+	}
+}
+
+// resolveOperator resolves an operator expression and returns the operator
+// along with the resolved types for left and right operands.
+func (c *Catalog) resolveOperator(name string, leftType, rightType uint32, isPrefix bool) (*BuiltinOperator, uint32, uint32, error) {
+	if isPrefix {
+		// Prefix operator.
+		if ops := c.operByKey[operKey{name: name, left: 0, right: rightType}]; len(ops) > 0 {
+			return ops[0], 0, rightType, nil
+		}
+		if rightType == UNKNOWNOID {
+			for _, commonType := range []uint32{TEXTOID, INT4OID, FLOAT8OID} {
+				if ops := c.operByKey[operKey{name: name, left: 0, right: commonType}]; len(ops) > 0 {
+					return ops[0], 0, commonType, nil
+				}
+			}
+		}
+		return nil, 0, 0, errUndefinedFunction(name, []uint32{rightType})
+	}
+
+	// Binary operator: exact match.
+	if ops := c.operByKey[operKey{name: name, left: leftType, right: rightType}]; len(ops) > 0 {
+		return ops[0], leftType, rightType, nil
+	}
+
+	// If one side is UNKNOWN, try substituting.
+	if leftType == UNKNOWNOID && rightType != UNKNOWNOID {
+		if ops := c.operByKey[operKey{name: name, left: rightType, right: rightType}]; len(ops) > 0 {
+			return ops[0], rightType, rightType, nil
+		}
+		// pg: src/backend/parser/parse_func.c — func_select_candidate (step 4d)
+		// Try the preferred type of the same category.
+		if pref := c.preferredTypeForCategory(rightType); pref != 0 && pref != rightType {
+			if ops := c.operByKey[operKey{name: name, left: pref, right: pref}]; len(ops) > 0 {
+				return ops[0], pref, pref, nil
+			}
+		}
+	}
+	if rightType == UNKNOWNOID && leftType != UNKNOWNOID {
+		if ops := c.operByKey[operKey{name: name, left: leftType, right: leftType}]; len(ops) > 0 {
+			return ops[0], leftType, leftType, nil
+		}
+		// pg: src/backend/parser/parse_func.c — func_select_candidate (step 4d)
+		if pref := c.preferredTypeForCategory(leftType); pref != 0 && pref != leftType {
+			if ops := c.operByKey[operKey{name: name, left: pref, right: pref}]; len(ops) > 0 {
+				return ops[0], pref, pref, nil
+			}
+		}
+	}
+	if leftType == UNKNOWNOID && rightType == UNKNOWNOID {
+		if ops := c.operByKey[operKey{name: name, left: TEXTOID, right: TEXTOID}]; len(ops) > 0 {
+			return ops[0], TEXTOID, TEXTOID, nil
+		}
+	}
+
+	// Try implicit coercion.
+	return c.resolveOpWithCoercionFull(name, leftType, rightType)
+}
+
+// funcCandidate represents a candidate during overload resolution.
+//
+// pg: src/backend/parser/parse_func.c — FuncCandidateList
+type funcCandidate struct {
+	argTypes []uint32
+	op       *BuiltinOperator // set for operator candidates
+	proc     *BuiltinProc     // set for function candidates
+}
+
+// canCoerceArgs checks whether inputTypes can be implicitly coerced to candidateTypes.
+// UNKNOWN inputs are coercible to anything; polymorphic params use IsBinaryCoercible
+// to check type-specific compatibility (e.g., ANYENUM only matches enum types).
+//
+// pg: src/backend/parser/parse_func.c — func_match_argtypes (per-candidate check)
+func (c *Catalog) canCoerceArgs(inputTypes, candidateTypes []uint32) bool {
+	for i := range inputTypes {
+		if inputTypes[i] == UNKNOWNOID {
+			continue
+		}
+		if inputTypes[i] == candidateTypes[i] {
+			continue
+		}
+		// pg: func_match_argtypes uses can_coerce_type which internally
+		// calls IsBinaryCoercible for polymorphic types.
+		if isPolymorphic(candidateTypes[i]) {
+			if c.IsBinaryCoercible(inputTypes[i], candidateTypes[i]) {
+				continue
+			}
+			return false
+		}
+		if !c.CanCoerce(inputTypes[i], candidateTypes[i], 'i') {
+			return false
+		}
+	}
+	return true
+}
+
+// funcSelectCandidate resolves ambiguous function/operator overloads using
+// PG's multi-phase heuristic algorithm.
+//
+// pg: src/backend/parser/parse_func.c — func_select_candidate
+func (c *Catalog) funcSelectCandidate(inputTypes []uint32, candidates []funcCandidate) *funcCandidate {
+	nargs := len(inputTypes)
+	if len(candidates) <= 1 {
+		if len(candidates) == 1 {
+			return &candidates[0]
+		}
+		return nil
+	}
+
+	// Phase 1: Domain unwrap + count unknowns.
+	// pg: func_select_candidate lines 1051-1062
+	inputBase := make([]uint32, nargs)
+	nunknowns := 0
+	for i := 0; i < nargs; i++ {
+		if inputTypes[i] != UNKNOWNOID {
+			inputBase[i] = c.getBaseType(inputTypes[i])
+		} else {
+			inputBase[i] = UNKNOWNOID
+			nunknowns++
+		}
+	}
+
+	// Phase 2: Keep candidates with the most exact type matches at non-UNKNOWN positions.
+	// pg: func_select_candidate lines 1068-1106
+	nbestMatch := -1
+	var filtered []funcCandidate
+	for ci := range candidates {
+		nmatch := 0
+		for i := 0; i < nargs; i++ {
+			if inputBase[i] != UNKNOWNOID && candidates[ci].argTypes[i] == inputBase[i] {
+				nmatch++
+			}
+		}
+		if nmatch > nbestMatch {
+			nbestMatch = nmatch
+			filtered = []funcCandidate{candidates[ci]}
+		} else if nmatch == nbestMatch {
+			filtered = append(filtered, candidates[ci])
+		}
+	}
+	candidates = filtered
+	if len(candidates) == 1 {
+		return &candidates[0]
+	}
+
+	// Phase 3: Prefer candidates with preferred types in the same category.
+	// pg: func_select_candidate lines 1115-1155
+	slotCategory := make([]byte, nargs)
+	for i := 0; i < nargs; i++ {
+		if bt := c.typeByOID[inputBase[i]]; bt != nil {
+			slotCategory[i] = bt.Category
+		}
+	}
+
+	nbestMatch = -1
+	filtered = nil
+	for ci := range candidates {
+		nmatch := 0
+		for i := 0; i < nargs; i++ {
+			if inputBase[i] != UNKNOWNOID {
+				if candidates[ci].argTypes[i] == inputBase[i] {
+					nmatch++
+				} else if ct := c.typeByOID[candidates[ci].argTypes[i]]; ct != nil &&
+					ct.IsPreferred && ct.Category == slotCategory[i] {
+					nmatch++
+				}
+			}
+		}
+		if nmatch > nbestMatch {
+			nbestMatch = nmatch
+			filtered = []funcCandidate{candidates[ci]}
+		} else if nmatch == nbestMatch {
+			filtered = append(filtered, candidates[ci])
+		}
+	}
+	candidates = filtered
+	if len(candidates) == 1 {
+		return &candidates[0]
+	}
+
+	// Phase 4: Resolve unknown argument positions using type category heuristics.
+	// STRING category wins on conflict (unknown literals look like strings).
+	// pg: func_select_candidate lines 1163-1300
+	if nunknowns == 0 {
+		return nil // no more heuristics without unknowns
+	}
+
+	slotCategoryU := make([]byte, nargs)
+	slotHasPreferred := make([]bool, nargs)
+	resolvedUnknowns := false
+	for i := 0; i < nargs; i++ {
+		if inputBase[i] != UNKNOWNOID {
+			continue
+		}
+		resolvedUnknowns = true
+		slotCategoryU[i] = 0 // TYPCATEGORY_INVALID
+		slotHasPreferred[i] = false
+		haveConflict := false
+		for ci := range candidates {
+			ct := c.typeByOID[candidates[ci].argTypes[i]]
+			if ct == nil {
+				continue
+			}
+			curCategory := ct.Category
+			curIsPreferred := ct.IsPreferred
+			if slotCategoryU[i] == 0 {
+				// First candidate for this position.
+				slotCategoryU[i] = curCategory
+				slotHasPreferred[i] = curIsPreferred
+			} else if curCategory == slotCategoryU[i] {
+				// Same category — merge preferred.
+				slotHasPreferred[i] = slotHasPreferred[i] || curIsPreferred
+			} else {
+				// Category conflict.
+				if curCategory == 'S' {
+					// STRING always wins.
+					slotCategoryU[i] = curCategory
+					slotHasPreferred[i] = curIsPreferred
+				} else {
+					haveConflict = true
+				}
+			}
+		}
+		if haveConflict && slotCategoryU[i] != 'S' {
+			resolvedUnknowns = false
+			break
+		}
+	}
+
+	if resolvedUnknowns {
+		// Filter candidates that don't match resolved categories.
+		filtered = nil
+		for ci := range candidates {
+			keepit := true
+			for i := 0; i < nargs; i++ {
+				if inputBase[i] != UNKNOWNOID {
+					continue
+				}
+				ct := c.typeByOID[candidates[ci].argTypes[i]]
+				if ct == nil {
+					keepit = false
+					break
+				}
+				if ct.Category != slotCategoryU[i] {
+					keepit = false
+					break
+				}
+				if slotHasPreferred[i] && !ct.IsPreferred {
+					keepit = false
+					break
+				}
+			}
+			if keepit {
+				filtered = append(filtered, candidates[ci])
+			}
+		}
+		if len(filtered) > 0 {
+			candidates = filtered
+		}
+		if len(candidates) == 1 {
+			return &candidates[0]
+		}
+	}
+
+	// Phase 5: Last gasp — if all known-type inputs have the same base type,
+	// assume unknowns are that type and see if exactly one candidate matches.
+	// pg: func_select_candidate lines 1312-1357
+	if nunknowns < nargs {
+		knownType := uint32(UNKNOWNOID)
+		for i := 0; i < nargs; i++ {
+			if inputBase[i] == UNKNOWNOID {
+				continue
+			}
+			if knownType == UNKNOWNOID {
+				knownType = inputBase[i]
+			} else if knownType != inputBase[i] {
+				knownType = UNKNOWNOID
+				break
+			}
+		}
+
+		if knownType != UNKNOWNOID {
+			// Pretend all inputs are knownType.
+			allKnown := make([]uint32, nargs)
+			for i := range allKnown {
+				allKnown[i] = knownType
+			}
+			var lastMatch *funcCandidate
+			nmatches := 0
+			for ci := range candidates {
+				if c.canCoerceArgs(allKnown, candidates[ci].argTypes) {
+					nmatches++
+					if nmatches > 1 {
+						break // not unique
+					}
+					lastMatch = &candidates[ci]
+				}
+			}
+			if nmatches == 1 {
+				return lastMatch
+			}
+		}
+	}
+
+	return nil // failed to select a best candidate
+}
+
+// resolveOpWithCoercionFull resolves a binary operator by collecting all
+// candidates with the matching name, filtering to coercible ones, and
+// delegating to funcSelectCandidate.
+//
+// pg: src/backend/parser/parse_oper.c — oper_select_candidate (via func_select_candidate)
+func (c *Catalog) resolveOpWithCoercionFull(name string, leftType, rightType uint32) (*BuiltinOperator, uint32, uint32, error) {
+	inputTypes := []uint32{leftType, rightType}
+
+	// 1. Collect all binary operators with matching name.
+	var allCandidates []funcCandidate
+	for key, ops := range c.operByKey {
+		if key.name != name {
+			continue
+		}
+		for _, op := range ops {
+			if op.Kind == 'l' {
+				continue // skip prefix operators
+			}
+			allCandidates = append(allCandidates, funcCandidate{
+				argTypes: []uint32{op.Left, op.Right},
+				op:       op,
+			})
+		}
+	}
+
+	// 2. Filter to coercible candidates (func_match_argtypes equivalent).
+	var coercible []funcCandidate
+	for _, cand := range allCandidates {
+		if c.canCoerceArgs(inputTypes, cand.argTypes) {
+			coercible = append(coercible, cand)
+		}
+	}
+	if len(coercible) == 0 {
+		return nil, 0, 0, errUndefinedFunction(name, []uint32{leftType, rightType})
+	}
+	if len(coercible) == 1 {
+		best := &coercible[0]
+		resolvedLeft := best.op.Left
+		resolvedRight := best.op.Right
+		if isPolymorphic(resolvedLeft) {
+			resolvedLeft = leftType
+		}
+		if isPolymorphic(resolvedRight) {
+			resolvedRight = rightType
+		}
+		return best.op, resolvedLeft, resolvedRight, nil
+	}
+
+	// 3. Delegate to funcSelectCandidate for multi-phase resolution.
+	best := c.funcSelectCandidate(inputTypes, coercible)
+	if best == nil {
+		return nil, 0, 0, errUndefinedFunction(name, []uint32{leftType, rightType})
+	}
+
+	// Resolve polymorphic types: replace with actual input types.
+	resolvedLeft := best.op.Left
+	resolvedRight := best.op.Right
+	if isPolymorphic(resolvedLeft) {
+		resolvedLeft = leftType
+	}
+	if isPolymorphic(resolvedRight) {
+		resolvedRight = rightType
+	}
+	return best.op, resolvedLeft, resolvedRight, nil
+}
+
+// resolveFuncOverload resolves function overloading and returns the best match proc
+// and the resolved argument types (after resolving UNKNOWN).
+//
+// pg: src/backend/parser/parse_func.c — FuncnameGetCandidates + func_select_candidate
+func (c *Catalog) resolveFuncOverload(procs []*BuiltinProc, argTypes []uint32, argNames []string, hasStar bool, explicitVariadic bool) (*BuiltinProc, []uint32, error) {
+	// 1. Build candidates filtered by arg count, and by argument names for a
+	// call in named or mixed notation.
+	var candidates []funcCandidate
+	for _, p := range procs {
+		var candArgTypes []uint32
+		ok := false
+		if argNames != nil {
+			var positions []int
+			if positions, ok = namedCallPositions(p, argNames, explicitVariadic); ok {
+				candArgTypes = make([]uint32, len(positions))
+				for i, pos := range positions {
+					candArgTypes[i] = p.ArgTypes[pos]
+				}
+			}
+		} else {
+			candArgTypes, ok = candidateArgTypesForCall(p, len(argTypes), explicitVariadic)
+		}
+		if !ok {
+			continue
+		}
+		candidates = append(candidates, funcCandidate{
+			argTypes: candArgTypes,
+			proc:     p,
+		})
+	}
+
+	if len(candidates) == 0 {
+		return nil, nil, errUndefinedFunction(procs[0].Name, argTypes)
+	}
+
+	// 2. Check for exact match first.
+	for ci := range candidates {
+		exact := true
+		for i, argOID := range argTypes {
+			if argOID != candidates[ci].argTypes[i] {
+				exact = false
+				break
+			}
+		}
+		if exact {
+			return candidates[ci].proc, buildResolvedArgs(argTypes, candidates[ci].argTypes), nil
+		}
+	}
+
+	// 3. Filter to coercible candidates (func_match_argtypes).
+	var coercible []funcCandidate
+	for _, cand := range candidates {
+		if c.canCoerceArgs(argTypes, cand.argTypes) {
+			coercible = append(coercible, cand)
+		}
+	}
+	if len(coercible) == 0 {
+		return nil, nil, errUndefinedFunction(procs[0].Name, argTypes)
+	}
+	if len(coercible) == 1 {
+		return coercible[0].proc, buildResolvedArgs(argTypes, coercible[0].argTypes), nil
+	}
+
+	// 4. Delegate to funcSelectCandidate for multi-phase resolution.
+	best := c.funcSelectCandidate(argTypes, coercible)
+	if best == nil {
+		return nil, nil, errUndefinedFunction(procs[0].Name, argTypes)
+	}
+	return best.proc, buildResolvedArgs(argTypes, best.argTypes), nil
+}
+
+func candidateArgTypesForCall(proc *BuiltinProc, nargs int, explicitVariadic bool) ([]uint32, bool) {
+	procNArgs := int(proc.NArgs)
+	if procNArgs < 0 || procNArgs > len(proc.ArgTypes) {
+		return nil, false
+	}
+
+	if proc.Variadic == 0 {
+		minArgs := procNArgs - int(proc.NArgDefaults)
+		if minArgs < 0 {
+			minArgs = 0
+		}
+		if nargs < minArgs || nargs > procNArgs {
+			return nil, false
+		}
+		return proc.ArgTypes[:nargs], true
+	}
+
+	if explicitVariadic {
+		if nargs != procNArgs {
+			return nil, false
+		}
+		return proc.ArgTypes[:procNArgs], true
+	}
+
+	// With fewer arguments than parameters, a variadic function is matched
+	// without expanding its variadic parameter, the omitted trailing ones
+	// taking their defaults.
+	// pg: src/backend/catalog/namespace.c — FuncnameGetCandidates
+	if nargs < procNArgs {
+		if nargs+int(proc.NArgDefaults) < procNArgs {
+			return nil, false
+		}
+		return proc.ArgTypes[:nargs], true
+	}
+	fixedArgs := procNArgs - 1
+	if fixedArgs < 0 {
+		return nil, false
+	}
+
+	argTypes := make([]uint32, nargs)
+	copy(argTypes, proc.ArgTypes[:fixedArgs])
+	variadicType := proc.Variadic
+	if variadicType == 0 {
+		variadicType = proc.ArgTypes[procNArgs-1]
+	}
+	for i := fixedArgs; i < nargs; i++ {
+		argTypes[i] = variadicType
+	}
+	return argTypes, true
+}
+
+// withDefaultArgTypes fills the parameters a call leaves to their defaults
+// with the types of the default expressions, which count when a polymorphic
+// result type is resolved. argTypes is in parameter order, with 0 for a
+// parameter a named call skips.
+//
+// pg: src/backend/parser/parse_func.c — ParseFuncOrColumn (argdefaults in actual_arg_types)
+func (c *Catalog) withDefaultArgTypes(proc *BuiltinProc, argTypes []uint32) []uint32 {
+	n := int(proc.NArgs)
+	up := c.userProcs[proc.OID]
+	if up == nil || len(up.ArgDefaultTypes) == 0 || len(argTypes) > n {
+		return argTypes
+	}
+	out := make([]uint32, n)
+	copy(out, argTypes)
+	first := n - len(up.ArgDefaultTypes)
+	for pos := max(first, 0); pos < n; pos++ {
+		if out[pos] == 0 {
+			out[pos] = up.ArgDefaultTypes[pos-first]
+		}
+	}
+	return out
+}
+
+// callArgNames returns the name of each argument of a call, "" for a
+// positional one, or nil when no argument is named. Positional arguments must
+// come first, and no name may repeat.
+//
+// pg: src/backend/parser/parse_func.c — ParseFuncOrColumn (argnames)
+func callArgNames(args []AnalyzedExpr) ([]string, error) {
+	var names []string
+	for i, arg := range args {
+		na, ok := arg.(*NamedArgExprQ)
+		if !ok {
+			if names != nil {
+				return nil, &Error{Code: CodeSyntaxError, Message: "positional argument cannot follow named argument"}
+			}
+			continue
+		}
+		if slices.Contains(names, na.Name) {
+			return nil, &Error{Code: CodeSyntaxError, Message: fmt.Sprintf("argument name %q used more than once", na.Name)}
+		}
+		if names == nil {
+			names = make([]string, i, len(args))
+		}
+		names = append(names, na.Name)
+	}
+	return names, nil
+}
+
+// namedCallPositions matches a call in named or mixed notation against proc.
+// argNames holds each argument's name, "" for a positional one. Positional
+// arguments fill the first parameters and each named one the input parameter
+// of that name; every parameter left unfilled must have a default. It
+// returns the parameter each argument fills, in call order. A variadic
+// function matches only when the call passes VARIADIC explicitly.
+//
+// pg: src/backend/catalog/namespace.c — FuncnameGetCandidates (argnames),
+// MatchNamedCall
+func namedCallPositions(proc *BuiltinProc, argNames []string, explicitVariadic bool) ([]int, bool) {
+	nargs, pronargs := len(argNames), int(proc.NArgs)
+	if proc.ArgNames == nil || (proc.Variadic != 0 && !explicitVariadic) ||
+		nargs > pronargs || nargs+int(proc.NArgDefaults) < pronargs {
+		return nil, false
+	}
+	// The names of the input parameters, in order.
+	var inNames []string
+	for i, name := range proc.ArgNames {
+		if proc.ArgModes != nil && i < len(proc.ArgModes) {
+			if mode := proc.ArgModes[i]; mode != 'i' && mode != 'b' && mode != 'v' {
+				continue
+			}
+		}
+		inNames = append(inNames, name)
+	}
+	given := make([]bool, pronargs)
+	positions := make([]int, nargs)
+	for i, name := range argNames {
+		pos := i
+		if name != "" {
+			pos = slices.Index(inNames, name)
+		}
+		if pos < 0 || pos >= pronargs || given[pos] {
+			return nil, false
+		}
+		given[pos] = true
+		positions[i] = pos
+	}
+	firstDefault := pronargs - int(proc.NArgDefaults)
+	for pos := 0; pos < firstDefault; pos++ {
+		if !given[pos] {
+			return nil, false
+		}
+	}
+	return positions, true
+}
+
+// buildResolvedArgs constructs the resolved argument type slice from the matched candidate.
+func buildResolvedArgs(argTypes []uint32, candidateArgTypes []uint32) []uint32 {
+	resolved := make([]uint32, len(argTypes))
+	for i := range argTypes {
+		if i < len(candidateArgTypes) {
+			resolved[i] = candidateArgTypes[i]
+		} else {
+			resolved[i] = argTypes[i]
+		}
+	}
+	return resolved
+}
+
+// figureColName determines the output column name for an expression.
+//
+// pg: src/backend/parser/parse_target.c — FigureColname
+func figureColName(n nodes.Node) string {
+	if n == nil {
+		return "?column?"
+	}
+	switch v := n.(type) {
+	case *nodes.ColumnRef:
+		if v.Fields != nil && len(v.Fields.Items) > 0 {
+			last := v.Fields.Items[len(v.Fields.Items)-1]
+			if s, ok := last.(*nodes.String); ok {
+				return s.Str
+			}
+		}
+		return "?column?"
+	case *nodes.FuncCall:
+		if v.Funcname != nil && len(v.Funcname.Items) > 0 {
+			return stringVal(v.Funcname.Items[len(v.Funcname.Items)-1])
+		}
+		return "?column?"
+	case *nodes.TypeCast:
+		// Try inner expression first, then fall back to type name.
+		inner := figureColName(v.Arg)
+		if inner != "?column?" {
+			return inner
+		}
+		if v.TypeName != nil {
+			_, name := typeNameParts(v.TypeName)
+			if name != "" {
+				return name
+			}
+		}
+		return "?column?"
+	case *nodes.A_Expr:
+		return "?column?"
+	case *nodes.SubLink:
+		// scalar subquery — use the subquery's first column name
+		if sub, ok := v.Subselect.(*nodes.SelectStmt); ok {
+			if sub.TargetList != nil && len(sub.TargetList.Items) > 0 {
+				if rt, ok := sub.TargetList.Items[0].(*nodes.ResTarget); ok {
+					if rt.Name != "" {
+						return rt.Name
+					}
+					return figureColName(rt.Val)
+				}
+			}
+		}
+		return "?column?"
+	case *nodes.CaseExpr:
+		return "case"
+	case *nodes.CoalesceExpr:
+		return "coalesce"
+	case *nodes.MinMaxExpr:
+		if v.Op == nodes.IS_GREATEST {
+			return "greatest"
+		}
+		return "least"
+	case *nodes.NullIfExpr:
+		return "nullif"
+	case *nodes.SQLValueFunction:
+		switch v.Op {
+		case nodes.SVFOP_CURRENT_DATE:
+			return "current_date"
+		case nodes.SVFOP_CURRENT_TIME, nodes.SVFOP_CURRENT_TIME_N:
+			return "current_time"
+		case nodes.SVFOP_CURRENT_TIMESTAMP, nodes.SVFOP_CURRENT_TIMESTAMP_N:
+			return "current_timestamp"
+		case nodes.SVFOP_LOCALTIME, nodes.SVFOP_LOCALTIME_N:
+			return "localtime"
+		case nodes.SVFOP_LOCALTIMESTAMP, nodes.SVFOP_LOCALTIMESTAMP_N:
+			return "localtimestamp"
+		case nodes.SVFOP_CURRENT_ROLE:
+			return "current_role"
+		case nodes.SVFOP_CURRENT_USER:
+			return "current_user"
+		case nodes.SVFOP_USER:
+			return "current_user"
+		case nodes.SVFOP_SESSION_USER:
+			return "session_user"
+		case nodes.SVFOP_CURRENT_CATALOG:
+			return "current_catalog"
+		case nodes.SVFOP_CURRENT_SCHEMA:
+			return "current_schema"
+		}
+		return "?column?"
+	case *nodes.BooleanTest:
+		return figureColName(v.Arg)
+	case *nodes.A_Const:
+		return "?column?"
+	case *nodes.ArrayExpr:
+		return "array"
+	case *nodes.RowExpr:
+		return "row"
+	case *nodes.CollateClause:
+		return figureColName(v.Arg)
+	case *nodes.XmlExpr:
+		switch v.Op {
+		case nodes.IS_XMLCONCAT:
+			return "xmlconcat"
+		case nodes.IS_XMLELEMENT:
+			return "xmlelement"
+		case nodes.IS_XMLFOREST:
+			return "xmlforest"
+		case nodes.IS_XMLPARSE:
+			return "xmlparse"
+		case nodes.IS_XMLPI:
+			return "xmlpi"
+		case nodes.IS_XMLROOT:
+			return "xmlroot"
+		case nodes.IS_XMLSERIALIZE:
+			return "xmlserialize"
+		}
+		return "?column?"
+	case *nodes.XmlSerialize:
+		return "xmlserialize"
+	case *nodes.GroupingFunc:
+		return "grouping"
+	case *nodes.A_Indirection:
+		if v.Indirection != nil && len(v.Indirection.Items) > 0 {
+			last := v.Indirection.Items[len(v.Indirection.Items)-1]
+			if s, ok := last.(*nodes.String); ok {
+				return s.Str
+			}
+		}
+		return "?column?"
+	default:
+		return "?column?"
+	}
+}
+
+// isStar checks if a ColumnRef is a star expression.
+func isStar(cr *nodes.ColumnRef) bool {
+	if cr.Fields == nil {
+		return false
+	}
+	for _, item := range cr.Fields.Items {
+		if _, ok := item.(*nodes.A_Star); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// starTableName extracts the table name from a qualified star expression (table.*).
+func starTableName(cr *nodes.ColumnRef) string {
+	if cr.Fields == nil || len(cr.Fields.Items) < 2 {
+		return ""
+	}
+	return stringVal(cr.Fields.Items[0])
+}
+
+// convertJoinType converts a pgparser JoinType to the catalog JoinType.
+// CROSS JOIN is an inner join with no condition, as in PostgreSQL.
+func convertJoinType(jt nodes.JoinType) JoinType {
+	switch jt {
+	case nodes.JOIN_LEFT:
+		return JoinLeft
+	case nodes.JOIN_RIGHT:
+		return JoinRight
+	case nodes.JOIN_FULL:
+		return JoinFull
+	default:
+		return JoinInner
+	}
+}
+
+// convertSetOpType converts pgparser SetOperation to the catalog SetOpType.
+func convertSetOpType(op nodes.SetOperation) SetOpType {
+	switch op {
+	case nodes.SETOP_UNION:
+		return SetOpUnion
+	case nodes.SETOP_INTERSECT:
+		return SetOpIntersect
+	case nodes.SETOP_EXCEPT:
+		return SetOpExcept
+	default:
+		return SetOpNone
+	}
+}
+
+// findTargetlistEntry finds (or creates) a target list entry for a GROUP BY/ORDER BY expression.
+// Supports SQL92 (integer position, bare column name) and SQL99 (expression matching).
+//
+// pg: src/backend/parser/parse_clause.c — findTargetlistEntrySQL92 + findTargetlistEntrySQL99
+func (ac *analyzeCtx) findTargetlistEntry(n nodes.Node, tlist []*TargetEntry) (*TargetEntry, error) {
+	// SQL92: integer constant → positional reference.
+	if ac2, ok := n.(*nodes.A_Const); ok && !ac2.Isnull {
+		if iv, ok := ac2.Val.(*nodes.Integer); ok {
+			pos := int(iv.Ival)
+			// Count non-junk entries.
+			idx := 0
+			for _, te := range tlist {
+				if te.ResJunk {
+					continue
+				}
+				idx++
+				if idx == pos {
+					return te, nil
+				}
+			}
+			return nil, &Error{
+				Code:    CodeFeatureNotSupported,
+				Message: fmt.Sprintf("ORDER/GROUP BY position %d is not in select list", pos),
+			}
+		}
+	}
+
+	// SQL92: bare column name → match by ResName.
+	if cr, ok := n.(*nodes.ColumnRef); ok {
+		if cr.Fields != nil && len(cr.Fields.Items) == 1 {
+			colName := stringVal(cr.Fields.Items[0])
+			for _, te := range tlist {
+				if !te.ResJunk && te.ResName == colName {
+					return te, nil
+				}
+			}
+		}
+	}
+
+	// SQL99: transform and match by expression.
+	expr, err := ac.transformExpr(n)
+	if err != nil {
+		return nil, err
+	}
+
+	// Search for matching expression in existing target list.
+	for _, te := range tlist {
+		if exprEqual(te.Expr, expr) {
+			return te, nil
+		}
+	}
+
+	// No match — create a resjunk target entry.
+	// pg: makeTargetEntry with resjunk=true, appended to tlist
+	resNo := int16(len(ac.query.TargetList) + 1)
+	name := figureColName(n)
+	te := &TargetEntry{
+		Expr:    expr,
+		ResNo:   resNo,
+		ResName: name,
+		ResJunk: true,
+	}
+	ac.query.TargetList = append(ac.query.TargetList, te)
+	return te, nil
+}
+
+// assignSortGroupRef assigns a sort/group reference number to a target entry.
+//
+// pg: src/backend/parser/parse_clause.c — assignSortGroupRef
+func (ac *analyzeCtx) assignSortGroupRef(tle *TargetEntry, tlist []*TargetEntry) uint32 {
+	if tle.ResSortGroupRef != 0 {
+		return tle.ResSortGroupRef
+	}
+	var maxRef uint32
+	for _, te := range tlist {
+		if te.ResSortGroupRef > maxRef {
+			maxRef = te.ResSortGroupRef
+		}
+	}
+	tle.ResSortGroupRef = maxRef + 1
+	return tle.ResSortGroupRef
+}
+
+// exprEqual checks if two analyzed expressions are structurally equal.
+// Used for matching ORDER BY/GROUP BY expressions to target list entries.
+//
+// (pgddl helper — PG uses equal() on stripped expression nodes)
+func exprEqual(a, b AnalyzedExpr) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	switch va := a.(type) {
+	case *VarExpr:
+		vb, ok := b.(*VarExpr)
+		return ok && va.RangeIdx == vb.RangeIdx && va.AttNum == vb.AttNum
+	case *ConstExpr:
+		cb, ok := b.(*ConstExpr)
+		return ok && va.TypeOID == cb.TypeOID && va.Value == cb.Value && va.IsNull == cb.IsNull
+	case *FuncCallExpr:
+		fb, ok := b.(*FuncCallExpr)
+		if !ok || va.FuncOID != fb.FuncOID || len(va.Args) != len(fb.Args) {
+			return false
+		}
+		for i := range va.Args {
+			if !exprEqual(va.Args[i], fb.Args[i]) {
+				return false
+			}
+		}
+		return true
+	case *OpExpr:
+		ob, ok := b.(*OpExpr)
+		if !ok || va.OpOID != ob.OpOID {
+			return false
+		}
+		return exprEqual(va.Left, ob.Left) && exprEqual(va.Right, ob.Right)
+	case *AggExpr:
+		ab, ok := b.(*AggExpr)
+		if !ok || va.AggFuncOID != ab.AggFuncOID || va.AggStar != ab.AggStar ||
+			va.AggDistinct != ab.AggDistinct || va.AggWithinGroup != ab.AggWithinGroup ||
+			len(va.Args) != len(ab.Args) || len(va.AggOrder) != len(ab.AggOrder) ||
+			!exprEqual(va.AggFilter, ab.AggFilter) {
+			return false
+		}
+		for i := range va.Args {
+			if !exprEqual(va.Args[i], ab.Args[i]) {
+				return false
+			}
+		}
+		for i, sa := range va.AggOrder {
+			sb := ab.AggOrder[i]
+			if sa.Descending != sb.Descending || sa.NullsFirst != sb.NullsFirst || !exprEqual(sa.Expr, sb.Expr) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveCollation picks a collation from a list of analyzed expressions.
+// Simplified from PG's assign_collations_walker: first non-zero collation wins.
+//
+// (pgddl helper — PG uses select_common_collation / assign_collations_walker)
+func resolveCollation(args ...AnalyzedExpr) uint32 {
+	for _, arg := range args {
+		if arg == nil {
+			continue
+		}
+		if c := arg.exprCollation(); c != 0 {
+			return c
+		}
+	}
+	return 0
+}
+
+// AnalyzeSelectStmt transforms a raw SelectStmt AST node into a semantically
+// analyzed Query. The catalog must already contain the schema (tables, types,
+// functions) referenced by the query — load it via Exec() beforehand.
+//
+// The returned Query contains resolved column references (VarExpr), type
+// information, and provenance tracking (TargetEntry.ResOrigTbl/ResOrigCol)
+// that can be used to extract column lineage.
+//
+// pg: src/backend/parser/analyze.c — transformSelectStmt
+func (c *Catalog) AnalyzeSelectStmt(stmt *nodes.SelectStmt) (*Query, error) {
+	return c.analyzeSelectStmt(stmt)
+}
+
+// AnalyzeOptions relaxes how AnalyzeSelectStmtWithOptions treats a query the
+// catalog cannot fully resolve. The zero value analyzes as PostgreSQL does.
+type AnalyzeOptions struct {
+	// OpaqueUnknownFunctions analyzes a call to a function the catalog has
+	// no match for, such as one from an extension a synced schema does not
+	// carry, as an opaque call instead of failing with "function ... does
+	// not exist" (42883). Its arguments and clauses are analyzed as usual,
+	// so their columns stay visible. The call becomes a WindowFuncExpr when
+	// it has OVER; an AggExpr when it has *, DISTINCT, ORDER BY, WITHIN
+	// GROUP, or FILTER; and a FuncCallExpr otherwise. Its function OID is 0
+	// and its result type is unknown (UNKNOWNOID). In FROM, such a function
+	// has the columns its column definition list gives; otherwise its
+	// RangeTableEntry has UnknownColumns set, and each column the query
+	// names is added to it. A * over it fails. Use it to read lineage,
+	// never to decide whether PostgreSQL accepts the query.
+	OpaqueUnknownFunctions bool
+}
+
+// AnalyzeSelectStmtWithOptions is AnalyzeSelectStmt with the relaxations
+// opts selects.
+func (c *Catalog) AnalyzeSelectStmtWithOptions(stmt *nodes.SelectStmt, opts AnalyzeOptions) (*Query, error) {
+	return c.analyzeSelectStmtWithOptions(stmt, opts)
+}
+
+// AnalyzeExprNoContext analyzes a raw expression node without any range table
+// context. Used for function parameter default expressions.
+//
+// pg: src/backend/parser/parse_expr.c — transformExpr (no pstate relations)
+func (c *Catalog) AnalyzeExprNoContext(expr nodes.Node) (AnalyzedExpr, error) {
+	if expr == nil {
+		return nil, nil
+	}
+	ac := &analyzeCtx{
+		catalog: c,
+		query:   &Query{},
+	}
+	return ac.transformExpr(expr)
+}
+
+// AnalyzeTriggerWhenExpr analyzes a trigger WHEN clause in the context of
+// OLD (varno=1) and NEW (varno=2) pseudo-relations.
+//
+// pg: src/backend/commands/trigger.c — CreateTrigger (WHEN clause setup)
+func (c *Catalog) AnalyzeTriggerWhenExpr(expr nodes.Node, rel *Relation) (AnalyzedExpr, error) {
+	if expr == nil {
+		return nil, nil
+	}
+	oldRTE := c.buildRelationRTE(rel)
+	oldRTE.ERef = "old"
+	newRTE := c.buildRelationRTE(rel)
+	newRTE.ERef = "new"
+	ac := &analyzeCtx{
+		catalog: c,
+		query:   &Query{RangeTable: []*RangeTableEntry{oldRTE, newRTE}},
+	}
+	return ac.transformExpr(expr)
+}
+
+// AnalyzeStandaloneExpr analyzes a raw expression node in the context of a
+// relation's columns. Used for CHECK constraints, column defaults, and policy
+// expressions.
+//
+// pg: src/backend/parser/parse_expr.c — transformExpr (standalone context)
+func (c *Catalog) AnalyzeStandaloneExpr(expr nodes.Node, rel *Relation) (AnalyzedExpr, error) {
+	if expr == nil {
+		return nil, nil
+	}
+	rte := c.buildRelationRTE(rel)
+	ac := &analyzeCtx{
+		catalog: c,
+		query:   &Query{RangeTable: []*RangeTableEntry{rte}},
+	}
+	return ac.transformExpr(expr)
+}
+
+// AnalyzeColumnDefaultExpr analyzes a column DEFAULT expression using
+// PostgreSQL's EXPR_KIND_COLUMN_DEFAULT semantics.
+//
+// pg: src/backend/catalog/heap.c — cookDefault
+// pg: src/backend/parser/parse_expr.c — transformColumnRef
+func (c *Catalog) AnalyzeColumnDefaultExpr(expr nodes.Node, rel *Relation) (AnalyzedExpr, error) {
+	if expr == nil {
+		return nil, nil
+	}
+	rte := c.buildRelationRTE(rel)
+	ac := &analyzeCtx{
+		catalog:  c,
+		query:    &Query{RangeTable: []*RangeTableEntry{rte}},
+		exprKind: analyzeExprKindColumnDefault,
+	}
+	analyzed, err := ac.transformExpr(expr)
+	if err != nil {
+		return nil, err
+	}
+	if exprContainsVarExpr(analyzed) {
+		return nil, errColumnReferenceInDefault()
+	}
+	return analyzed, nil
+}
+
+func errColumnReferenceInDefault() error {
+	return &Error{Code: CodeFeatureNotSupported, Message: "cannot use column reference in DEFAULT expression"}
+}
+
+func errAggregateInDefault() error {
+	return &Error{Code: CodeGroupingError, Message: "aggregate functions are not allowed in DEFAULT expressions"}
+}
+
+func errWindowFunctionInDefault() error {
+	return &Error{Code: CodeWindowingError, Message: "window functions are not allowed in DEFAULT expressions"}
+}
+
+func errSetReturningFunctionInDefault() error {
+	return &Error{Code: CodeFeatureNotSupported, Message: "set-returning functions are not allowed in DEFAULT expressions"}
+}
+
+func errGroupingOperationInDefault() error {
+	return &Error{Code: CodeGroupingError, Message: "grouping operations are not allowed in DEFAULT expressions"}
+}
+
+func exprContainsVarExpr(expr AnalyzedExpr) bool {
+	found := false
+	WalkAnalyzedExpr(expr, func(e AnalyzedExpr) bool {
+		switch v := e.(type) {
+		case *VarExpr:
+			found = true
+		case *SubLinkExpr:
+			if v.SubQuery != nil {
+				for _, te := range v.SubQuery.TargetList {
+					if te != nil && exprContainsVarExpr(te.Expr) {
+						found = true
+						break
+					}
+				}
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// AnalyzeDomainExpr analyzes a raw expression node in the context of a domain
+// type. The "VALUE" keyword is intercepted in transformColumnRef and replaced
+// with CoerceToDomainValueExpr.
+//
+// pg: src/backend/commands/typecmds.c — domainAddCheckConstraint
+func (c *Catalog) AnalyzeDomainExpr(expr nodes.Node, domainBaseTypeOID uint32, domainBaseTypMod int32) (AnalyzedExpr, error) {
+	if expr == nil {
+		return nil, nil
+	}
+	bt := c.typeByOID[domainBaseTypeOID]
+	var coll uint32
+	if bt != nil {
+		coll = bt.Collation
+	}
+	ac := &analyzeCtx{
+		catalog:             c,
+		query:               &Query{},
+		domainConstraint:    true,
+		domainBaseTypeOID:   domainBaseTypeOID,
+		domainBaseTypMod:    domainBaseTypMod,
+		domainBaseCollation: coll,
+	}
+	return ac.transformExpr(expr)
+}
+
+// buildRelationRTE builds a RangeTableEntry from a Relation's columns.
+//
+// (pgddl helper — PG uses addRangeTableEntryForRelation)
+func (c *Catalog) buildRelationRTE(rel *Relation) *RangeTableEntry {
+	rte := &RangeTableEntry{
+		Kind:    RTERelation,
+		RelOID:  rel.OID,
+		RelName: rel.Name,
+		ERef:    rel.Name,
+	}
+	if rel.Schema != nil {
+		rte.SchemaName = rel.Schema.Name
+	}
+	for _, col := range rel.Columns {
+		rte.ColNames = append(rte.ColNames, col.Name)
+		rte.ColTypes = append(rte.ColTypes, col.TypeOID)
+		rte.ColTypMods = append(rte.ColTypMods, col.TypeMod)
+		rte.ColCollations = append(rte.ColCollations, col.Collation)
+	}
+	return rte
+}
+
+// transformGroupingSet transforms a GroupingSet or plain column reference into a GroupingSetQ.
+//
+// pg: src/backend/parser/parse_clause.c — transformGroupingSet
+func (ac *analyzeCtx) transformGroupingSet(n nodes.Node, tlist []*TargetEntry) (*GroupingSetQ, error) {
+	gs, ok := n.(*nodes.GroupingSet)
+	if !ok {
+		// Plain column reference — wrap as GroupingSetSimple.
+		tle, err := ac.findTargetlistEntry(n, tlist)
+		if err != nil {
+			return nil, err
+		}
+		ref := ac.assignSortGroupRef(tle, tlist)
+		return &GroupingSetQ{
+			Kind:    GroupingSetSimple,
+			Content: []*SortGroupClause{{TLESortGroupRef: ref}},
+		}, nil
+	}
+
+	switch gs.Kind {
+	case nodes.GROUPING_SET_ROLLUP:
+		gsq := &GroupingSetQ{Kind: GroupingSetRollup}
+		if gs.Content != nil {
+			for _, item := range gs.Content.Items {
+				tle, err := ac.findTargetlistEntry(item, tlist)
+				if err != nil {
+					return nil, err
+				}
+				ref := ac.assignSortGroupRef(tle, tlist)
+				gsq.Content = append(gsq.Content, &SortGroupClause{TLESortGroupRef: ref})
+			}
+		}
+		return gsq, nil
+	case nodes.GROUPING_SET_CUBE:
+		gsq := &GroupingSetQ{Kind: GroupingSetCube}
+		if gs.Content != nil {
+			for _, item := range gs.Content.Items {
+				tle, err := ac.findTargetlistEntry(item, tlist)
+				if err != nil {
+					return nil, err
+				}
+				ref := ac.assignSortGroupRef(tle, tlist)
+				gsq.Content = append(gsq.Content, &SortGroupClause{TLESortGroupRef: ref})
+			}
+		}
+		return gsq, nil
+	case nodes.GROUPING_SET_SETS:
+		gsq := &GroupingSetQ{Kind: GroupingSetSets}
+		if gs.Content != nil {
+			for _, item := range gs.Content.Items {
+				sub, err := ac.transformGroupingSet(item, tlist)
+				if err != nil {
+					return nil, err
+				}
+				gsq.Sets = append(gsq.Sets, sub)
+			}
+		}
+		return gsq, nil
+	case nodes.GROUPING_SET_EMPTY:
+		return &GroupingSetQ{Kind: GroupingSetSimple}, nil
+	default:
+		// GROUPING_SET_SIMPLE — plain column
+		gsq := &GroupingSetQ{Kind: GroupingSetSimple}
+		if gs.Content != nil {
+			for _, item := range gs.Content.Items {
+				tle, err := ac.findTargetlistEntry(item, tlist)
+				if err != nil {
+					return nil, err
+				}
+				ref := ac.assignSortGroupRef(tle, tlist)
+				gsq.Content = append(gsq.Content, &SortGroupClause{TLESortGroupRef: ref})
+			}
+		}
+		return gsq, nil
+	}
+}
+
+// flattenGroupingSetRefs adds all column refs from a GroupingSetQ to the
+// query's GroupClause for target list resolution.
+func (ac *analyzeCtx) flattenGroupingSetRefs(gs *GroupingSetQ, q *Query) {
+	for _, sgc := range gs.Content {
+		isDup := false
+		for _, existing := range q.GroupClause {
+			if existing.TLESortGroupRef == sgc.TLESortGroupRef {
+				isDup = true
+				break
+			}
+		}
+		if !isDup {
+			q.GroupClause = append(q.GroupClause, sgc)
+		}
+	}
+	for _, sub := range gs.Sets {
+		ac.flattenGroupingSetRefs(sub, q)
+	}
+}
+
+// transformGroupingFunc transforms a GROUPING(...) expression.
+//
+// pg: src/backend/parser/parse_expr.c — transformGroupingFunc
+func (ac *analyzeCtx) transformGroupingFunc(gf *nodes.GroupingFunc) (AnalyzedExpr, error) {
+	var args []AnalyzedExpr
+	var refs []int
+	if gf.Args != nil {
+		for _, a := range gf.Args.Items {
+			expr, err := ac.transformExpr(a)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, expr)
+		}
+	}
+	if gf.Refs != nil {
+		for _, r := range gf.Refs.Items {
+			if iv, ok := r.(*nodes.Integer); ok {
+				refs = append(refs, int(iv.Ival))
+			}
+		}
+	}
+	if ac.exprKind == analyzeExprKindColumnDefault {
+		return nil, errGroupingOperationInDefault()
+	}
+	return &GroupingFuncExpr{
+		Args: args,
+		Refs: refs,
+	}, nil
+}
+
+// transformXmlExpr transforms a XmlExpr node into an analyzed XmlExprQ.
+//
+// pg: src/backend/parser/parse_expr.c — transformXmlExpr
+func (ac *analyzeCtx) transformXmlExpr(xe *nodes.XmlExpr) (AnalyzedExpr, error) {
+	// Translate AST XmlOptionType (0=DOCUMENT,1=CONTENT) to catalog constants.
+	xmlopt := XmlOptionContent
+	if xe.Xmloption == nodes.XMLOPTION_DOCUMENT {
+		xmlopt = XmlOptionDocument
+	}
+
+	result := &XmlExprQ{
+		Op:        int(xe.Op),
+		Name:      xe.Name,
+		Xmloption: xmlopt,
+		TypeOID:   XMLOID,
+		TypeMod:   -1,
+	}
+
+	// IS DOCUMENT returns boolean.
+	if xe.Op == nodes.IS_XMLSERIALIZE {
+		if xe.Type != 0 {
+			result.TypeOID = uint32(xe.Type)
+		} else {
+			result.TypeOID = TEXTOID
+		}
+		result.TypeMod = xe.Typmod
+	}
+
+	// Named args (xml_attributes / XMLFOREST elements).
+	// Parser stores these as ResTarget nodes; extract the expression and
+	// the AS alias (ResTarget.Name) so ArgNames stays in sync.
+	if xe.NamedArgs != nil {
+		for _, a := range xe.NamedArgs.Items {
+			if rt, ok := a.(*nodes.ResTarget); ok {
+				expr, err := ac.transformExpr(rt.Val)
+				if err != nil {
+					return nil, err
+				}
+				result.NamedArgs = append(result.NamedArgs, expr)
+				result.ArgNames = append(result.ArgNames, rt.Name)
+			} else {
+				expr, err := ac.transformExpr(a)
+				if err != nil {
+					return nil, err
+				}
+				result.NamedArgs = append(result.NamedArgs, expr)
+				result.ArgNames = append(result.ArgNames, "")
+			}
+		}
+	}
+
+	// Arg names (populated from AST when parser fills ArgNames directly).
+	if xe.ArgNames != nil {
+		for _, a := range xe.ArgNames.Items {
+			if s, ok := a.(*nodes.String); ok {
+				result.ArgNames = append(result.ArgNames, s.Str)
+			}
+		}
+	}
+
+	// Args.
+	if xe.Args != nil {
+		for _, a := range xe.Args.Items {
+			expr, err := ac.transformExpr(a)
+			if err != nil {
+				return nil, err
+			}
+			result.Args = append(result.Args, expr)
+		}
+	}
+
+	return result, nil
+}
+
+// transformXmlSerialize transforms an XMLSERIALIZE expression into an XmlExprQ.
+//
+// pg: src/backend/parser/parse_expr.c — transformXmlSerialize
+func (ac *analyzeCtx) transformXmlSerialize(xs *nodes.XmlSerialize) (AnalyzedExpr, error) {
+	// Transform the inner expression.
+	arg, err := ac.transformExpr(xs.Expr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve target type.
+	var typeOID uint32 = TEXTOID
+	var typMod int32 = -1
+	if xs.TypeName != nil {
+		typeOID, typMod, err = ac.catalog.resolveTypeName(xs.TypeName)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Translate AST XmlOptionType to catalog constants.
+	serializeOpt := XmlOptionContent
+	if xs.Xmloption == nodes.XMLOPTION_DOCUMENT {
+		serializeOpt = XmlOptionDocument
+	}
+
+	return &XmlExprQ{
+		Op:        XmlOpSerialize,
+		Xmloption: serializeOpt,
+		Args:      []AnalyzedExpr{arg},
+		TypeOID:   typeOID,
+		TypeMod:   typMod,
+	}, nil
+}
+
+// transformRangeTableSampleItem processes a RangeTableSample FROM clause item.
+// It first transforms the relation, then attaches the tablesample clause.
+//
+// pg: src/backend/parser/parse_clause.c — transformRangeTableSample
+func (ac *analyzeCtx) transformRangeTableSampleItem(rts *nodes.RangeTableSample) (JoinNode, error) {
+	// Transform the inner relation.
+	jn, err := ac.transformFromClauseItem(rts.Relation)
+	if err != nil {
+		return nil, err
+	}
+	// The inner item should be a RangeTableRef.
+	rtRef, ok := jn.(*RangeTableRef)
+	if !ok {
+		return nil, fmt.Errorf("TABLESAMPLE on non-table item")
+	}
+	rte := ac.query.RangeTable[rtRef.RTIndex]
+	if err := ac.transformRangeTableSample(rts, rte); err != nil {
+		return nil, err
+	}
+	return jn, nil
+}
+
+// transformRangeTableSample processes a TABLESAMPLE clause and attaches it to the RTE.
+//
+// pg: src/backend/parser/parse_clause.c — transformRangeTableSample
+func (ac *analyzeCtx) transformRangeTableSample(rts *nodes.RangeTableSample, rte *RangeTableEntry) error {
+	ts := &TablesampleClauseQ{}
+
+	// Method name.
+	if rts.Method != nil {
+		for _, item := range rts.Method.Items {
+			if s, ok := item.(*nodes.String); ok {
+				ts.Method = s.Str
+			}
+		}
+	}
+
+	// Args.
+	if rts.Args != nil {
+		for _, a := range rts.Args.Items {
+			expr, err := ac.transformExpr(a)
+			if err != nil {
+				return err
+			}
+			ts.Args = append(ts.Args, expr)
+		}
+	}
+
+	// REPEATABLE.
+	if rts.Repeatable != nil {
+		expr, err := ac.transformExpr(rts.Repeatable)
+		if err != nil {
+			return err
+		}
+		ts.Repeatable = expr
+	}
+
+	rte.Tablesample = ts
+	return nil
+}
+
+// setOpKeyword returns the SQL keyword for a set operation.
+func setOpKeyword(op nodes.SetOperation) string {
+	switch op {
+	case nodes.SETOP_UNION:
+		return "UNION"
+	case nodes.SETOP_INTERSECT:
+		return "INTERSECT"
+	case nodes.SETOP_EXCEPT:
+		return "EXCEPT"
+	default:
+		return "SET"
+	}
+}
+
+// --- JSON Expression Transformers (PG16+) ---
+
+// transformJsonIsPredicate transforms expr IS [NOT] JSON [OBJECT|ARRAY|SCALAR].
+//
+// pg: src/backend/parser/parse_expr.c — transformJsonIsPredicate
+func (ac *analyzeCtx) transformJsonIsPredicate(n *nodes.JsonIsPredicate) (AnalyzedExpr, error) {
+	expr, err := ac.transformExpr(n.Expr)
+	if err != nil {
+		return nil, err
+	}
+	return &JsonIsPredicateExpr{
+		Expr:       expr,
+		ItemType:   int(n.ItemType),
+		UniqueKeys: n.UniqueKeys,
+		IsNot:      false, // PG wraps NOT externally via BoolExpr
+	}, nil
+}
+
+// transformJsonFuncExpr transforms JSON_VALUE, JSON_QUERY, JSON_EXISTS.
+//
+// pg: src/backend/parser/parse_expr.c — transformJsonFuncExpr
+func (ac *analyzeCtx) transformJsonFuncExpr(n *nodes.JsonFuncExpr) (AnalyzedExpr, error) {
+	var expr AnalyzedExpr
+	if n.ContextItem != nil {
+		var err error
+		expr, err = ac.transformExpr(n.ContextItem.RawExpr)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var pathStr string
+	if n.Pathspec != nil {
+		if s, ok := n.Pathspec.(*nodes.A_Const); ok && s.Val != nil {
+			if sv, ok := s.Val.(*nodes.String); ok {
+				pathStr = sv.Str
+			}
+		}
+		// Also try JsonTablePathSpec
+		if ps, ok := n.Pathspec.(*nodes.JsonTablePathSpec); ok && ps.String != nil {
+			if s, ok := ps.String.(*nodes.A_Const); ok && s.Val != nil {
+				if sv, ok := s.Val.(*nodes.String); ok {
+					pathStr = sv.Str
+				}
+			}
+		}
+	}
+
+	var op JsonExprOpQ
+	var resultType uint32
+	switch n.Op {
+	case nodes.JSON_EXISTS_OP:
+		op = JsonExprExists
+		resultType = BOOLOID
+	case nodes.JSON_QUERY_OP:
+		op = JsonExprQuery
+		resultType = JSONBOID
+	case nodes.JSON_VALUE_OP:
+		op = JsonExprValue
+		resultType = TEXTOID
+	default:
+		resultType = TEXTOID
+	}
+
+	return &JsonExprQ{
+		Op:         op,
+		Expr:       expr,
+		Path:       pathStr,
+		ResultType: resultType,
+	}, nil
+}
+
+// transformJsonObjectConstructor transforms JSON_OBJECT(...).
+func (ac *analyzeCtx) transformJsonObjectConstructor(n *nodes.JsonObjectConstructor) (AnalyzedExpr, error) {
+	var args []AnalyzedExpr
+	if n.Exprs != nil {
+		for _, item := range n.Exprs.Items {
+			if kv, ok := item.(*nodes.JsonKeyValue); ok {
+				// Transform key
+				keyExpr, err := ac.transformExpr(kv.Key)
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, keyExpr)
+				// Transform value
+				if kv.Value != nil {
+					valExpr, err := ac.transformExpr(kv.Value.RawExpr)
+					if err != nil {
+						return nil, err
+					}
+					args = append(args, valExpr)
+				}
+			}
+		}
+	}
+	return &JsonConstructorExprQ{
+		ConstructorType: JsonConstructorObject,
+		Args:            args,
+		ResultType:      JSONOID,
+	}, nil
+}
+
+// transformJsonArrayConstructor transforms JSON_ARRAY(...).
+func (ac *analyzeCtx) transformJsonArrayConstructor(n *nodes.JsonArrayConstructor) (AnalyzedExpr, error) {
+	var args []AnalyzedExpr
+	if n.Exprs != nil {
+		for _, item := range n.Exprs.Items {
+			if jve, ok := item.(*nodes.JsonValueExpr); ok {
+				expr, err := ac.transformExpr(jve.RawExpr)
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, expr)
+			} else {
+				expr, err := ac.transformExpr(item)
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, expr)
+			}
+		}
+	}
+	return &JsonConstructorExprQ{
+		ConstructorType: JsonConstructorArray,
+		Args:            args,
+		ResultType:      JSONOID,
+	}, nil
+}
+
+// transformJsonValueExpr transforms a JsonValueExpr (inner expression).
+func (ac *analyzeCtx) transformJsonValueExpr(n *nodes.JsonValueExpr) (AnalyzedExpr, error) {
+	expr, err := ac.transformExpr(n.RawExpr)
+	if err != nil {
+		return nil, err
+	}
+	return &JsonValueExprQ{
+		Expr:       expr,
+		ResultType: expr.exprType(),
+	}, nil
+}
+
+// transformJsonScalarExpr transforms JSON_SCALAR().
+func (ac *analyzeCtx) transformJsonScalarExpr(n *nodes.JsonScalarExpr) (AnalyzedExpr, error) {
+	expr, err := ac.transformExpr(n.Expr)
+	if err != nil {
+		return nil, err
+	}
+	return &JsonConstructorExprQ{
+		ConstructorType: JsonConstructorScalar,
+		Args:            []AnalyzedExpr{expr},
+		ResultType:      JSONOID,
+	}, nil
+}
+
+// transformJsonParseExpr transforms JSON() parse expression.
+func (ac *analyzeCtx) transformJsonParseExpr(n *nodes.JsonParseExpr) (AnalyzedExpr, error) {
+	var inner AnalyzedExpr
+	if n.Expr != nil {
+		var err error
+		inner, err = ac.transformExpr(n.Expr.RawExpr)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &JsonConstructorExprQ{
+		ConstructorType: JsonConstructorParse,
+		Args:            []AnalyzedExpr{inner},
+		ResultType:      JSONOID,
+	}, nil
+}
+
+// transformJsonSerializeExpr transforms JSON_SERIALIZE().
+func (ac *analyzeCtx) transformJsonSerializeExpr(n *nodes.JsonSerializeExpr) (AnalyzedExpr, error) {
+	var inner AnalyzedExpr
+	if n.Expr != nil {
+		var err error
+		inner, err = ac.transformExpr(n.Expr.RawExpr)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &JsonConstructorExprQ{
+		ConstructorType: JsonConstructorSerialize,
+		Args:            []AnalyzedExpr{inner},
+		ResultType:      TEXTOID,
+	}, nil
+}
